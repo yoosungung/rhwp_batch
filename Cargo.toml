@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "rhwp",
+    "rhwp-batch",
+]
+resolver = "2"

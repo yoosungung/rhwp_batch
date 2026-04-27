@@ -1,0 +1,29 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: rhwp-fill-
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: rhwp
+        image: registry.local/rhwp-batch:0.1.0
+        args:
+          - fill
+          - --template=/templates/order.hwp
+          - --data-dir=/input
+          - --output-dir=/output
+          - --report=/output/_report.json
+          - --log-format=json
+        volumeMounts:
+          - { name: templates, mountPath: /templates, readOnly: true }
+          - { name: input,     mountPath: /input,     readOnly: true }
+          - { name: output,    mountPath: /output }
+      volumes:
+        - name: templates
+          configMap: { name: rhwp-templates }
+        - name: input
+          persistentVolumeClaim: { claimName: rhwp-input }
+        - name: output
+          persistentVolumeClaim: { claimName: rhwp-output }

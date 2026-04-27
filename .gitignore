@@ -1,0 +1,32 @@
+# Rust / Cargo
+target/
+**/*.rs.bk
+*.pdb
+
+# rhwp (원본 crate) 산출물·샘플·임시 디렉토리
+rhwp/output/
+rhwp/samples/
+rhwp/saved/
+rhwp/template/
+
+# rhwp-batch 샘플
+rhwp-batch/samples/
+
+# OS / 에디터
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# 환경 / 비밀
+.env
+.env.*
+!.env.example
+
+# 로그·임시 파일
+*.log
+tmp/
+.tmp/
