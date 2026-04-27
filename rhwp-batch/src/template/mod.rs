@@ -215,7 +215,7 @@ fn rebuild_grid(table: &mut rhwp::model::table::Table) {
 // ── 문단 재귀 처리 ────────────────────────────────────────────────────────────
 
 fn fill_paragraphs(
-    paragraphs: &mut Vec<Paragraph>,
+    paragraphs: &mut [Paragraph],
     data: &Value,
     on_missing: OnMissingKey,
 ) -> Result<(), BatchError> {
@@ -403,7 +403,7 @@ fn char_utf16_len(s: &str) -> usize {
 
 /// char_shapes의 start_pos(UTF-16 기준)를 조정한다.
 /// `deltas`: (threshold_utf16, delta) 목록. threshold 이상인 start_pos에 delta를 누적 적용.
-fn adjust_char_shapes(char_shapes: &mut Vec<CharShapeRef>, deltas: &[(usize, i64)]) {
+fn adjust_char_shapes(char_shapes: &mut [CharShapeRef], deltas: &[(usize, i64)]) {
     if deltas.is_empty() || char_shapes.is_empty() {
         return;
     }

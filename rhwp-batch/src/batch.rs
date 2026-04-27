@@ -4,6 +4,7 @@
 //! 직렬화한다. 페이지네이션 비용을 파싱 단계에서만 한 번 지불한다 (D18).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -107,8 +108,9 @@ pub fn run_batch(
 
     let template_doc = Arc::new(template_doc);
     let results: Arc<Mutex<Vec<BatchItemReport>>> = Arc::new(Mutex::new(Vec::new()));
+    let abort: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let threads = cfg.threads.max(1);
-    let chunk_size = (items.len() + threads - 1) / threads;
+    let chunk_size = items.len().div_ceil(threads).max(1);
 
     // 2. N개 항목을 workers에 분배하여 병렬 처리
     let mut handles = Vec::new();
@@ -116,12 +118,16 @@ pub fn run_batch(
         let chunk: Vec<_> = chunk.to_vec();
         let template_doc = Arc::clone(&template_doc);
         let results = Arc::clone(&results);
+        let abort = Arc::clone(&abort);
         let on_missing_key = cfg.on_missing_key;
         let on_error_continue = cfg.on_error_continue;
         let overwrite = cfg.overwrite;
 
         let handle = thread::spawn(move || {
             for (data_path, output_path) in &chunk {
+                if abort.load(Ordering::Relaxed) {
+                    break;
+                }
                 let item_result = process_one(
                     &template_doc,
                     data_path,
@@ -129,6 +135,7 @@ pub fn run_batch(
                     on_missing_key,
                     overwrite,
                 );
+                let failed = item_result.is_err();
                 let report_item = match item_result {
                     Ok(_) => BatchItemReport {
                         data: data_path.clone(),
@@ -148,8 +155,8 @@ pub fn run_batch(
                     }
                 };
                 results.lock().unwrap().push(report_item);
-                // on_error_continue=false: early exit signal (best-effort, other threads continue)
-                if !on_error_continue && results.lock().unwrap().last().map(|r| r.status == "failed").unwrap_or(false) {
+                if failed && !on_error_continue {
+                    abort.store(true, Ordering::Relaxed);
                     break;
                 }
             }

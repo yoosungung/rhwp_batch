@@ -74,43 +74,7 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 fn current_iso8601() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // 간이 ISO 8601 UTC 포맷 (chrono 없이)
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    let days = secs / 86400; // Unix epoch days
-    let (y, mo, d) = days_to_ymd(days);
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, m, s)
-}
-
-fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
-    // 그레고리력 변환 (간이)
-    let mut y = 1970u64;
-    loop {
-        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-        let ydays = if leap { 366 } else { 365 };
-        if days < ydays {
-            break;
-        }
-        days -= ydays;
-        y += 1;
-    }
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let month_days = [31u64, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut mo = 1u64;
-    for &md in &month_days {
-        if days < md {
-            break;
-        }
-        days -= md;
-        mo += 1;
-    }
-    (y, mo, days + 1)
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// 이미지 모드 (D4)
@@ -295,14 +259,14 @@ impl<'a> Converter<'a> {
 
         if !table.cell_grid.is_empty() {
             // cell_grid[row * col_count + col] = Some(cell_idx)
-            for r in 0..row_count {
-                for c in 0..col_count {
+            for (r, row_out) in grid.iter_mut().enumerate() {
+                for (c, cell_out) in row_out.iter_mut().enumerate() {
                     let grid_idx = r * col_count + c;
                     if let Some(Some(cell_idx)) = table.cell_grid.get(grid_idx) {
                         if let Some(cell) = table.cells.get(*cell_idx) {
                             // 앵커 셀(col==c && row==r)만 값 기입 (D25)
                             if cell.col as usize == c && cell.row as usize == r {
-                                grid[r][c] = cell_text(&cell.paragraphs);
+                                *cell_out = cell_text(&cell.paragraphs);
                                 if cell.col_span > 1 || cell.row_span > 1 {
                                     merged_cells.push(MergedCell {
                                         r,
@@ -532,17 +496,18 @@ fn build_markdown(grid: &[Vec<String>]) -> String {
 }
 
 /// Image 블록의 near_text_before/after를 사후 채움
-fn fill_near_text(blocks: &mut Vec<BlockJson>) {
+fn fill_near_text(blocks: &mut [BlockJson]) {
     // 먼저 각 인덱스의 adjacent text를 미리 추출 (borrow checker 우회)
     let texts: Vec<Option<String>> = blocks
         .iter()
         .map(|b| b.as_adjacent_text().map(String::from))
         .collect();
 
-    for i in 0..blocks.len() {
-        if let BlockJson::Image { near_text_before, near_text_after, .. } = &mut blocks[i] {
+    let total = texts.len();
+    for (i, block) in blocks.iter_mut().enumerate() {
+        if let BlockJson::Image { near_text_before, near_text_after, .. } = block {
             *near_text_before = (0..i).rev().find_map(|j| texts[j].clone());
-            *near_text_after = (i + 1..texts.len()).find_map(|j| texts[j].clone());
+            *near_text_after = (i + 1..total).find_map(|j| texts[j].clone());
         }
     }
 }
