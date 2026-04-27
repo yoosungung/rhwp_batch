@@ -12,6 +12,9 @@ rhwp/template/
 # rhwp-batch 샘플
 rhwp-batch/samples/
 
+# convert_all.sh 출력 (변환된 *.json 및 .assets/ 폴더)
+rhwp-batch/tests/output/
+
 # OS / 에디터
 .DS_Store
 Thumbs.db
