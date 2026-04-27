@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "rhwp-batch", version, about = "HWP/HWPX batch conversion and template filling")]
@@ -40,6 +40,26 @@ pub struct ToJsonArgs {
     /// Output directory (directory mode)
     #[arg(long)]
     pub output_dir: Option<std::path::PathBuf>,
+
+    /// Image handling mode
+    #[arg(long, default_value = "extract")]
+    pub image_mode: ImageModeArg,
+
+    /// Directory to write extracted images (default: <output>.assets/)
+    #[arg(long)]
+    pub image_dir: Option<std::path::PathBuf>,
+
+    /// Pretty-print JSON output
+    #[arg(long)]
+    pub pretty: bool,
+
+    /// Heading style map overrides (e.g. "MyStyle=2")
+    #[arg(long, value_name = "NAME=LEVEL")]
+    pub heading_style_map: Vec<String>,
+
+    /// Overwrite existing output files
+    #[arg(long)]
+    pub overwrite: bool,
 }
 
 #[derive(clap::Args)]
@@ -74,9 +94,36 @@ pub struct FillArgs {
 
     /// Behavior on missing template key (error | empty | keep)
     #[arg(long, default_value = "error")]
-    pub on_missing_key: String,
+    pub on_missing_key: OnMissingKey,
 
     /// Behavior on per-item error in batch (stop | continue)
     #[arg(long, default_value = "stop")]
-    pub on_error: String,
+    pub on_error: OnError,
+
+    /// Number of worker threads (default: CPU count)
+    #[arg(long)]
+    pub threads: Option<usize>,
+
+    /// Overwrite existing output files
+    #[arg(long)]
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq)]
+pub enum ImageModeArg {
+    Extract,
+    Inline,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq)]
+pub enum OnMissingKey {
+    Error,
+    Empty,
+    Keep,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq)]
+pub enum OnError {
+    Stop,
+    Continue,
 }

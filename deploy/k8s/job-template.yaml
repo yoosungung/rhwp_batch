@@ -1,9 +1,18 @@
+# rhwp-batch K8s Job 템플릿 (fill 배치 모드)
+# 사용법: kubectl create -f job-template.yaml
+# 양식 변경 시 ConfigMap만 갱신, 이미지 재빌드 불필요 (D11)
 apiVersion: batch/v1
 kind: Job
 metadata:
   generateName: rhwp-fill-
+  labels:
+    app: rhwp-batch
 spec:
+  backoffLimit: 2
   template:
+    metadata:
+      labels:
+        app: rhwp-batch
     spec:
       restartPolicy: OnFailure
       containers:
@@ -16,14 +25,71 @@ spec:
           - --output-dir=/output
           - --report=/output/_report.json
           - --log-format=json
+          - --on-error=continue
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
         volumeMounts:
-          - { name: templates, mountPath: /templates, readOnly: true }
-          - { name: input,     mountPath: /input,     readOnly: true }
-          - { name: output,    mountPath: /output }
+          - name: templates
+            mountPath: /templates
+            readOnly: true
+          - name: input
+            mountPath: /input
+            readOnly: true
+          - name: output
+            mountPath: /output
       volumes:
         - name: templates
-          configMap: { name: rhwp-templates }
+          configMap:
+            name: rhwp-templates    # ConfigMap 또는 PVC/CSI로 교체 가능
         - name: input
-          persistentVolumeClaim: { claimName: rhwp-input }
+          persistentVolumeClaim:
+            claimName: rhwp-input
         - name: output
-          persistentVolumeClaim: { claimName: rhwp-output }
+          persistentVolumeClaim:
+            claimName: rhwp-output
+---
+# to-json 변환 Job 예시
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: rhwp-tojson-
+  labels:
+    app: rhwp-batch
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: rhwp
+        image: registry.local/rhwp-batch:0.1.0
+        args:
+          - to-json
+          - --input-dir=/input
+          - --output-dir=/output
+          - --image-mode=extract
+          - --log-format=json
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+        volumeMounts:
+          - name: input
+            mountPath: /input
+            readOnly: true
+          - name: output
+            mountPath: /output
+      volumes:
+        - name: input
+          persistentVolumeClaim:
+            claimName: rhwp-input
+        - name: output
+          persistentVolumeClaim:
+            claimName: rhwp-output

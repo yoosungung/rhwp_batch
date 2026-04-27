@@ -14,4 +14,8 @@ pub enum BatchError {
     Template(String),
     #[error("Template file not found: {0}")]
     TemplateNotFound(String),
+    #[error("Output file already exists (use --overwrite): {0}")]
+    OutputExists(String),
+    #[error("Missing marker key '{0}'")]
+    MissingKey(String),
 }
