@@ -6,9 +6,10 @@
 > 1. **변환**: HWP/HWPX → JSON (텍스트·표·이미지 포함)
 > 2. **생성**: 양식(template) HWP + JSON → 채워진 HWP (배치 모드 1급 시민)
 
-> ⚠️ **현재 본 README는 v1 예정 사양 문서다.** 프로젝트는 M1 착수 직전 단계이며 아직
-> 실제 바이너리·이미지가 배포되어 있지 않다. 진척 상황은 [ROADMAP.md](ROADMAP.md),
-> 기술 설계는 [DESIGN.md](DESIGN.md), 기여자 작업 규칙은 [CLAUDE.md](CLAUDE.md) 참조.
+> ⚠️ **v0.7.15** — upstream [`rhwp` v0.7.15](https://github.com/edwardkim/rhwp/releases/tag/v0.7.15) 추적.
+> Linux·macOS 바이너리는 [GitHub Releases](https://github.com/yoosungung/rhwp_batch/releases)에서 받을 수 있다.
+> 진척 상황은 [ROADMAP.md](ROADMAP.md), 기술 설계는 [DESIGN.md](DESIGN.md),
+> 기여자 작업 규칙은 [CLAUDE.md](CLAUDE.md) 참조.
 
 ---
 
@@ -34,17 +35,94 @@
 
 ## 설치
 
-### 컨테이너 이미지 (권장)
+### 바이너리 (GitHub Releases)
+
+[`v0.7.15` 릴리즈](https://github.com/yoosungung/rhwp_batch/releases/tag/v0.7.15)에서 플랫폼에 맞는 tarball을 받는다.
+
+| 파일 | 대상 |
+|------|------|
+| `rhwp-batch-v0.7.15-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 (glibc) |
+| `rhwp-batch-v0.7.15-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
 
 ```bash
-docker pull registry.local/rhwp-batch:0.1.0
+# 예: Linux
+curl -LO https://github.com/yoosungung/rhwp_batch/releases/download/v0.7.15/rhwp-batch-v0.7.15-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/yoosungung/rhwp_batch/releases/download/v0.7.15/rhwp-batch-v0.7.15-x86_64-unknown-linux-gnu.tar.gz.sha256
+shasum -a 256 -c rhwp-batch-v0.7.15-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf rhwp-batch-v0.7.15-x86_64-unknown-linux-gnu.tar.gz
+./rhwp-batch --version
+```
+
+### 사전 요구사항 (소스 빌드)
+
+- [Rust](https://rustup.rs/) 1.70 이상 (`rustc`, `cargo`)
+- Git
+
+```bash
+# Rust 미설치 시 (Linux·macOS 공통)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustc --version
+```
+
+### Linux (소스 빌드)
+
+```bash
+git clone https://github.com/yoosungung/rhwp_batch.git
+cd rhwp_batch
+
+# 릴리즈 빌드 (rhwp 의존성 포함, 수 분 소요)
+cargo build --release -p rhwp-batch
+
+# PATH에 설치 (둘 중 하나)
+cargo install --path rhwp-batch --force          # ~/.cargo/bin/
+sudo install -m 755 target/release/rhwp-batch /usr/local/bin/
+
+rhwp-batch --version
+```
+
+운영·파이프라인 환경에서는 아래 **컨테이너 이미지** 사용을 권장한다.
+
+### macOS (소스 빌드, 로컬 개발·검증용)
+
+공식 운영 타깃은 Linux이지만, 로컬에서 변환·양식 채우기를 시험할 때 동일한 절차로 빌드할 수 있다.
+
+```bash
+# Xcode Command Line Tools (최초 1회)
+xcode-select --install
+
+git clone https://github.com/yoosungung/rhwp_batch.git
+cd rhwp_batch
+
+cargo build --release -p rhwp-batch
+cargo install --path rhwp-batch --force          # ~/.cargo/bin/ (PATH에 없으면 ~/.zshrc 등에 추가)
+
+rhwp-batch --version
+```
+
+### 컨테이너 이미지 (운영 권장)
+
+```bash
+docker pull registry.local/rhwp-batch:0.7.15
+```
+
+직접 이미지를 빌드할 때:
+
+```bash
+docker build -f deploy/Dockerfile.batch -t rhwp-batch:local .
+docker run --rm rhwp-batch:local --version
 ```
 
 > 사내 레지스트리 주소·태그는 운영 정책에 맞춰 사용한다.
 
-### 직접 빌드 (개발자)
+### 개발자 참고
 
-기여자용 빌드 절차는 [CLAUDE.md "빌드 및 실행"](CLAUDE.md) 참조.
+테스트·워크스페이스 구조는 [CLAUDE.md "빌드 및 실행"](CLAUDE.md) 참조.
+
+```bash
+cargo test -p rhwp-batch              # 단위·통합 테스트
+cargo test -p rhwp-batch <test_name>  # 단일 테스트
+```
 
 ---
 

@@ -49,9 +49,15 @@ pub fn write_header(doc: &Document, ctx: &SerializeContext) -> Result<Vec<u8>, S
             ("xmlns:dc", "http://purl.org/dc/elements/1.1/"),
             ("xmlns:opf", "http://www.idpf.org/2007/opf/"),
             ("xmlns:epub", "http://www.idpf.org/2007/ops"),
-            ("xmlns:ooxmlchart", "http://www.hancom.co.kr/hwpml/2016/ooxmlchart"),
+            (
+                "xmlns:ooxmlchart",
+                "http://www.hancom.co.kr/hwpml/2016/ooxmlchart",
+            ),
             ("xmlns:hpf", "http://www.hancom.co.kr/schema/2011/hpf"),
-            ("xmlns:config", "urn:oasis:names:tc:opendocument:xmlns:config:1.0"),
+            (
+                "xmlns:config",
+                "urn:oasis:names:tc:opendocument:xmlns:config:1.0",
+            ),
             ("version", "1.2"),
             ("secCnt", &sec_cnt),
         ],
@@ -117,7 +123,10 @@ fn write_fontfaces<W: Write>(w: &mut Writer<W>, doc_info: &DocInfo) -> Result<()
     start_tag_attrs(
         w,
         "hh:fontfaces",
-        &[("itemCnt", &groups.iter().filter(|g| !g.is_empty()).count().to_string())],
+        &[(
+            "itemCnt",
+            &groups.iter().filter(|g| !g.is_empty()).count().to_string(),
+        )],
     )?;
     for (lang_idx, fonts) in groups.iter().enumerate() {
         if fonts.is_empty() {
@@ -203,8 +212,16 @@ fn write_border_fill<W: Write>(
 
     // 자식 순서 (BorderFillType.cpp:51-58):
     // slash, backSlash, leftBorder, rightBorder, topBorder, bottomBorder, diagonal, fillBrush
-    write_diag_line(w, "hh:slash")?;
-    write_diag_line(w, "hh:backSlash")?;
+    write_diag_line(
+        w,
+        "hh:slash",
+        diagonal_shape_type(((bf.attr >> 2) & 0x07) as u8),
+    )?;
+    write_diag_line(
+        w,
+        "hh:backSlash",
+        diagonal_shape_type(((bf.attr >> 5) & 0x07) as u8),
+    )?;
     write_border_line(w, "hh:leftBorder", &bf.borders[0])?;
     write_border_line(w, "hh:rightBorder", &bf.borders[1])?;
     write_border_line(w, "hh:topBorder", &bf.borders[2])?;
@@ -223,12 +240,26 @@ fn write_border_fill<W: Write>(
     Ok(())
 }
 
-fn write_diag_line<W: Write>(w: &mut Writer<W>, name: &str) -> Result<(), SerializeError> {
+fn write_diag_line<W: Write>(
+    w: &mut Writer<W>,
+    name: &str,
+    type_str: &str,
+) -> Result<(), SerializeError> {
     empty_tag(
         w,
         name,
-        &[("type", "NONE"), ("Crooked", "0"), ("isCounter", "0")],
+        &[("type", type_str), ("Crooked", "0"), ("isCounter", "0")],
     )
+}
+
+fn diagonal_shape_type(code: u8) -> &'static str {
+    match code & 0x07 {
+        0 => "NONE",
+        0b010 => "CENTER",
+        0b011 => "CENTER_BELOW",
+        0b110 => "CENTER_ABOVE",
+        _ => "ALL",
+    }
 }
 
 fn write_border_line<W: Write>(
@@ -308,11 +339,21 @@ fn border_width_mm(w: u8) -> &'static str {
 }
 
 fn color_hex(c: ColorRef) -> String {
-    // ColorRef = u32. HWP는 BGR 저장. HWPX는 RGB "#RRGGBB".
+    // ColorRef = u32. HWP 내부 저장: 상위 바이트가 비투명 플래그(0이면 유효 색상).
+    // 0xFFFFFFFF = 투명/없음 센티넬 → "none"
+    if c == 0xFFFFFFFF {
+        return "none".to_string();
+    }
+    // HWPX는 "#RRGGBB" 또는 "#AARRGGBB".
+    let a = ((c >> 24) & 0xFF) as u8;
     let r = (c & 0xFF) as u8;
     let g = ((c >> 8) & 0xFF) as u8;
     let b = ((c >> 16) & 0xFF) as u8;
-    format!("#{:02X}{:02X}{:02X}", r, g, b)
+    if a == 0 {
+        format!("#{:02X}{:02X}{:02X}", r, g, b)
+    } else {
+        format!("#{:02X}{:02X}{:02X}{:02X}", a, r, g, b)
+    }
 }
 
 // =====================================================================
@@ -339,7 +380,11 @@ fn write_char_properties<W: Write>(
     Ok(())
 }
 
-fn write_char_pr<W: Write>(w: &mut Writer<W>, id: u32, cs: &CharShape) -> Result<(), SerializeError> {
+fn write_char_pr<W: Write>(
+    w: &mut Writer<W>,
+    id: u32,
+    cs: &CharShape,
+) -> Result<(), SerializeError> {
     // 속성 순서 (CharShapeType.cpp:79-86): id, height, textColor, shadeColor,
     // useFontSpace, useKerning, symMark, borderFillIDRef
     let shade = if cs.shade_color == 0 {
@@ -398,7 +443,11 @@ fn write_char_pr<W: Write>(w: &mut Writer<W>, id: u32, cs: &CharShape) -> Result
         )?;
     }
     if cs.outline_type != 0 {
-        empty_tag(w, "hh:outline", &[("type", outline_type_str(cs.outline_type))])?;
+        empty_tag(
+            w,
+            "hh:outline",
+            &[("type", outline_type_str(cs.outline_type))],
+        )?;
     }
     if cs.shadow_type != 0 {
         empty_tag(
@@ -457,7 +506,11 @@ fn write_lang_attrs<W: Write>(
 }
 
 fn bool01(b: bool) -> &'static str {
-    if b { "1" } else { "0" }
+    if b {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 fn sym_mark_str(em: u8) -> &'static str {
@@ -589,10 +642,7 @@ fn tab_leader_str(f: u8) -> &'static str {
 // =====================================================================
 // <hh:numberings>
 // =====================================================================
-fn write_numberings<W: Write>(
-    w: &mut Writer<W>,
-    doc_info: &DocInfo,
-) -> Result<(), SerializeError> {
+fn write_numberings<W: Write>(w: &mut Writer<W>, doc_info: &DocInfo) -> Result<(), SerializeError> {
     if doc_info.numberings.is_empty() {
         return Ok(());
     }
@@ -936,10 +986,13 @@ mod tests {
         let doc = parse_hwpx(bytes).expect("parse");
         let ctx = SerializeContext::collect_from_document(&doc);
         let xml = String::from_utf8(write_header(&doc, &ctx).unwrap()).unwrap();
-        let snippet = xml.find("<hh:charPr ").and_then(|i| {
-            let end = xml[i..].find('>').map(|e| i + e)?;
-            Some(&xml[i..=end])
-        }).expect("charPr tag");
+        let snippet = xml
+            .find("<hh:charPr ")
+            .and_then(|i| {
+                let end = xml[i..].find('>').map(|e| i + e)?;
+                Some(&xml[i..=end])
+            })
+            .expect("charPr tag");
         // 속성이 id → height → textColor → shadeColor → useFontSpace → useKerning → symMark → borderFillIDRef 순서여야 함
         let ip = snippet.find("id=").unwrap();
         let hp = snippet.find("height=").unwrap();
@@ -950,5 +1003,33 @@ mod tests {
         let sm = snippet.find("symMark=").unwrap();
         let bf = snippet.find("borderFillIDRef=").unwrap();
         assert!(ip < hp && hp < tc && tc < sc && sc < uf && uf < uk && uk < sm && sm < bf);
+    }
+
+    #[test]
+    fn write_border_fill_preserves_slash_and_backslash_shape_types() {
+        let mut bf = BorderFill::default();
+        bf.attr = (0b010 << 2) | (0b011 << 5);
+
+        let mut writer = Writer::new(Vec::new());
+        write_border_fill(&mut writer, 0, &bf).expect("write borderFill");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+
+        assert!(
+            xml.contains(r#"<hh:slash type="CENTER" Crooked="0" isCounter="0"/>"#),
+            "slash 방향 비트가 CENTER로 보존되어야 함: {xml}"
+        );
+        assert!(
+            xml.contains(r#"<hh:backSlash type="CENTER_BELOW" Crooked="0" isCounter="0"/>"#),
+            "backSlash 방향 비트가 CENTER_BELOW로 보존되어야 함: {xml}"
+        );
+    }
+
+    #[test]
+    fn diagonal_shape_type_matches_hwpx_parser_codes() {
+        assert_eq!(diagonal_shape_type(0), "NONE");
+        assert_eq!(diagonal_shape_type(0b010), "CENTER");
+        assert_eq!(diagonal_shape_type(0b011), "CENTER_BELOW");
+        assert_eq!(diagonal_shape_type(0b110), "CENTER_ABOVE");
+        assert_eq!(diagonal_shape_type(0b111), "ALL");
     }
 }

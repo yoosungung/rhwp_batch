@@ -1,32 +1,68 @@
 //! 유틸리티 함수 (BinData 검색, 번호 포맷, 도형 스타일 변환)
 
-use crate::model::style::{HeadType, Numbering};
+use super::super::page_layout::LayoutRect;
+use super::super::render_tree::*;
+use super::super::{
+    format_number, ArrowStyle, LineStyle, NumberFormat as NumFmt, PathCommand, ShapeStyle,
+    StrokeDash,
+};
 use crate::model::bin_data::BinDataContent;
 use crate::model::footnote::NumberFormat;
-use super::super::render_tree::*;
-use super::super::page_layout::LayoutRect;
-use super::super::{ShapeStyle, LineStyle, PathCommand, StrokeDash, ArrowStyle, format_number, NumberFormat as NumFmt};
+use crate::model::image::Picture;
+use crate::model::style::{HeadType, Numbering};
 
 /// bin_data_id(1-indexed 순번)로 BinDataContent를 찾는다.
 /// bin_data_id는 doc_info의 BinData 레코드 순번(1부터 시작)이며,
 /// BinDataContent 배열도 같은 순서로 저장되어 있다.
-pub(crate) fn find_bin_data<'a>(bin_data_content: &'a [BinDataContent], bin_data_id: u16) -> Option<&'a BinDataContent> {
+///
+/// HWPX 차트는 sparse id (60000+N) 를 사용하므로 인덱스 범위 밖일 때만 id 직접 검색.
+/// 가드 `c.id == bin_data_id` 는 사용하지 않는다 — `c.id` 는 storage_id 이고 bin_data_id 는
+/// 인덱스이므로, 두 값이 다른 경우 (예: hwpspec.hwp 1 페이지 표지) 정상 매칭이 거짓 실패함.
+/// 자세한 정황: mydocs/troubleshootings/bin_data_id_index_mapping.md
+pub(crate) fn find_bin_data<'a>(
+    bin_data_content: &'a [BinDataContent],
+    bin_data_id: u16,
+) -> Option<&'a BinDataContent> {
     if bin_data_id == 0 {
         return None;
     }
-    // 1-indexed 순번으로 먼저 조회 (기존 동작 유지)
+    // 1-indexed 순번으로 BinDataContent 배열 접근
     if let Some(c) = bin_data_content.get((bin_data_id - 1) as usize) {
-        if c.id == bin_data_id {
-            return Some(c);
-        }
+        return Some(c);
     }
-    // 실패 시 id 필드로 직접 검색 (HWPX 차트처럼 sparse id 사용 시)
+    // 인덱스 범위 밖 (HWPX 차트 sparse id 60000+N 등) — id 직접 검색
     bin_data_content.iter().find(|c| c.id == bin_data_id)
+}
+
+/// Picture의 렌더 표시 크기(HWPUNIT)를 반환한다.
+///
+/// 일부 HWP5 그림은 `CommonObjAttr.width/height`보다
+/// `SHAPE_COMPONENT.current_width/current_height`가 실제 한컴 표시 크기에 가깝다.
+/// 기존 도형 경로와 동일하게 current 값이 더 큰 축만 채택해 축소 회귀 위험을 줄인다.
+pub(crate) fn picture_display_size_hu(picture: &Picture) -> (i32, i32) {
+    let mut width = picture.common.width as i32;
+    let mut height = picture.common.height as i32;
+
+    let current_width = picture.shape_attr.current_width as i32;
+    if current_width > 0 && current_width > width {
+        width = current_width;
+    }
+
+    let current_height = picture.shape_attr.current_height as i32;
+    if current_height > 0 && current_height > height {
+        height = current_height;
+    }
+
+    (width, height)
 }
 
 /// 문단의 실효 numbering_id를 반환한다.
 /// Outline 문단이고 para_style.numbering_id==0이면 구역의 outline_numbering_id로 fallback.
-pub fn resolve_numbering_id(head_type: HeadType, para_numbering_id: u16, outline_numbering_id: u16) -> u16 {
+pub fn resolve_numbering_id(
+    head_type: HeadType,
+    para_numbering_id: u16,
+    outline_numbering_id: u16,
+) -> u16 {
     if para_numbering_id == 0 && head_type == HeadType::Outline {
         outline_numbering_id
     } else {
@@ -75,26 +111,44 @@ pub(crate) fn expand_numbering_format(
 /// HWP 표 43 번호 형식 코드 → NumberFormat 변환
 pub(crate) fn numbering_format_to_number_format(code: u8) -> NumFmt {
     match code {
-        0 => NumFmt::Digit,           // 1, 2, 3
-        1 => NumFmt::CircledDigit,    // ①, ②, ③
-        2 => NumFmt::RomanUpper,      // I, II, III
-        3 => NumFmt::RomanLower,      // i, ii, iii
-        4 => NumFmt::LatinUpper,      // A, B, C
-        5 => NumFmt::LatinLower,      // a, b, c
-        8 => NumFmt::HangulGaNaDa,    // 가, 나, 다
-        12 => NumFmt::HangulNumber,   // 일, 이, 삼
-        13 => NumFmt::HanjaNumber,    // 一, 二, 三
+        0 => NumFmt::Digit,         // 1, 2, 3
+        1 => NumFmt::CircledDigit,  // ①, ②, ③
+        2 => NumFmt::RomanUpper,    // I, II, III
+        3 => NumFmt::RomanLower,    // i, ii, iii
+        4 => NumFmt::LatinUpper,    // A, B, C
+        5 => NumFmt::LatinLower,    // a, b, c
+        8 => NumFmt::HangulGaNaDa,  // 가, 나, 다
+        12 => NumFmt::HangulNumber, // 일, 이, 삼
+        13 => NumFmt::HanjaNumber,  // 一, 二, 三
         _ => NumFmt::Digit,
     }
 }
 
 /// 쪽 번호를 형식에 맞게 문자열로 변환 (mod.rs의 format_number 재사용)
-pub(crate) fn format_page_number(page_num: u32, format: u8, prefix_char: char, suffix_char: char, dash_char: char) -> String {
+pub(crate) fn format_page_number(
+    page_num: u32,
+    format: u8,
+    prefix_char: char,
+    suffix_char: char,
+    dash_char: char,
+) -> String {
     let num_fmt = NumFmt::from_hwp_format(format);
     let formatted = format_number(page_num as u16, num_fmt);
-    let prefix = if prefix_char != '\0' { prefix_char.to_string() } else { String::new() };
-    let suffix = if suffix_char != '\0' { suffix_char.to_string() } else { String::new() };
-    let dash = if dash_char != '\0' { dash_char.to_string() } else { String::new() };
+    let prefix = if prefix_char != '\0' {
+        prefix_char.to_string()
+    } else {
+        String::new()
+    };
+    let suffix = if suffix_char != '\0' {
+        suffix_char.to_string()
+    } else {
+        String::new()
+    };
+    let dash = if dash_char != '\0' {
+        dash_char.to_string()
+    } else {
+        String::new()
+    };
     if prefix.is_empty() && suffix.is_empty() && dash.is_empty() {
         formatted
     } else {
@@ -103,7 +157,9 @@ pub(crate) fn format_page_number(page_num: u32, format: u8, prefix_char: char, s
 }
 
 /// ShapeComponentAttr에서 ShapeTransform을 추출한다.
-pub(crate) fn extract_shape_transform(sa: &crate::model::shape::ShapeComponentAttr) -> ShapeTransform {
+pub(crate) fn extract_shape_transform(
+    sa: &crate::model::shape::ShapeComponentAttr,
+) -> ShapeTransform {
     ShapeTransform {
         rotation: sa.rotation_angle as f64,
         horz_flip: sa.horz_flip,
@@ -111,9 +167,11 @@ pub(crate) fn extract_shape_transform(sa: &crate::model::shape::ShapeComponentAt
     }
 }
 
-pub(crate) fn drawing_to_shape_style(drawing: &crate::model::shape::DrawingObjAttr) -> (ShapeStyle, Option<Box<super::super::GradientFillInfo>>) {
-    use crate::model::style::FillType;
+pub(crate) fn drawing_to_shape_style(
+    drawing: &crate::model::shape::DrawingObjAttr,
+) -> (ShapeStyle, Option<Box<super::super::GradientFillInfo>>) {
     use super::super::GradientFillInfo;
+    use crate::model::style::FillType;
 
     // 배경색: solid 필드가 있으면 fill_type과 무관하게 배경색 적용
     // (Image/Gradient와 단색 채우기가 동시에 적용되는 케이스 지원)
@@ -131,7 +189,9 @@ pub(crate) fn drawing_to_shape_style(drawing: &crate::model::shape::DrawingObjAt
         FillType::Gradient => drawing.fill.gradient.as_ref().map(|g| {
             let positions: Vec<f64> = if g.positions.is_empty() {
                 let n = g.colors.len();
-                (0..n).map(|i| i as f64 / (n.max(2) - 1).max(1) as f64).collect()
+                (0..n)
+                    .map(|i| i as f64 / (n.max(2) - 1).max(1) as f64)
+                    .collect()
             } else {
                 g.positions.iter().map(|&p| p as f64 / 100.0).collect()
             };
@@ -172,6 +232,13 @@ pub(crate) fn drawing_to_shape_style(drawing: &crate::model::shape::DrawingObjAt
     if shape_line_type > 0 && stroke_width == 0.0 {
         stroke_width = 0.5; // 최소 0.5px (0.12mm 한컴 기본값)
         stroke_color = Some(border.color);
+    }
+    // [Task #877 Stage 4] 점선 (LineType=2~7) 의 가시성 보강.
+    // sample16 paragraph 393 본문 점선 외곽선 width=56 HU (0.747 px) 가
+    // 점선 dash gap 으로 시각 인식 어려움. 점선 종류만 최소 1.0 px 보강 (실선 width
+    // 는 SVG snapshot 회귀 방지로 영향 안 줌).
+    if (2..=7).contains(&shape_line_type) && stroke_width > 0.0 && stroke_width < 1.0 {
+        stroke_width = 1.0;
     }
 
     // stroke dash 매핑 (hwplib LineType 참조)
@@ -252,12 +319,21 @@ pub(crate) fn drawing_to_line_style(drawing: &crate::model::shape::DrawingObjAtt
         3 => (StrokeDash::Dot, super::super::LineRenderType::Single),
         4 => (StrokeDash::DashDot, super::super::LineRenderType::Single),
         5 => (StrokeDash::DashDotDot, super::super::LineRenderType::Single),
-        6 => (StrokeDash::Dash, super::super::LineRenderType::Single),    // LongDash
-        7 => (StrokeDash::Dot, super::super::LineRenderType::Single),     // CircleDot
+        6 => (StrokeDash::Dash, super::super::LineRenderType::Single), // LongDash
+        7 => (StrokeDash::Dot, super::super::LineRenderType::Single),  // CircleDot
         8 => (StrokeDash::Solid, super::super::LineRenderType::Double),
-        9 => (StrokeDash::Solid, super::super::LineRenderType::ThinThickDouble),
-        10 => (StrokeDash::Solid, super::super::LineRenderType::ThickThinDouble),
-        11 => (StrokeDash::Solid, super::super::LineRenderType::ThinThickThinTriple),
+        9 => (
+            StrokeDash::Solid,
+            super::super::LineRenderType::ThinThickDouble,
+        ),
+        10 => (
+            StrokeDash::Solid,
+            super::super::LineRenderType::ThickThinDouble,
+        ),
+        11 => (
+            StrokeDash::Solid,
+            super::super::LineRenderType::ThinThickThinTriple,
+        ),
         _ => (StrokeDash::Solid, super::super::LineRenderType::Single),
     };
 
@@ -309,11 +385,29 @@ fn arrow_type_from_hwp(hwp_type: u32, fill: bool) -> ArrowStyle {
     match hwp_type {
         0 => ArrowStyle::None,
         1 => ArrowStyle::Arrow,
-        2 => ArrowStyle::Arrow,         // LinedArrow (선형 화살표) → Arrow로 근사
+        2 => ArrowStyle::Arrow, // LinedArrow (선형 화살표) → Arrow로 근사
         3 => ArrowStyle::ConcaveArrow,
-        4 => if fill { ArrowStyle::Diamond } else { ArrowStyle::OpenDiamond },
-        5 => if fill { ArrowStyle::Circle } else { ArrowStyle::OpenCircle },
-        6 => if fill { ArrowStyle::Square } else { ArrowStyle::OpenSquare },
+        4 => {
+            if fill {
+                ArrowStyle::Diamond
+            } else {
+                ArrowStyle::OpenDiamond
+            }
+        }
+        5 => {
+            if fill {
+                ArrowStyle::Circle
+            } else {
+                ArrowStyle::OpenCircle
+            }
+        }
+        6 => {
+            if fill {
+                ArrowStyle::Square
+            } else {
+                ArrowStyle::OpenSquare
+            }
+        }
         _ => ArrowStyle::None,
     }
 }
@@ -333,4 +427,165 @@ fn shape_border_width_to_px(width: i32) -> f64 {
 /// LayoutRect → BoundingBox 변환
 pub(crate) fn layout_rect_to_bbox(rect: &LayoutRect) -> BoundingBox {
     BoundingBox::new(rect.x, rect.y, rect.width, rect.height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_bin_data, picture_display_size_hu};
+    use crate::model::bin_data::BinDataContent;
+    use crate::model::image::Picture;
+
+    fn mk(id: u16, ext: &str) -> BinDataContent {
+        BinDataContent {
+            id,
+            data: vec![],
+            extension: ext.to_string(),
+        }
+    }
+
+    /// bin_data_id=0 은 항상 None
+    #[test]
+    fn find_bin_data_returns_none_for_zero() {
+        let v = vec![mk(1, "png")];
+        assert!(find_bin_data(&v, 0).is_none());
+    }
+
+    #[test]
+    fn picture_display_size_uses_larger_current_axis() {
+        let mut picture = Picture::default();
+        picture.common.width = 3365;
+        picture.common.height = 9446;
+        picture.shape_attr.current_width = 9014;
+        picture.shape_attr.current_height = 9446;
+
+        assert_eq!(picture_display_size_hu(&picture), (9014, 9446));
+    }
+
+    #[test]
+    fn picture_display_size_keeps_common_when_current_is_smaller() {
+        let mut picture = Picture::default();
+        picture.common.width = 9000;
+        picture.common.height = 8000;
+        picture.shape_attr.current_width = 3000;
+        picture.shape_attr.current_height = 4000;
+
+        assert_eq!(picture_display_size_hu(&picture), (9000, 8000));
+    }
+
+    /// hwpspec.hwp 패턴 — bin_data_id=1 이 storage_id=12 를 가리킴 (가드 회귀 방지)
+    #[test]
+    fn find_bin_data_indexed_match_storage_id_differs() {
+        let v = vec![
+            mk(12, "png"), // index 0 → bin_data_id=1
+            mk(1, "bmp"),  // index 1 → bin_data_id=2
+            mk(2, "bmp"),  // index 2 → bin_data_id=3
+        ];
+        // bin_data_id=1 → 인덱스 0 의 BIN000C.png 매칭 (storage_id=12)
+        let c = find_bin_data(&v, 1).expect("매칭 성공");
+        assert_eq!(c.id, 12);
+        assert_eq!(c.extension, "png");
+    }
+
+    /// 일반적인 케이스 — storage_id 가 인덱스와 일치
+    #[test]
+    fn find_bin_data_indexed_match_storage_id_matches() {
+        let v = vec![mk(1, "jpg"), mk(2, "png"), mk(3, "bmp")];
+        for i in 1..=3u16 {
+            let c = find_bin_data(&v, i).expect("매칭 성공");
+            assert_eq!(c.id, i);
+        }
+    }
+
+    /// HWPX 차트 — sparse id 60000+N (인덱스 범위 밖)
+    #[test]
+    fn find_bin_data_sparse_id_for_hwpx_chart() {
+        let v = vec![
+            mk(1, "png"),
+            mk(2, "png"),
+            mk(60001, "ooxml_chart"),
+            mk(60002, "ooxml_chart"),
+        ];
+        // bin_data_id=60001 → 인덱스 60000 범위 밖 → fallback id 직접 검색
+        let c = find_bin_data(&v, 60001).expect("차트 매칭");
+        assert_eq!(c.id, 60001);
+        assert_eq!(c.extension, "ooxml_chart");
+
+        let c2 = find_bin_data(&v, 60002).expect("차트 매칭");
+        assert_eq!(c2.id, 60002);
+    }
+
+    /// 인덱스 범위 밖 + 일치 id 없음 → None
+    #[test]
+    fn find_bin_data_out_of_range_returns_none() {
+        let v = vec![mk(1, "png"), mk(2, "png")];
+        assert!(find_bin_data(&v, 99).is_none());
+    }
+
+    /// 차트 회귀 방지 — HWPX 의 실제 배열 구조 모사
+    /// 일반 BinData (id=인덱스+1) 다음에 차트 (id=60000+N) 가 push 되는 형태
+    #[test]
+    fn find_bin_data_hwpx_realistic_layout_with_chart() {
+        // HWPX 파서 (parser/hwpx/mod.rs:105-127) 의 실제 push 패턴 모사
+        let v = vec![
+            mk(1, "png"),             // index 0 — bin_data_id=1
+            mk(2, "png"),             // index 1 — bin_data_id=2
+            mk(3, "jpg"),             // index 2 — bin_data_id=3
+            mk(60001, "ooxml_chart"), // index 3 — chart 1
+            mk(60002, "ooxml_chart"), // index 4 — chart 2
+        ];
+
+        // 일반 그림: bin_data_id=1,2,3 → 인덱스 매칭
+        for i in 1..=3u16 {
+            let c = find_bin_data(&v, i).expect("그림 매칭");
+            assert_eq!(c.id, i);
+            assert!(c.extension == "png" || c.extension == "jpg");
+        }
+
+        // 차트: bin_data_id=60001,60002 → 인덱스 60000+ 범위 밖 → fallback id 검색
+        let chart1 = find_bin_data(&v, 60001).expect("차트 1");
+        assert_eq!(chart1.id, 60001);
+        assert_eq!(chart1.extension, "ooxml_chart");
+
+        let chart2 = find_bin_data(&v, 60002).expect("차트 2");
+        assert_eq!(chart2.id, 60002);
+
+        // 차트의 인덱스 위치 (3, 4) 는 일반 그림처럼 1-indexed 로도 접근 가능하지만
+        // 차트는 bin_data_id=60001/60002 로 호출되므로 영향 없음
+    }
+
+    /// HWP 패턴 — storage_id sparse 한 일반 그림 (hwpspec.hwp 1 페이지 페이지 표지)
+    #[test]
+    fn find_bin_data_hwp_hwpspec_page_bg_pattern() {
+        // hwpspec.hwp 의 실제 BinData 매핑 (앞부분 14개)
+        // 트러블슈팅 문서의 표 참고
+        let v = vec![
+            mk(0x000C, "png"), // index 0 — bin_data_id=1 → 페이지 표지 (BIN000C.png, 1137 bytes)
+            mk(0x0001, "bmp"), // index 1 — bin_data_id=2
+            mk(0x0002, "bmp"), // index 2 — bin_data_id=3
+            mk(0x0003, "bmp"), // index 3
+            mk(0x0004, "bmp"), // index 4
+            mk(0x0005, "bmp"), // index 5
+            mk(0x0006, "bmp"), // index 6
+            mk(0x0007, "bmp"), // index 7
+            mk(0x0008, "bmp"), // index 8
+            mk(0x0009, "bmp"), // index 9
+            mk(0x000A, "bmp"), // index 10
+            mk(0x000B, "bmp"), // index 11
+            mk(0x002B, "png"), // index 12 — bin_data_id=13
+            mk(0x000D, "bmp"), // index 13 — bin_data_id=14
+        ];
+
+        // 페이지 표지 — bin_data_id=1 → 인덱스 0 → storage_id=12 (PNG)
+        let bg = find_bin_data(&v, 1).expect("페이지 표지");
+        assert_eq!(
+            bg.id, 0x000C,
+            "회귀: bin_data_id=1 이 storage_id=12 가 아님 (가드가 정상 매칭을 거짓 실패시킴)"
+        );
+        assert_eq!(bg.extension, "png");
+
+        // bin_data_id=14 → 인덱스 13 → storage_id=13 (BMP)
+        let p2 = find_bin_data(&v, 14).expect("두 번째 표지");
+        assert_eq!(p2.id, 0x000D);
+        assert_eq!(p2.extension, "bmp");
+    }
 }

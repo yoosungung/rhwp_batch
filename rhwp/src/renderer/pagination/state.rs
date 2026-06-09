@@ -1,8 +1,8 @@
 //! PaginationState: paginate_with_measured의 가변 상태를 캡슐화
 
-use std::collections::HashMap;
+use super::{ColumnContent, PageContent, PageItem, WrapAroundPara};
 use crate::renderer::page_layout::PageLayoutInfo;
-use super::{PageContent, ColumnContent, PageItem, WrapAroundPara};
+use std::collections::HashMap;
 
 /// 페이지당 방어 로직 최대 실행 횟수.
 /// 정상 문서에서는 절대 도달하지 않는 값. 이 값을 초과하면 무한 루프로 판단하고 강제 배치.
@@ -27,6 +27,8 @@ pub(super) struct PaginationState {
     pub footnote_safety_margin: f64,
     /// 현재 단에 축적된 어울림 리턴 문단 목록
     pub current_column_wrap_around_paras: Vec<WrapAroundPara>,
+    /// [Task #604 R3] 현재 단의 wrap text 문단 ↔ anchor 메타데이터
+    pub current_column_wrap_anchors: std::collections::HashMap<usize, super::WrapAnchorRef>,
     /// 현재 페이지의 vpos 기준점 (첫 문단의 vertical_pos, HWPUNIT)
     /// layout의 vpos 보정과 동기화하기 위해 사용
     pub page_vpos_base: Option<i32>,
@@ -67,6 +69,7 @@ impl PaginationState {
             footnote_separator_overhead,
             footnote_safety_margin,
             current_column_wrap_around_paras: Vec::new(),
+            current_column_wrap_anchors: std::collections::HashMap::new(),
             page_vpos_base: None,
             page_has_block_table: false,
             defense_counts: HashMap::new(),
@@ -82,11 +85,14 @@ impl PaginationState {
         }
         let col_content = ColumnContent {
             column_index: self.current_column,
+            start_height: 0.0,
+            endnote_flow: false,
             items: std::mem::take(&mut self.current_items),
             zone_layout: self.current_zone_layout.clone(),
             zone_y_offset: self.current_zone_y_offset,
             wrap_around_paras: std::mem::take(&mut self.current_column_wrap_around_paras),
             used_height: self.current_height,
+            wrap_anchors: std::mem::take(&mut self.current_column_wrap_anchors),
         };
         if let Some(page) = self.pages.last_mut() {
             page.column_contents.push(col_content);
@@ -99,11 +105,14 @@ impl PaginationState {
     pub fn flush_column_always(&mut self) {
         let col_content = ColumnContent {
             column_index: self.current_column,
+            start_height: 0.0,
+            endnote_flow: false,
             items: std::mem::take(&mut self.current_items),
             zone_layout: self.current_zone_layout.clone(),
             zone_y_offset: self.current_zone_y_offset,
             wrap_around_paras: std::mem::take(&mut self.current_column_wrap_around_paras),
             used_height: self.current_height,
+            wrap_anchors: std::mem::take(&mut self.current_column_wrap_anchors),
         };
         if let Some(page) = self.pages.last_mut() {
             page.column_contents.push(col_content);
@@ -132,7 +141,10 @@ impl PaginationState {
             return;
         }
         let is_para_item = self.current_items.last().map_or(false, |item| {
-            matches!(item, PageItem::FullParagraph { .. } | PageItem::PartialParagraph { .. })
+            matches!(
+                item,
+                PageItem::FullParagraph { .. } | PageItem::PartialParagraph { .. }
+            )
         });
         if !is_para_item {
             return;
@@ -217,6 +229,7 @@ impl PaginationState {
         self.current_zone_layout = None;
         self.on_first_multicolumn_page = false;
         self.current_column_wrap_around_paras.clear();
+        self.current_column_wrap_anchors.clear();
     }
 
     /// PageContent 생성 헬퍼

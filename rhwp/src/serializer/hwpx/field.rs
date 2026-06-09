@@ -9,8 +9,6 @@
 //! - 누름틀(ClickHere), 날짜, 메일머지 등 복잡한 필드는 `<hp:fieldBegin type="...">` 의
 //!   type 속성만 구분하고 내부 command 직렬화는 #186 에서 확장.
 
-#![allow(dead_code)]
-
 use std::io::Write;
 
 use quick_xml::Writer;
@@ -60,6 +58,7 @@ pub fn write_field_end<W: Write>(w: &mut Writer<W>, field_id: u32) -> Result<(),
 // 하이퍼링크 (필드의 특수형) — <hp:fieldBegin type="HYPERLINK"> 변형
 // =====================================================================
 
+#[allow(dead_code)]
 pub fn write_hyperlink_begin<W: Write>(
     w: &mut Writer<W>,
     link: &Hyperlink,
@@ -86,30 +85,28 @@ pub fn write_hyperlink_begin<W: Write>(
 // =====================================================================
 
 /// `<hp:fn>` 각주 뼈대 (내부 문단 직렬화는 #186 에서 연결).
-pub fn write_footnote_open<W: Write>(
-    w: &mut Writer<W>,
-    number: u16,
-) -> Result<(), SerializeError> {
+#[allow(dead_code)]
+pub fn write_footnote_open<W: Write>(w: &mut Writer<W>, number: u16) -> Result<(), SerializeError> {
     let n = number.to_string();
     start_tag(w, "hp:fn")?;
     empty_tag(w, "hp:autoNum", &[("num", &n)])?;
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn write_footnote_close<W: Write>(w: &mut Writer<W>) -> Result<(), SerializeError> {
     end_tag(w, "hp:fn")
 }
 
-pub fn write_endnote_open<W: Write>(
-    w: &mut Writer<W>,
-    number: u16,
-) -> Result<(), SerializeError> {
+#[allow(dead_code)]
+pub fn write_endnote_open<W: Write>(w: &mut Writer<W>, number: u16) -> Result<(), SerializeError> {
     let n = number.to_string();
     start_tag(w, "hp:en")?;
     empty_tag(w, "hp:autoNum", &[("num", &n)])?;
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn write_endnote_close<W: Write>(w: &mut Writer<W>) -> Result<(), SerializeError> {
     end_tag(w, "hp:en")
 }
@@ -119,7 +116,11 @@ pub fn write_endnote_close<W: Write>(w: &mut Writer<W>) -> Result<(), SerializeE
 // =====================================================================
 
 fn bool01(b: bool) -> &'static str {
-    if b { "1" } else { "0" }
+    if b {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 fn field_type_str(t: FieldType) -> &'static str {
@@ -156,7 +157,9 @@ mod tests {
 
     #[test]
     fn bookmark_emits_name() {
-        let bm = Bookmark { name: "chapter1".to_string() };
+        let bm = Bookmark {
+            name: "chapter1".to_string(),
+        };
         let xml = to_string(|w| write_bookmark(w, &bm));
         assert!(xml.contains(r#"<hp:bookmark name="chapter1"/>"#), "{}", xml);
     }
@@ -189,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn footnote_emits_autoNum() {
+    fn footnote_emits_auto_num() {
         let xml = to_string(|w| {
             write_footnote_open(w, 3)?;
             write_footnote_close(w)

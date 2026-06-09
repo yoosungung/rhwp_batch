@@ -1,24 +1,52 @@
 //! 각주/미주 (Footnote, Endnote, FootnoteShape)
 
-use super::*;
 use super::paragraph::Paragraph;
+use super::*;
 
 /// 각주 ('fn  ' 컨트롤)
+///
+/// [Task #1050] HWP5 CTRL_FOOTNOTE payload 전체 보존 (size=20):
+/// number(UInt4) + beforeDecorationLetter(WChar) + afterDecorationLetter(WChar)
+/// + numberShape(UInt4) + instanceId(UInt4, optional).
+///
+/// LIST_HEADER for Footnote (size=16): paraCount(SInt4) + property(UInt4) + 8 byte zero padding.
+///
+/// 참조: `hwplib::ControlFootnote` + `CtrlHeaderFootnote`.
 #[derive(Debug, Default, Clone)]
 pub struct Footnote {
     /// 각주 번호
     pub number: u16,
     /// 문단 리스트
     pub paragraphs: Vec<Paragraph>,
+    /// 앞 장식 문자 (WChar, default 0 = 없음)
+    pub before_decoration_letter: u16,
+    /// 뒤 장식 문자 (WChar, default 0x0029 = ')')
+    pub after_decoration_letter: u16,
+    /// 번호 모양 (UInt4, default 0 = Digit)
+    pub number_shape: u32,
+    /// 문서 내 고유 식별자 (UInt4, optional)
+    pub instance_id: u32,
+    /// LIST_HEADER property (UInt4, default 0)
+    pub list_header_property: u32,
 }
 
-/// 미주 ('en  ' 컨트롤)
+/// 미주 ('en  ' 컨트롤) — [Task #1050] Footnote 와 동일 구조
 #[derive(Debug, Default, Clone)]
 pub struct Endnote {
     /// 미주 번호
     pub number: u16,
     /// 문단 리스트
     pub paragraphs: Vec<Paragraph>,
+    /// 앞 장식 문자 (WChar)
+    pub before_decoration_letter: u16,
+    /// 뒤 장식 문자 (WChar)
+    pub after_decoration_letter: u16,
+    /// 번호 모양 (UInt4)
+    pub number_shape: u32,
+    /// 문서 내 고유 식별자 (UInt4)
+    pub instance_id: u32,
+    /// LIST_HEADER property (UInt4)
+    pub list_header_property: u32,
 }
 
 /// 각주/미주 모양 (HWPTAG_FOOTNOTE_SHAPE)
@@ -62,25 +90,25 @@ pub struct FootnoteShape {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum NumberFormat {
     #[default]
-    Digit,                // 1, 2, 3
-    CircledDigit,         // ①, ②, ③
-    UpperRoman,           // I, II, III
-    LowerRoman,           // i, ii, iii
-    UpperAlpha,           // A, B, C
-    LowerAlpha,           // a, b, c
-    CircledUpperAlpha,    // Ⓐ, Ⓑ, Ⓒ
-    CircledLowerAlpha,    // ⓐ, ⓑ, ⓒ
-    HangulSyllable,       // 가, 나, 다
-    CircledHangulSyllable,// ㉮, ㉯, ㉰
-    HangulJamo,           // ㄱ, ㄴ, ㄷ
-    CircledHangulJamo,    // ㉠, ㉡, ㉢
-    HangulDigit,          // 일, 이, 삼
-    HanjaDigit,           // 一, 二, 三
-    CircledHanjaDigit,    // 동그라미 一, 二, 三
-    HanjaGapEul,          // 갑, 을, 병 ...
-    HanjaGapEulHanja,     // 甲, 乙, 丙 ...
-    FourSymbol,           // 4가지 문자 반복
-    UserChar,             // 사용자 지정 문자 반복
+    Digit, // 1, 2, 3
+    CircledDigit,          // ①, ②, ③
+    UpperRoman,            // I, II, III
+    LowerRoman,            // i, ii, iii
+    UpperAlpha,            // A, B, C
+    LowerAlpha,            // a, b, c
+    CircledUpperAlpha,     // Ⓐ, Ⓑ, Ⓒ
+    CircledLowerAlpha,     // ⓐ, ⓑ, ⓒ
+    HangulSyllable,        // 가, 나, 다
+    CircledHangulSyllable, // ㉮, ㉯, ㉰
+    HangulJamo,            // ㄱ, ㄴ, ㄷ
+    CircledHangulJamo,     // ㉠, ㉡, ㉢
+    HangulDigit,           // 일, 이, 삼
+    HanjaDigit,            // 一, 二, 三
+    CircledHanjaDigit,     // 동그라미 一, 二, 三
+    HanjaGapEul,           // 갑, 을, 병 ...
+    HanjaGapEulHanja,      // 甲, 乙, 丙 ...
+    FourSymbol,            // 4가지 문자 반복
+    UserChar,              // 사용자 지정 문자 반복
 }
 
 /// 번호 매기기 방식

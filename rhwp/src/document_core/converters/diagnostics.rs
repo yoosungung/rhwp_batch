@@ -40,7 +40,8 @@ impl DiffSummary {
 
     /// 영역별 카운트.
     pub fn counts_by_area(&self) -> Vec<(&'static str, usize)> {
-        let mut map: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+        let mut map: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
         for it in &self.items {
             *map.entry(it.area).or_insert(0) += 1;
         }
@@ -72,7 +73,7 @@ impl DiffSummary {
 ///
 /// 검사 항목 (Stage 1 베이스라인):
 /// - `table.raw_ctrl_data` 가 비어있는 표 (직렬화기가 빈 ctrl_data 작성 → 한컴 거부)
-/// - `cell.apply_inner_margin == true` 이지만 `raw_list_extra` 에 bit 16 보강 없음
+/// - `cell.apply_inner_margin == true` 이지만 LIST_HEADER width_ref bit 0 보강 없음
 /// - `paragraph.line_segs[i].vertical_pos == 0` 인 비-첫줄 lineseg (페이지 폭주 원인)
 /// - `section.raw_stream is Some` 인지 (있으면 직렬화기 빠른 경로, 없으면 동적)
 ///
@@ -135,9 +136,11 @@ fn check_paragraph(
                     hwp_value: "(CommonObjAttr 직렬화 필요)".into(),
                 });
             }
-            if t.raw_table_record_attr == 0 && (t.attr != 0
-                || t.repeat_header
-                || !matches!(t.page_break, crate::model::table::TablePageBreak::None)) {
+            if t.raw_table_record_attr == 0
+                && (t.attr != 0
+                    || t.repeat_header
+                    || !matches!(t.page_break, crate::model::table::TablePageBreak::None))
+            {
                 summary.push(IrFieldDiff {
                     area: "table.raw_table_record_attr",
                     location: format!(
@@ -153,15 +156,15 @@ fn check_paragraph(
             }
             // 셀별 검사
             for (cell_idx, cell) in t.cells.iter().enumerate() {
-                if cell.apply_inner_margin && !raw_list_extra_has_bit16(&cell.raw_list_extra) {
+                if cell.apply_inner_margin && cell.list_header_width_ref & 0x0001 == 0 {
                     summary.push(IrFieldDiff {
-                        area: "cell.list_attr.bit16",
+                        area: "cell.list_header_width_ref.bit0",
                         location: format!(
                             "{}sec={},para={},ctrl={},cell={}",
                             path_prefix, sec_idx, para_idx, ctrl_idx, cell_idx
                         ),
-                        hwpx_value: "apply_inner_margin=true, bit16=0".into(),
-                        hwp_value: "bit16=1 (셀 안 여백 지정)".into(),
+                        hwpx_value: "apply_inner_margin=true, width_ref bit0=0".into(),
+                        hwp_value: "width_ref bit0=1 (셀 안 여백 지정)".into(),
                     });
                 }
                 // 셀 내부 문단 재귀
@@ -175,12 +178,6 @@ fn check_paragraph(
             }
         }
     }
-}
-
-/// `raw_list_extra` 가 bit 16 (apply_inner_margin) 을 표현하는지 — Stage 3 에서 본격화.
-/// Stage 1 은 보수적으로 항상 false 반환 (일단 영역 누적이 목적).
-fn raw_list_extra_has_bit16(_extra: &[u8]) -> bool {
-    false
 }
 
 /// 두 IR (HWPX 출처와 HWP 출처) 의 영역별 차이를 비교한다.
@@ -220,11 +217,9 @@ mod tests {
         // 빈 문서엔 표/lineseg 자체가 없으므로 critical 영역 차이 0
         let counts = summary.counts_by_area();
         assert!(
-            counts
-                .iter()
-                .all(|(a, _)| *a != "table.raw_ctrl_data"
-                    && *a != "cell.list_attr.bit16"
-                    && *a != "paragraph.line_seg.vertical_pos"),
+            counts.iter().all(|(a, _)| *a != "table.raw_ctrl_data"
+                && *a != "cell.list_header_width_ref.bit0"
+                && *a != "paragraph.line_seg.vertical_pos"),
             "empty doc should have no critical-area diffs, got: {:?}",
             counts
         );

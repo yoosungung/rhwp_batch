@@ -3,13 +3,14 @@
 //! DocInfo 참조 테이블을 렌더링에서 바로 사용할 수 있는
 //! 해소된 스타일 목록(ResolvedStyleSet)으로 변환한다.
 
+use super::{hwpunit_to_px, GradientFillInfo, PatternFillInfo, TabStop};
 use crate::model::document::DocInfo;
+use crate::model::image::ImageEffect;
 use crate::model::style::{
-    Alignment, BorderFill, BorderLine, Bullet, CharShape, DiagonalLine, HeadType,
-    ImageFillMode, LineSpacingType, Numbering, ParaShape, TabDef, UnderlineType, FillType,
+    Alignment, BorderFill, BorderLine, Bullet, CharShape, DiagonalLine, FillType, HeadType,
+    ImageFillMode, LineSpacingType, Numbering, ParaShape, TabDef, UnderlineType,
 };
 use crate::model::ColorRef;
-use super::{hwpunit_to_px, GradientFillInfo, PatternFillInfo, TabStop};
 
 /// HWP 언어 카테고리 수 (한국어, 영어, 한자, 일본어, 기타, 기호, 사용자)
 pub const LANG_COUNT: usize = 7;
@@ -249,6 +250,12 @@ pub struct ResolvedImageFill {
     pub bin_data_id: u16,
     /// 이미지 채우기 모드
     pub fill_mode: ImageFillMode,
+    /// 밝기
+    pub brightness: i8,
+    /// 명암
+    pub contrast: i8,
+    /// 그림 효과
+    pub effect: ImageEffect,
 }
 
 impl Default for ResolvedBorderStyle {
@@ -266,7 +273,7 @@ impl Default for ResolvedBorderStyle {
 }
 
 /// 해소된 스타일 세트 (DocInfo에서 변환)
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ResolvedStyleSet {
     /// 글자 스타일 목록 (char_shapes[id]에 대응)
     pub char_styles: Vec<ResolvedCharStyle>,
@@ -282,8 +289,19 @@ pub struct ResolvedStyleSet {
 
 /// DocInfo 참조 테이블을 해소된 스타일 목록으로 변환한다.
 pub fn resolve_styles(doc_info: &DocInfo, dpi: f64) -> ResolvedStyleSet {
+    resolve_styles_with_variant(doc_info, dpi, false)
+}
+
+/// [Task #1001] HWP3 → HWP5 변환본 인지하여 ParaShape spacing/margin 추가 보정.
+/// 변환본의 ParaShape 단위는 일반 HWP5 의 2배 (HwpUnitChar / HWPUNIT 의 2배 스케일)
+/// 이므로 추가 1/2 보정 적용. 호출자가 Document::is_hwp3_variant 를 전달.
+pub fn resolve_styles_with_variant(
+    doc_info: &DocInfo,
+    dpi: f64,
+    is_hwp3_variant: bool,
+) -> ResolvedStyleSet {
     let char_styles = resolve_char_styles(doc_info, dpi);
-    let para_styles = resolve_para_styles(doc_info, dpi);
+    let para_styles = resolve_para_styles_with_variant(doc_info, dpi, is_hwp3_variant);
     let border_styles = resolve_border_styles(doc_info);
     let numberings = doc_info.numberings.clone();
     let bullets = doc_info.bullets.clone();
@@ -307,11 +325,7 @@ fn resolve_char_styles(doc_info: &DocInfo, dpi: f64) -> Vec<ResolvedCharStyle> {
 }
 
 /// 개별 CharShape 해소
-fn resolve_single_char_style(
-    cs: &CharShape,
-    doc_info: &DocInfo,
-    dpi: f64,
-) -> ResolvedCharStyle {
+fn resolve_single_char_style(cs: &CharShape, doc_info: &DocInfo, dpi: f64) -> ResolvedCharStyle {
     // base_size는 HWPUNIT 단위
     let font_size = hwpunit_to_px(cs.base_size, dpi);
 
@@ -445,7 +459,18 @@ pub fn primary_font_name(font_family: &str) -> &str {
 /// HWP 문서의 원본 폰트 이름 + 타입(TTF/HFT) + 언어 카테고리를 기반으로
 /// @font-face에 등록된 최종 폰트로 치환한다.
 /// 체인이 이미 평탄화되어 1회 조회로 최종 결과를 반환한다.
-pub(crate) fn resolve_font_substitution(name: &str, alt_type: u8, lang_index: usize) -> Option<&'static str> {
+pub(crate) fn resolve_font_substitution(
+    name: &str,
+    alt_type: u8,
+    lang_index: usize,
+) -> Option<&'static str> {
+    // HWP3 원본/일부 한컴 재저장본은 HCI 영문 폰트를 TTF(type=1) 또는
+    // unknown(type=0)으로 싣기도 한다. 한컴은 같은 face를 보여주므로
+    // alt_type 차이와 무관하게 legacy 영문 HFT 치환을 우선 적용한다.
+    if let Some(result) = resolve_legacy_latin_font(name, lang_index) {
+        return Some(result);
+    }
+
     // HFT(type=2) 폰트 치환
     if alt_type == 2 {
         if let Some(result) = resolve_hft_font(name, lang_index) {
@@ -455,6 +480,53 @@ pub(crate) fn resolve_font_substitution(name: &str, alt_type: u8, lang_index: us
 
     // TTF(type=1) 또는 알수없음(type=0) 치환
     resolve_ttf_font(name)
+}
+
+fn resolve_legacy_latin_font(name: &str, lang_index: usize) -> Option<&'static str> {
+    if lang_index != 1 {
+        return None;
+    }
+
+    match name {
+        "HCI Poppy" => Some("Palatino Linotype"),
+        "HCI Tulip"
+        | "HCI Morning Glory"
+        | "HCI Centaurea"
+        | "HCI Bellflower"
+        | "AmeriGarmnd BT"
+        | "Bodoni Bd BT"
+        | "Bodoni Bk BT"
+        | "Baskerville BT"
+        | "GoudyOlSt BT"
+        | "Cooper Blk BT"
+        | "Stencil BT"
+        | "BrushScript BT"
+        | "CommercialScript BT"
+        | "Liberty BT"
+        | "MurrayHill Bd BT"
+        | "ParkAvenue BT"
+        | "CentSchbook BT"
+        | "펜흘림" => Some("HY견명조"),
+        "HCI Hollyhock"
+        | "HCI Hollyhock Narrow"
+        | "HCI Acacia"
+        | "Swis721 BT"
+        | "Hobo BT"
+        | "Orbit-B BT"
+        | "Blippo Blk BT"
+        | "BroadwayEngraved BT"
+        | "FuturaBlack BT"
+        | "Newtext Bk BT"
+        | "DomCasual BT"
+        | "가는안상수체영문"
+        | "중간안상수체영문"
+        | "굵은안상수체영문" => Some("HY중고딕"),
+        "HCI Columbine" | "Courier10 BT" | "OCR-A BT" | "OCR-B-10 BT" | "Orator10 BT" => {
+            Some("Calibri")
+        }
+        "BernhardFashion BT" | "Freehand591 BT" => Some("HY중고딕"),
+        _ => None,
+    }
 }
 
 /// HFT 폰트 → @font-face 등록 폰트 치환 (언어별)
@@ -483,13 +555,20 @@ fn resolve_hft_font(name: &str, lang_index: usize) -> Option<&'static str> {
         "명조" => Some("HY견명조"),
         // 체인 평탄화: 다단계 HFT→HFT→...→TTF 체인의 최종 결과
         "휴먼명조" => Some("HY신명조"),
-        "문화바탕" | "문화바탕제목" | "문화쓰기" | "문화쓰기흘림" => Some("HY신명조"),
-        "신명 세명조" | "신명 신명조" | "신명 신신명조" | "신명 중명조"
-        | "신명 순명조" | "신명 신문명조" => Some("HY신명조"),
+        "문화바탕" | "문화바탕제목" | "문화쓰기" | "문화쓰기흘림" => {
+            Some("HY신명조")
+        }
+        "신명 세명조"
+        | "신명 신명조"
+        | "신명 신신명조"
+        | "신명 중명조"
+        | "신명 순명조"
+        | "신명 신문명조" => Some("HY신명조"),
         "옛한글" | "양재 다운명조M" => Some("HY신명조"),
-        "#세명조" | "#신명조" | "#중명조" | "#신중명조"
-        | "#화명조A" | "#화명조B" | "#태명조" | "#신태명조" | "#태신명조"
-        | "#견명조" | "#신문명조" | "#신문태명" => Some("HY신명조"),
+        "#세명조" | "#신명조" | "#중명조" | "#신중명조" | "#화명조A" | "#화명조B" | "#태명조"
+        | "#신태명조" | "#태신명조" | "#견명조" | "#신문명조" | "#신문태명" => {
+            Some("HY신명조")
+        }
         // 고딕 계열
         "휴먼고딕" | "문화돋움" | "문화돋움제목" | "태 나무" => Some("돋움"),
         "휴먼옛체" | "딸기" => Some("돋움"),
@@ -500,9 +579,8 @@ fn resolve_hft_font(name: &str, lang_index: usize) -> Option<&'static str> {
         "양재 매화" | "양재 소슬" | "양재 샤넬" | "옥수수" => Some("돋움"),
         "양재 본목각M" | "복숭아" => Some("돋움"),
         "신명 세고딕" | "신명 디나루" | "신명 세나루" => Some("돋움"),
-        "#세고딕" | "#신세고딕" | "#중고딕" | "#태고딕"
-        | "#신문고딕" | "#신문태고" | "#세나루" | "#신세나루"
-        | "#디나루" | "#신디나루" => Some("돋움"),
+        "#세고딕" | "#신세고딕" | "#중고딕" | "#태고딕" | "#신문고딕" | "#신문태고" | "#세나루"
+        | "#신세나루" | "#디나루" | "#신디나루" => Some("돋움"),
         // 그래픽/궁서/기타
         "신명 신그래픽" | "강낭콩" => Some("굴림"),
         "#그래픽" | "#신그래픽" | "#공작" => Some("굴림"),
@@ -510,7 +588,9 @@ fn resolve_hft_font(name: &str, lang_index: usize) -> Option<&'static str> {
         "#빅" => Some("HY견고딕"),
         "태 헤드라인T" => Some("HY견고딕"),
         "태 헤드라인D" => Some("HY견명조"),
-        "가는공한" | "중간공한" | "굵은공한" | "필기" | "타이프" => Some("HY견명조"),
+        "가는공한" | "중간공한" | "굵은공한" | "필기" | "타이프" => {
+            Some("HY견명조")
+        }
         "가지" | "오이" | "양재 둘기" => Some("HY견명조"),
         "신명 궁서" | "#궁서" => Some("궁서"),
         "#수암A" | "#수암B" => Some("돋움"),
@@ -532,19 +612,41 @@ fn resolve_hft_font(name: &str, lang_index: usize) -> Option<&'static str> {
     // 영어(1) 전용 HFT 치환
     if lang_index == 1 {
         match name {
-            "HCI Tulip" | "HCI Morning Glory" | "HCI Centaurea"
-            | "HCI Bellflower" | "AmeriGarmnd BT" | "Bodoni Bd BT"
-            | "Bodoni Bk BT" | "Baskerville BT" | "GoudyOlSt BT"
-            | "Cooper Blk BT" | "Stencil BT" | "BrushScript BT"
-            | "CommercialScript BT" | "Liberty BT" | "MurrayHill Bd BT"
-            | "ParkAvenue BT" | "CentSchbook BT" | "펜흘림" => Some("HY견명조"),
-            "HCI Hollyhock" | "HCI Hollyhock Narrow" | "HCI Acacia"
-            | "Swis721 BT" | "Hobo BT" | "Orbit-B BT"
-            | "Blippo Blk BT" | "BroadwayEngraved BT"
-            | "FuturaBlack BT" | "Newtext Bk BT" | "DomCasual BT"
-            | "가는안상수체영문" | "중간안상수체영문" | "굵은안상수체영문" => Some("HY중고딕"),
-            "HCI Columbine" | "Courier10 BT" | "OCR-A BT"
-            | "OCR-B-10 BT" | "Orator10 BT" => Some("Calibri"),
+            "HCI Tulip"
+            | "HCI Morning Glory"
+            | "HCI Centaurea"
+            | "HCI Bellflower"
+            | "AmeriGarmnd BT"
+            | "Bodoni Bd BT"
+            | "Bodoni Bk BT"
+            | "Baskerville BT"
+            | "GoudyOlSt BT"
+            | "Cooper Blk BT"
+            | "Stencil BT"
+            | "BrushScript BT"
+            | "CommercialScript BT"
+            | "Liberty BT"
+            | "MurrayHill Bd BT"
+            | "ParkAvenue BT"
+            | "CentSchbook BT"
+            | "펜흘림" => Some("HY견명조"),
+            "HCI Hollyhock"
+            | "HCI Hollyhock Narrow"
+            | "HCI Acacia"
+            | "Swis721 BT"
+            | "Hobo BT"
+            | "Orbit-B BT"
+            | "Blippo Blk BT"
+            | "BroadwayEngraved BT"
+            | "FuturaBlack BT"
+            | "Newtext Bk BT"
+            | "DomCasual BT"
+            | "가는안상수체영문"
+            | "중간안상수체영문"
+            | "굵은안상수체영문" => Some("HY중고딕"),
+            "HCI Columbine" | "Courier10 BT" | "OCR-A BT" | "OCR-B-10 BT" | "Orator10 BT" => {
+                Some("Calibri")
+            }
             "BernhardFashion BT" | "Freehand591 BT" => Some("HY중고딕"),
             _ => None,
         }
@@ -598,31 +700,75 @@ fn resolve_ttf_font(name: &str) -> Option<&'static str> {
 /// regular weight fallback 으로 떨어지면 PDF(한컴) 출력과 시각 괴리가
 /// 발생하므로, 이 리스트에 포함된 face 는 SVG 에서 font-weight="bold"
 /// 를 강제해 fallback bold variant 로 근사 렌더한다.
+///
+/// Task #574: HY견명조 는 한컴 일반 두께 명조 — heavy 가 아님. 제거.
+/// HY견명조B (명시 Bold variant) 는 보존.
 pub(crate) fn is_heavy_display_face(font_family: &str) -> bool {
     // font_family 는 "HY헤드라인M,'Malgun Gothic',..." 처럼 CSS 체인 형태.
     // 첫 face 만 검사 (HWP 가 지정한 primary face).
-    let primary = font_family.split(',').next().unwrap_or(font_family)
+    let primary = font_family
+        .split(',')
+        .next()
+        .unwrap_or(font_family)
         .trim()
         .trim_matches('\'')
         .trim_matches('"');
-    matches!(primary,
-        "HY헤드라인M" | "HYHeadLine M" | "HYHeadLine Medium"
-        | "HY견고딕" | "HY견명조" | "HY견명조B"
-        | "HY그래픽" | "HY그래픽M"
+    matches!(
+        primary,
+        "HY헤드라인M"
+            | "HYHeadLine M"
+            | "HYHeadLine Medium"
+            | "HY견고딕"
+            | "HY견명조B"
+            | "HY그래픽"
+            | "HY그래픽M"
     )
+}
+
+/// 중고딕/태고딕 계열 (CSS font-weight 500) 폰트 판별.
+///
+/// HWP 에서 중고딕 계열은 Regular(400)과 Bold(700) 사이의 Medium(500) weight.
+/// Fallback 폰트 매칭 시 weight 500 힌트를 주어 선명도를 유지한다.
+pub(crate) fn is_medium_weight_face(font_family: &str) -> bool {
+    let primary = font_family
+        .split(',')
+        .next()
+        .unwrap_or(font_family)
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"');
+    let lower = primary.to_lowercase();
+    lower.contains("중고딕")
+        || lower.contains("태고딕")
+        || lower.contains("mediumgothic")
+        || lower.contains("hymedium")
 }
 
 /// ParaShape → ResolvedParaStyle 목록
 fn resolve_para_styles(doc_info: &DocInfo, dpi: f64) -> Vec<ResolvedParaStyle> {
+    resolve_para_styles_with_variant(doc_info, dpi, false)
+}
+
+/// [Task #1001] 변환본 인지 ParaShape 해소
+fn resolve_para_styles_with_variant(
+    doc_info: &DocInfo,
+    dpi: f64,
+    is_hwp3_variant: bool,
+) -> Vec<ResolvedParaStyle> {
     doc_info
         .para_shapes
         .iter()
-        .map(|ps| resolve_single_para_style(ps, &doc_info.tab_defs, dpi))
+        .map(|ps| resolve_single_para_style(ps, &doc_info.tab_defs, dpi, is_hwp3_variant))
         .collect()
 }
 
 /// 개별 ParaShape 해소
-fn resolve_single_para_style(ps: &ParaShape, tab_defs: &[TabDef], dpi: f64) -> ResolvedParaStyle {
+fn resolve_single_para_style(
+    ps: &ParaShape,
+    tab_defs: &[TabDef],
+    dpi: f64,
+    is_hwp3_variant: bool,
+) -> ResolvedParaStyle {
     let line_spacing = match ps.line_spacing_type {
         LineSpacingType::Percent => ps.line_spacing as f64,
         _ => hwpunit_to_px(ps.line_spacing, dpi),
@@ -636,11 +782,16 @@ fn resolve_single_para_style(ps: &ParaShape, tab_defs: &[TabDef], dpi: f64) -> R
     // 렌더링 시 2로 나누어야 한다 (hwp2hwpx 변환 코드 및 HWP 대화상자 확인).
     let tab_def = tab_defs.get(ps.tab_def_id as usize);
     let tab_stops: Vec<TabStop> = tab_def
-        .map(|td| td.tabs.iter().map(|t| TabStop {
-            position: hwpunit_to_px(t.position as i32, dpi) / 2.0, // HWP 탭 position은 실제 좌표의 2배로 저장됨 (한컴 격자 비교로 확인)
-            tab_type: t.tab_type,
-            fill_type: t.fill_type,
-        }).collect())
+        .map(|td| {
+            td.tabs
+                .iter()
+                .map(|t| TabStop {
+                    position: hwpunit_to_px(t.position as i32, dpi) / 2.0, // HWP 탭 position은 실제 좌표의 2배로 저장됨 (한컴 격자 비교로 확인)
+                    tab_type: t.tab_type,
+                    fill_type: t.fill_type,
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let auto_tab_right = tab_def.map(|td| td.auto_tab_right).unwrap_or(false);
 
@@ -648,15 +799,21 @@ fn resolve_single_para_style(ps: &ParaShape, tab_defs: &[TabDef], dpi: f64) -> R
     // margin_left/right/indent: LineSeg.column_start와 비교하면 column_start = margin_left / 2
     // spacing_before/after: pyhwpx 확인 결과 동일하게 2배 스케일 저장
     // 실제 렌더링 시 2로 나누어야 올바른 값이 된다.
+    //
+    // [Task #1037] HWP5 변환본 의 추가 2배 스케일 (총 4배) 은 parser 단계 (parser/mod.rs)
+    // 에서 normalize (halve) 되어 본 단계에서는 normal HWP5 동등 (2배 스케일) — uniform
+    // variant_div=2 적용. 종전 variant_div=4 는 raw 값 normalize 전 보정 패턴이었음.
+    let _ = is_hwp3_variant;
+    let variant_div = 2.0;
     ResolvedParaStyle {
         alignment: ps.alignment,
         line_spacing,
         line_spacing_type: ps.line_spacing_type,
-        margin_left: hwpunit_to_px(ps.margin_left, dpi) / 2.0,
-        margin_right: hwpunit_to_px(ps.margin_right, dpi) / 2.0,
-        indent: hwpunit_to_px(ps.indent, dpi) / 2.0,
-        spacing_before: hwpunit_to_px(ps.spacing_before, dpi) / 2.0,
-        spacing_after: hwpunit_to_px(ps.spacing_after, dpi) / 2.0,
+        margin_left: hwpunit_to_px(ps.margin_left, dpi) / variant_div,
+        margin_right: hwpunit_to_px(ps.margin_right, dpi) / variant_div,
+        indent: hwpunit_to_px(ps.indent, dpi) / variant_div,
+        spacing_before: hwpunit_to_px(ps.spacing_before, dpi) / variant_div,
+        spacing_after: hwpunit_to_px(ps.spacing_after, dpi) / variant_div,
         head_type: ps.head_type,
         para_level: ps.para_level,
         numbering_id: ps.numbering_id,
@@ -692,9 +849,10 @@ fn resolve_border_styles(doc_info: &DocInfo) -> Vec<ResolvedBorderStyle> {
 fn resolve_single_border_style(bf: &BorderFill) -> ResolvedBorderStyle {
     let fill_color = match bf.fill.fill_type {
         FillType::Solid => bf.fill.solid.as_ref().and_then(|s| {
+            // pattern_type > 0: 패턴 채우기 → 단색 fill 아님 (background_color는 패턴 배경)
             // ColorRef 상위 바이트가 0이 아니면 "채우기 없음" (투명)
             // 0xFFFFFFFF = CLR_INVALID/CLR_DEFAULT (Windows COLORREF)
-            if (s.background_color >> 24) != 0 {
+            if s.pattern_type > 0 || (s.background_color >> 24) != 0 {
                 None
             } else {
                 Some(s.background_color)
@@ -730,7 +888,9 @@ fn resolve_single_border_style(bf: &BorderFill) -> ResolvedBorderStyle {
             }
             let positions: Vec<f64> = if g.positions.is_empty() {
                 let n = g.colors.len();
-                (0..n).map(|i| i as f64 / (n.max(2) - 1).max(1) as f64).collect()
+                (0..n)
+                    .map(|i| i as f64 / (n.max(2) - 1).max(1) as f64)
+                    .collect()
             } else {
                 g.positions.iter().map(|&p| p as f64 / 100.0).collect()
             };
@@ -747,11 +907,12 @@ fn resolve_single_border_style(bf: &BorderFill) -> ResolvedBorderStyle {
     };
 
     let image_fill = match bf.fill.fill_type {
-        FillType::Image => bf.fill.image.as_ref().map(|img| {
-            ResolvedImageFill {
-                bin_data_id: img.bin_data_id,
-                fill_mode: img.fill_mode,
-            }
+        FillType::Image => bf.fill.image.as_ref().map(|img| ResolvedImageFill {
+            bin_data_id: img.bin_data_id,
+            fill_mode: img.fill_mode,
+            brightness: img.brightness,
+            contrast: img.contrast,
+            effect: image_fill_effect(img.effect),
         }),
         _ => None,
     };
@@ -764,6 +925,15 @@ fn resolve_single_border_style(bf: &BorderFill) -> ResolvedBorderStyle {
         image_fill,
         diagonal_attr: bf.attr,
         diagonal: bf.diagonal,
+    }
+}
+
+fn image_fill_effect(effect: u8) -> ImageEffect {
+    match effect {
+        1 => ImageEffect::GrayScale,
+        2 => ImageEffect::BlackWhite,
+        3 => ImageEffect::Pattern8x8,
+        _ => ImageEffect::RealPic,
     }
 }
 
@@ -792,7 +962,7 @@ mod tests {
             char_shapes: vec![
                 CharShape {
                     font_ids: [0, 0, 0, 0, 0, 0, 0], // 함초롬돋움
-                    base_size: 2400,                     // 24pt = 2400 HWPUNIT (1pt = 100 HWPUNIT)
+                    base_size: 2400,                 // 24pt = 2400 HWPUNIT (1pt = 100 HWPUNIT)
                     bold: true,
                     italic: false,
                     text_color: 0x00000000, // 검정
@@ -802,7 +972,7 @@ mod tests {
                 },
                 CharShape {
                     font_ids: [1, 1, 1, 1, 1, 1, 1], // 함초롬바탕
-                    base_size: 1000,                     // 10pt
+                    base_size: 1000,                 // 10pt
                     bold: false,
                     italic: true,
                     text_color: 0x00FF0000, // 파란색 (BGR)
@@ -837,25 +1007,39 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            border_fills: vec![
-                BorderFill {
-                    borders: [
-                        BorderLine { line_type: BorderLineType::Solid, width: 1, color: 0 },
-                        BorderLine { line_type: BorderLineType::Solid, width: 1, color: 0 },
-                        BorderLine { line_type: BorderLineType::Solid, width: 1, color: 0 },
-                        BorderLine { line_type: BorderLineType::Solid, width: 1, color: 0 },
-                    ],
-                    fill: Fill {
-                        fill_type: FillType::Solid,
-                        solid: Some(SolidFill {
-                            background_color: 0x00FFFFFF,
-                            ..Default::default()
-                        }),
-                        ..Default::default()
+            border_fills: vec![BorderFill {
+                borders: [
+                    BorderLine {
+                        line_type: BorderLineType::Solid,
+                        width: 1,
+                        color: 0,
                     },
+                    BorderLine {
+                        line_type: BorderLineType::Solid,
+                        width: 1,
+                        color: 0,
+                    },
+                    BorderLine {
+                        line_type: BorderLineType::Solid,
+                        width: 1,
+                        color: 0,
+                    },
+                    BorderLine {
+                        line_type: BorderLineType::Solid,
+                        width: 1,
+                        color: 0,
+                    },
+                ],
+                fill: Fill {
+                    fill_type: FillType::Solid,
+                    solid: Some(SolidFill {
+                        background_color: 0x00FFFFFF,
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
-            ],
+                ..Default::default()
+            }],
             ..Default::default()
         }
     }
@@ -952,12 +1136,18 @@ mod tests {
 
         // 퍼센트 타입: 그대로 160.0
         assert!((styles.para_styles[0].line_spacing - 160.0).abs() < 0.01);
-        assert_eq!(styles.para_styles[0].line_spacing_type, LineSpacingType::Percent);
+        assert_eq!(
+            styles.para_styles[0].line_spacing_type,
+            LineSpacingType::Percent
+        );
 
         // 고정 타입: 1200 HWPUNIT → px 변환
         let expected = hwpunit_to_px(1200, DEFAULT_DPI);
         assert!((styles.para_styles[1].line_spacing - expected).abs() < 0.01);
-        assert_eq!(styles.para_styles[1].line_spacing_type, LineSpacingType::Fixed);
+        assert_eq!(
+            styles.para_styles[1].line_spacing_type,
+            LineSpacingType::Fixed
+        );
     }
 
     #[test]
@@ -982,7 +1172,10 @@ mod tests {
 
         assert_eq!(styles.border_styles.len(), 1);
         assert_eq!(styles.border_styles[0].fill_color, Some(0x00FFFFFF));
-        assert_eq!(styles.border_styles[0].borders[0].line_type, BorderLineType::Solid);
+        assert_eq!(
+            styles.border_styles[0].borders[0].line_type,
+            BorderLineType::Solid
+        );
     }
 
     #[test]
@@ -1010,6 +1203,38 @@ mod tests {
         };
         let styles = resolve_styles(&doc_info, DEFAULT_DPI);
         assert_eq!(styles.border_styles[0].fill_color, None);
+    }
+
+    #[test]
+    fn test_resolve_border_image_fill_preserves_watermark_attrs() {
+        let mut fill = Fill::default();
+        fill.fill_type = FillType::Image;
+        fill.image = Some(ImageFill {
+            fill_mode: ImageFillMode::Center,
+            brightness: -50,
+            contrast: 70,
+            effect: 1,
+            bin_data_id: 3,
+        });
+        let doc_info = DocInfo {
+            border_fills: vec![BorderFill {
+                fill,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let styles = resolve_styles(&doc_info, DEFAULT_DPI);
+        let image_fill = styles.border_styles[0]
+            .image_fill
+            .as_ref()
+            .expect("image fill");
+
+        assert_eq!(image_fill.bin_data_id, 3);
+        assert_eq!(image_fill.fill_mode, ImageFillMode::Center);
+        assert_eq!(image_fill.brightness, -50);
+        assert_eq!(image_fill.contrast, 70);
+        assert_eq!(image_fill.effect, ImageEffect::GrayScale);
     }
 
     // === 언어 판별 테스트 ===
@@ -1064,28 +1289,29 @@ mod tests {
         DocInfo {
             font_faces: vec![
                 // lang=0 (한국어)
-                vec![
-                    Font { name: "함초롬돋움".to_string(), ..Default::default() },
-                ],
+                vec![Font {
+                    name: "함초롬돋움".to_string(),
+                    ..Default::default()
+                }],
                 // lang=1 (영어)
-                vec![
-                    Font { name: "Arial".to_string(), ..Default::default() },
-                ],
+                vec![Font {
+                    name: "Arial".to_string(),
+                    ..Default::default()
+                }],
                 // lang=2 (한자)
-                vec![
-                    Font { name: "SimSun".to_string(), ..Default::default() },
-                ],
+                vec![Font {
+                    name: "SimSun".to_string(),
+                    ..Default::default()
+                }],
                 // lang=3~6 (나머지) - 비어있을 수 있음
             ],
-            char_shapes: vec![
-                CharShape {
-                    font_ids: [0, 0, 0, 0, 0, 0, 0], // 모든 언어에서 0번 폰트
-                    base_size: 1000,
-                    ratios: [100, 80, 90, 100, 100, 100, 100],
-                    spacings: [0, -5, 0, 0, 0, 0, 0],
-                    ..Default::default()
-                },
-            ],
+            char_shapes: vec![CharShape {
+                font_ids: [0, 0, 0, 0, 0, 0, 0], // 모든 언어에서 0번 폰트
+                base_size: 1000,
+                ratios: [100, 80, 90, 100, 100, 100, 100],
+                spacings: [0, -5, 0, 0, 0, 0, 0],
+                ..Default::default()
+            }],
             ..Default::default()
         }
     }
@@ -1098,10 +1324,10 @@ mod tests {
         let cs = &styles.char_styles[0];
         assert_eq!(cs.font_families.len(), 7);
         assert_eq!(cs.font_families[0], "함초롬돋움"); // 한국어
-        assert_eq!(cs.font_families[1], "Arial");       // 영어
-        assert_eq!(cs.font_families[2], "SimSun");       // 한자
-        assert_eq!(cs.font_families[3], "");             // 일본어 (없음)
-        assert_eq!(cs.font_family, "함초롬돋움");        // 기본값 = 한국어
+        assert_eq!(cs.font_families[1], "Arial"); // 영어
+        assert_eq!(cs.font_families[2], "SimSun"); // 한자
+        assert_eq!(cs.font_families[3], ""); // 일본어 (없음)
+        assert_eq!(cs.font_family, "함초롬돋움"); // 기본값 = 한국어
     }
 
     #[test]
@@ -1110,10 +1336,10 @@ mod tests {
         let styles = resolve_styles(&doc_info, DEFAULT_DPI);
 
         let cs = &styles.char_styles[0];
-        assert!((cs.ratios[0] - 1.0).abs() < 0.01);   // 한국어 100%
-        assert!((cs.ratios[1] - 0.8).abs() < 0.01);   // 영어 80%
-        assert!((cs.ratios[2] - 0.9).abs() < 0.01);   // 한자 90%
-        assert!((cs.ratio - 1.0).abs() < 0.01);        // 기본값 = 한국어
+        assert!((cs.ratios[0] - 1.0).abs() < 0.01); // 한국어 100%
+        assert!((cs.ratios[1] - 0.8).abs() < 0.01); // 영어 80%
+        assert!((cs.ratios[2] - 0.9).abs() < 0.01); // 한자 90%
+        assert!((cs.ratio - 1.0).abs() < 0.01); // 기본값 = 한국어
     }
 
     #[test]

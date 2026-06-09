@@ -1,8 +1,30 @@
 //! 그리기 개체 (Shape, Line, Rect, Ellipse, Arc, Polygon, Curve, Group, TextBox)
 
-use super::*;
 use super::paragraph::Paragraph;
 use super::style::{Fill, ShapeBorderLine};
+use super::*;
+
+/// `raw_ctrl_data` (CTRL_HEADER) 바이트 오프셋 상수.
+///
+/// `parse_common_obj_attr` 및 `serialize_common_obj_attr` 과 일치해야 한다.
+/// `table_ops.rs`, `object_ops.rs`, `html_table_import.rs` 등에서 직접 바이트
+/// 인덱싱 대신 이 상수를 사용한다.
+pub(crate) mod common_obj_offsets {
+    pub const FLAGS: std::ops::Range<usize> = 0..4;
+    pub const V_OFFSET: std::ops::Range<usize> = 4..8;
+    pub const H_OFFSET: std::ops::Range<usize> = 8..12;
+    pub const WIDTH: std::ops::Range<usize> = 12..16;
+    pub const HEIGHT: std::ops::Range<usize> = 16..20;
+    pub const Z_ORDER: std::ops::Range<usize> = 20..24;
+    pub const MARGIN_LEFT: std::ops::Range<usize> = 24..26;
+    pub const MARGIN_RIGHT: std::ops::Range<usize> = 26..28;
+    pub const MARGIN_TOP: std::ops::Range<usize> = 28..30;
+    pub const MARGIN_BOTTOM: std::ops::Range<usize> = 30..32;
+    pub const INSTANCE_ID: std::ops::Range<usize> = 32..36;
+    pub const PREVENT_PAGE_BREAK: std::ops::Range<usize> = 36..40;
+    pub const MIN_LEN: usize = INSTANCE_ID.end;
+    pub const MIN_LEN_WITH_PREVENT_PAGE_BREAK: usize = PREVENT_PAGE_BREAK.end;
+}
 
 /// 개체 공통 속성 (모든 개체에 공통)
 #[derive(Debug, Clone, Default)]
@@ -29,6 +51,22 @@ pub struct CommonObjAttr {
     pub prevent_page_break: i32,
     /// 글자처럼 취급
     pub treat_as_char: bool,
+    /// HWPX `hp:pos@flowWithText`.
+    ///
+    /// HWP5 GenShape CTRL_HEADER attr bit 13 후보로 보존한다.
+    pub flow_with_text: bool,
+    /// HWPX `hp:pos@allowOverlap`.
+    ///
+    /// HWP5 GenShape CTRL_HEADER attr bit 14 후보로 보존한다.
+    pub allow_overlap: bool,
+    /// HWPX 출처 GenShape를 HWP5로 저장할 때 필요한 storage high bit 후보.
+    ///
+    /// Table adapter의 `0x08000000` 보강과 다른 `0x04000000` bit 26이다.
+    pub hwp5_gen_shape_attr_bit26: bool,
+    /// VertRelTo가 para일 때 크기 보호 여부 (HWP5 GenShape CTRL_HEADER attr bit 20).
+    pub size_protect: bool,
+    /// HWPX 출처 GenShape 번호 범주 high bit 후보 (HWP5 GenShape CTRL_HEADER attr bit 28).
+    pub hwp5_gen_shape_attr_bit28: bool,
     /// 세로 위치 기준
     pub vert_rel_to: VertRelTo,
     /// 세로 정렬 방식
@@ -37,8 +75,10 @@ pub struct CommonObjAttr {
     pub horz_rel_to: HorzRelTo,
     /// 가로 정렬 방식
     pub horz_align: HorzAlign,
-    /// 텍스트 흐름 방식
+    /// 텍스트 흐름 방식 (개체 배치 방식 — attr bit 21-23)
     pub text_wrap: TextWrap,
+    /// 텍스트가 흐르는 방향 (attr bit 24-25)
+    pub text_flow: TextFlow,
     /// 너비 기준 (bit 15-17): 0=Paper, 1=Page, 2=Column, 3=Para, 4=Absolute
     pub width_criterion: SizeCriterion,
     /// 높이 기준 (bit 18-19): 0=Paper, 1=Page, 2=Absolute
@@ -106,8 +146,8 @@ pub enum SizeCriterion {
     Absolute,
 }
 
-/// 텍스트 흐름 방식
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// 텍스트 흐름 방식 (개체 배치 — attr bit 21-23)
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub enum TextWrap {
     #[default]
     Square,
@@ -116,6 +156,18 @@ pub enum TextWrap {
     TopAndBottom,
     BehindText,
     InFrontOfText,
+}
+
+/// 텍스트가 흐르는 방향 (attr bit 24-25)
+///
+/// HWPX `textFlow` 속성값과 대응한다.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum TextFlow {
+    #[default]
+    BothSides,
+    LeftOnly,
+    RightOnly,
+    LargestOnly,
 }
 
 /// 개체 요소 속성 (그리기 개체 공통)
@@ -149,6 +201,10 @@ pub struct ShapeComponentAttr {
     pub vert_flip: bool,
     /// 회전각
     pub rotation_angle: HwpUnit16,
+    /// HWPX rotationInfo@rotateimage 보존.
+    ///
+    /// HWP5 SHAPE_COMPONENT offset 36 storage field의 0x0008_0000 bit로 materialize된다.
+    pub rotate_image: bool,
     /// 회전 중심 좌표
     pub rotation_center: Point,
     /// 렌더링 정보 원본 바이트 (변환 행렬 등, 라운드트립 보존용)
@@ -183,6 +239,7 @@ impl Default for ShapeComponentAttr {
             horz_flip: false,
             vert_flip: false,
             rotation_angle: 0,
+            rotate_image: false,
             rotation_center: Point::default(),
             raw_rendering: Vec::new(),
             render_tx: 0.0,
@@ -422,7 +479,10 @@ impl LinkLineType {
 
     /// 꺽인 연결선인지
     pub fn is_stroke(&self) -> bool {
-        matches!(self, Self::StrokeNoArrow | Self::StrokeOneWay | Self::StrokeBoth)
+        matches!(
+            self,
+            Self::StrokeNoArrow | Self::StrokeOneWay | Self::StrokeBoth
+        )
     }
 
     /// 곡선 연결선인지
@@ -524,6 +584,8 @@ pub struct PolygonShape {
     pub drawing: DrawingObjAttr,
     /// 꼭짓점 좌표 목록
     pub points: Vec<Point>,
+    /// SHAPE_POLYGON 끝 패딩/추가 바이트 (라운드트립 보존)
+    pub raw_trailing: Vec<u8>,
 }
 
 /// 곡선 개체 (HWPTAG_SHAPE_COMPONENT_CURVE)
@@ -745,10 +807,7 @@ mod tests {
     #[test]
     fn test_shape_object_line() {
         let line = ShapeObject::Line(LineShape::default());
-        match line {
-            ShapeObject::Line(_) => assert!(true),
-            _ => panic!("Expected Line variant"),
-        }
+        assert!(matches!(line, ShapeObject::Line(_)));
     }
 
     #[test]

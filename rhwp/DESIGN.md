@@ -23,7 +23,7 @@
 
 | 항목 | 내용 |
 |------|------|
-| 언어 | Rust 2021 (`rhwp` v0.7.6) |
+| 언어 | Rust 2021 (`rhwp` v0.7.15) |
 | 빌드 산출물 | `cdylib` + `rlib` (네이티브 lib + WASM lib) + `rhwp` CLI |
 | 핵심 의존성 | `cfb` (OLE), `flate2`, `zip`, `quick-xml`, `encoding_rs`, `image`, `wasm-bindgen` |
 | 네이티브 전용 | `svg2pdf`, `usvg`, `pdf-writer`, `subsetter`, `ttf-parser` |

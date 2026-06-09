@@ -28,7 +28,10 @@ use std::io::Write;
 use quick_xml::Writer;
 
 use crate::model::image::{ImageEffect, Picture};
-use crate::model::shape::{CommonObjAttr, HorzAlign, HorzRelTo, TextWrap, VertAlign, VertRelTo};
+use crate::model::shape::{
+    CommonObjAttr, HorzAlign, HorzRelTo, ShapeComponentAttr, TextFlow, TextWrap, VertAlign,
+    VertRelTo,
+};
 
 use super::context::SerializeContext;
 use super::utils::{empty_tag, end_tag, start_tag, start_tag_attrs};
@@ -47,8 +50,9 @@ pub fn write_picture<W: Write>(
     let id_str = pic.common.instance_id.to_string();
     let z_order = pic.common.z_order.to_string();
     let tw = text_wrap_str(pic.common.text_wrap);
-    let tf = text_flow_str(pic.common.text_wrap);
+    let tf = text_flow_str(pic.common.text_flow);
     let instid = pic.instance_id.to_string();
+    let href = pic.href.as_deref().unwrap_or("");
 
     start_tag_attrs(
         w,
@@ -61,7 +65,7 @@ pub fn write_picture<W: Write>(
             ("textFlow", tf),
             ("lock", "0"),
             ("dropcapstyle", "None"),
-            ("href", ""),
+            ("href", href),
             ("groupLevel", "0"),
             ("instid", &instid),
             ("reverse", "0"),
@@ -72,10 +76,10 @@ pub fn write_picture<W: Write>(
     // offset, orgSz, curSz, flip, rotationInfo, renderingInfo, imgRect, imgClip,
     // inMargin, imgDim, img, effects, sz, pos, outMargin
     write_offset(w, &pic.common)?;
-    write_org_sz(w)?; // ShapeComponentAttr 매핑 (IR 접근 제한으로 간이)
+    write_org_sz(w, &pic.shape_attr)?;
     write_cur_sz(w, &pic.common)?;
-    write_flip(w)?;
-    write_rotation_info(w)?;
+    write_flip(w, &pic.shape_attr)?;
+    write_rotation_info(w, &pic.shape_attr)?;
     write_rendering_info(w)?;
     write_img_rect(w, &pic.common)?;
     write_img_clip(w, pic)?;
@@ -99,11 +103,13 @@ fn write_offset<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), Se
     empty_tag(w, "hp:offset", &[("x", &x), ("y", &y)])
 }
 
-fn write_org_sz<W: Write>(w: &mut Writer<W>) -> Result<(), SerializeError> {
-    // IR에서 원본 크기는 shape_attr.original_width/height 이나 접근이 제한적.
-    // Stage 4 에선 common.width/height 를 그대로 원본 크기로 출력 (간이).
-    // Picture 라운드트립 실제 정확도는 shape_attr 직접 매핑 후 향상됨.
-    empty_tag(w, "hp:orgSz", &[("width", "0"), ("height", "0")])
+fn write_org_sz<W: Write>(
+    w: &mut Writer<W>,
+    sa: &ShapeComponentAttr,
+) -> Result<(), SerializeError> {
+    let ow = sa.original_width.to_string();
+    let oh = sa.original_height.to_string();
+    empty_tag(w, "hp:orgSz", &[("width", &ow), ("height", &oh)])
 }
 
 fn write_cur_sz<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), SerializeError> {
@@ -112,15 +118,29 @@ fn write_cur_sz<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), Se
     empty_tag(w, "hp:curSz", &[("width", &width), ("height", &height)])
 }
 
-fn write_flip<W: Write>(w: &mut Writer<W>) -> Result<(), SerializeError> {
-    empty_tag(w, "hp:flip", &[("horizontal", "0"), ("vertical", "0")])
+fn write_flip<W: Write>(w: &mut Writer<W>, sa: &ShapeComponentAttr) -> Result<(), SerializeError> {
+    let h = bool01(sa.horz_flip);
+    let v = bool01(sa.vert_flip);
+    empty_tag(w, "hp:flip", &[("horizontal", h), ("vertical", v)])
 }
 
-fn write_rotation_info<W: Write>(w: &mut Writer<W>) -> Result<(), SerializeError> {
+fn write_rotation_info<W: Write>(
+    w: &mut Writer<W>,
+    sa: &ShapeComponentAttr,
+) -> Result<(), SerializeError> {
+    let angle = sa.rotation_angle.to_string();
+    let cx = sa.rotation_center.x.to_string();
+    let cy = sa.rotation_center.y.to_string();
+    let ri = bool01(sa.rotate_image);
     empty_tag(
         w,
         "hp:rotationInfo",
-        &[("angle", "0"), ("centerX", "0"), ("centerY", "0"), ("rotateimage", "0")],
+        &[
+            ("angle", &angle),
+            ("centerX", &cx),
+            ("centerY", &cy),
+            ("rotateimage", ri),
+        ],
     )
 }
 
@@ -188,8 +208,12 @@ fn write_in_margin<W: Write>(w: &mut Writer<W>, p: &Picture) -> Result<(), Seria
 
 fn write_img_dim<W: Write>(w: &mut Writer<W>, p: &Picture) -> Result<(), SerializeError> {
     // imgDim은 원본 크기의 clip 적용 결과. 간이 구현.
-    let dw = (p.common.width as i32 - p.crop.left - p.crop.right).max(0).to_string();
-    let dh = (p.common.height as i32 - p.crop.top - p.crop.bottom).max(0).to_string();
+    let dw = (p.common.width as i32 - p.crop.left - p.crop.right)
+        .max(0)
+        .to_string();
+    let dh = (p.common.height as i32 - p.crop.top - p.crop.bottom)
+        .max(0)
+        .to_string();
     empty_tag(w, "hp:imgDim", &[("dimwidth", &dw), ("dimheight", &dh)])
 }
 
@@ -284,7 +308,11 @@ fn write_out_margin<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<()
 // ---------- 변환 헬퍼 ----------
 
 fn bool01(b: bool) -> &'static str {
-    if b { "1" } else { "0" }
+    if b {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 fn text_wrap_str(w: TextWrap) -> &'static str {
@@ -299,8 +327,13 @@ fn text_wrap_str(w: TextWrap) -> &'static str {
     }
 }
 
-fn text_flow_str(_: TextWrap) -> &'static str {
-    "BOTH_SIDES"
+fn text_flow_str(f: TextFlow) -> &'static str {
+    match f {
+        TextFlow::BothSides => "BOTH_SIDES",
+        TextFlow::LeftOnly => "LEFT_ONLY",
+        TextFlow::RightOnly => "RIGHT_ONLY",
+        TextFlow::LargestOnly => "LARGEST_ONLY",
+    }
 }
 
 fn vert_rel_to_str(v: VertRelTo) -> &'static str {
@@ -369,6 +402,7 @@ mod tests {
             brightness: 0,
             contrast: 0,
             effect: ImageEffect::RealPic,
+            external_path: None,
         };
         pic.common.width = 1000;
         pic.common.height = 500;
@@ -421,6 +455,40 @@ mod tests {
     }
 
     #[test]
+    fn shape_component_attrs_are_serialized() {
+        let doc = make_doc_with_bin(1, "png");
+        let ctx = SerializeContext::collect_from_document(&doc);
+        let mut pic = make_picture(1);
+        pic.shape_attr.original_width = 23456;
+        pic.shape_attr.original_height = 12345;
+        pic.shape_attr.horz_flip = true;
+        pic.shape_attr.vert_flip = true;
+        pic.shape_attr.rotation_angle = 34;
+        pic.shape_attr.rotation_center.x = 11700;
+        pic.shape_attr.rotation_center.y = 14794;
+        pic.shape_attr.rotate_image = true;
+
+        let xml = serialize(&pic, &ctx);
+        assert!(
+            xml.contains(r#"<hp:orgSz width="23456" height="12345"/>"#),
+            "orgSz must use ShapeComponentAttr values: {}",
+            xml
+        );
+        assert!(
+            xml.contains(r#"<hp:flip horizontal="1" vertical="1"/>"#),
+            "flip must use ShapeComponentAttr values: {}",
+            xml
+        );
+        assert!(
+            xml.contains(
+                r#"<hp:rotationInfo angle="34" centerX="11700" centerY="14794" rotateimage="1"/>"#
+            ),
+            "rotationInfo must use ShapeComponentAttr values: {}",
+            xml
+        );
+    }
+
+    #[test]
     fn unresolved_bin_data_id_errors() {
         let doc = Document::default(); // bin_data 없음
         let ctx = SerializeContext::collect_from_document(&doc);
@@ -429,7 +497,11 @@ mod tests {
         let err = write_picture(&mut w, &pic, &ctx).unwrap_err();
         let msg = format!("{}", err);
         assert!(msg.contains("binaryItemIDRef"), "error msg: {}", msg);
-        assert!(msg.contains("99"), "error should include bin_data_id: {}", msg);
+        assert!(
+            msg.contains("99"),
+            "error should include bin_data_id: {}",
+            msg
+        );
     }
 
     #[test]

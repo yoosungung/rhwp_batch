@@ -1,7 +1,8 @@
 use super::*;
 use crate::model::bin_data::{BinDataCompression, BinDataStatus};
 use crate::model::style::{
-    Alignment, BorderLine, DiagonalLine, Fill, LineSpacingType, NumberingHead, SolidFill,
+    Alignment, BorderLine, DiagonalLine, Fill, ImageFill, ImageFillMode, LineSpacingType,
+    NumberingHead, SolidFill,
 };
 use crate::parser::doc_info::parse_doc_info;
 use crate::parser::record::Record;
@@ -35,12 +36,31 @@ fn test_serialize_document_properties() {
 }
 
 #[test]
+fn test_serialize_id_mappings_uses_modern_count_table_size() {
+    let mut doc_info = DocInfo::default();
+    doc_info.font_faces = vec![Vec::new(); 7];
+    doc_info.memo_shape_count = 1;
+
+    let data = serialize_id_mappings(&doc_info);
+    assert_eq!(data.len(), 72);
+
+    let mut r = crate::parser::byte_reader::ByteReader::new(&data);
+    for _ in 0..15 {
+        r.read_u32().unwrap();
+    }
+    assert_eq!(r.read_u32().unwrap(), 1);
+    assert_eq!(r.read_u32().unwrap(), 0);
+    assert_eq!(r.read_u32().unwrap(), 0);
+}
+
+#[test]
 fn test_serialize_face_name_simple() {
     let font = Font {
         raw_data: None,
         name: "함초롬바탕".to_string(),
         alt_type: 0,
         alt_name: None,
+        type_info: None,
         default_name: None,
     };
 
@@ -59,6 +79,7 @@ fn test_serialize_face_name_with_alt() {
         name: "맑은 고딕".to_string(),
         alt_type: 1,
         alt_name: Some("Malgun Gothic".to_string()),
+        type_info: None,
         default_name: None,
     };
 
@@ -69,8 +90,32 @@ fn test_serialize_face_name_with_alt() {
     assert_eq!(attr & 0x03, 1); // alt_type
     let name = r.read_hwp_string().unwrap();
     assert_eq!(name, "맑은 고딕");
+    assert_eq!(r.read_u8().unwrap(), 1);
     let alt_name = r.read_hwp_string().unwrap();
     assert_eq!(alt_name, "Malgun Gothic");
+}
+
+#[test]
+fn test_serialize_face_name_with_type_info_and_default_name() {
+    let font = Font {
+        raw_data: None,
+        name: "굴림".to_string(),
+        alt_type: 1,
+        alt_name: None,
+        type_info: Some([2, 11, 6, 0, 0, 1, 1, 1, 1, 1]),
+        default_name: Some("Gulim".to_string()),
+    };
+
+    let data = serialize_face_name(&font);
+
+    assert_eq!(
+        data,
+        vec![
+            0x61, 0x02, 0x00, 0x74, 0xad, 0xbc, 0xb9, 0x02, 0x0b, 0x06, 0x00, 0x00, 0x01, 0x01,
+            0x01, 0x01, 0x01, 0x05, 0x00, 0x47, 0x00, 0x75, 0x00, 0x6c, 0x00, 0x69, 0x00, 0x6d,
+            0x00,
+        ]
+    );
 }
 
 #[test]
@@ -165,6 +210,7 @@ fn test_serialize_para_shape_roundtrip() {
     };
 
     let data = serialize_para_shape(&ps);
+    assert_eq!(data.len(), 58);
     let mut r = crate::parser::byte_reader::ByteReader::new(&data);
     assert_eq!(r.read_u32().unwrap(), 0x04);
     assert_eq!(r.read_i32().unwrap(), 1000);
@@ -176,6 +222,7 @@ fn test_serialize_para_shape_roundtrip() {
     assert_eq!(r.read_u16().unwrap(), 1);
     assert_eq!(r.read_u16().unwrap(), 2);
     assert_eq!(r.read_u16().unwrap(), 3);
+    assert_eq!(&data[54..58], &[0, 0, 0, 0]);
 }
 
 #[test]
@@ -186,6 +233,7 @@ fn test_serialize_style_roundtrip() {
         english_name: "Normal".to_string(),
         style_type: 0,
         next_style_id: 0,
+        lang_id: 1042,
         para_shape_id: 1,
         char_shape_id: 2,
     };
@@ -196,8 +244,12 @@ fn test_serialize_style_roundtrip() {
     assert_eq!(r.read_hwp_string().unwrap(), "Normal");
     assert_eq!(r.read_u8().unwrap(), 0);
     assert_eq!(r.read_u8().unwrap(), 0);
+    // [Task #1058 후속] lang_id (INT16) — HWP5 spec 표 47
+    assert_eq!(r.read_i16().unwrap(), 1042);
     assert_eq!(r.read_u16().unwrap(), 1);
     assert_eq!(r.read_u16().unwrap(), 2);
+    // trailing 2 byte zero
+    assert_eq!(r.read_u16().unwrap(), 0);
 }
 
 #[test]
@@ -278,17 +330,68 @@ fn test_serialize_border_fill_solid() {
 }
 
 #[test]
+fn test_serialize_border_fill_image_fill_mode_uses_hwp5_values() {
+    let cases = [
+        (ImageFillMode::TileAll, 0),
+        (ImageFillMode::TileHorzTop, 1),
+        (ImageFillMode::TileHorzBottom, 2),
+        (ImageFillMode::TileVertLeft, 3),
+        (ImageFillMode::TileVertRight, 4),
+        (ImageFillMode::FitToSize, 5),
+        (ImageFillMode::Center, 6),
+        (ImageFillMode::CenterTop, 7),
+        (ImageFillMode::CenterBottom, 8),
+        (ImageFillMode::LeftCenter, 9),
+        (ImageFillMode::LeftTop, 10),
+        (ImageFillMode::LeftBottom, 11),
+        (ImageFillMode::RightCenter, 12),
+        (ImageFillMode::RightTop, 13),
+        (ImageFillMode::RightBottom, 14),
+        (ImageFillMode::None, 15),
+    ];
+
+    for (mode, expected) in cases {
+        let bf = BorderFill {
+            raw_data: None,
+            attr: 0,
+            borders: [BorderLine::default(); 4],
+            diagonal: DiagonalLine::default(),
+            fill: Fill {
+                fill_type: FillType::Image,
+                solid: None,
+                gradient: None,
+                image: Some(ImageFill {
+                    fill_mode: mode,
+                    brightness: 0,
+                    contrast: 0,
+                    effect: 0,
+                    bin_data_id: 7,
+                }),
+                alpha: 0,
+            },
+        };
+
+        let data = serialize_border_fill(&bf);
+        let mut r = crate::parser::byte_reader::ByteReader::new(&data[32..]);
+        assert_eq!(r.read_u32().unwrap(), 2);
+        assert_eq!(
+            r.read_u8().unwrap(),
+            expected,
+            "{mode:?} must use HWP5 image fill mode {expected}"
+        );
+    }
+}
+
+#[test]
 fn test_serialize_tab_def() {
     let td = TabDef {
         raw_data: None,
         attr: 0x03,
-        tabs: vec![
-            crate::model::style::TabItem {
-                position: 7200,
-                tab_type: 0,
-                fill_type: 0,
-            },
-        ],
+        tabs: vec![crate::model::style::TabItem {
+            position: 7200,
+            tab_type: 0,
+            fill_type: 0,
+        }],
         auto_tab_left: true,
         auto_tab_right: true,
     };
@@ -326,6 +429,7 @@ fn test_serialize_doc_info_roundtrip() {
         name: "함초롬바탕".to_string(),
         alt_type: 0,
         alt_name: None,
+        type_info: None,
         default_name: None,
     });
     doc_info.char_shapes.push(CharShape {
@@ -387,6 +491,7 @@ fn test_serialize_doc_info_roundtrip() {
         english_name: "Normal".to_string(),
         style_type: 0,
         next_style_id: 0,
+        lang_id: 1042,
         para_shape_id: 0,
         char_shape_id: 0,
     });

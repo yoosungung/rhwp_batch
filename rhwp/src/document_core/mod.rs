@@ -6,25 +6,26 @@
 pub(crate) mod helpers;
 pub(crate) use helpers::*;
 
+pub mod builders;
 mod commands;
-mod queries;
+pub mod converters;
 pub(crate) mod html_table_import;
+pub mod queries;
 pub mod table_calc;
 pub mod validation;
-pub mod converters;
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use crate::model::document::Document;
 use crate::model::event::DocumentEvent;
 use crate::model::paragraph::Paragraph;
-use crate::renderer::pagination::PaginationResult;
-use crate::renderer::height_measurer::{MeasuredTable, MeasuredSection};
+use crate::renderer::composer::ComposedParagraph;
+use crate::renderer::height_measurer::{MeasuredSection, MeasuredTable};
 use crate::renderer::layout::LayoutEngine;
+use crate::renderer::pagination::PaginationResult;
 use crate::renderer::render_tree::PageRenderTree;
 use crate::renderer::style_resolver::ResolvedStyleSet;
-use crate::renderer::composer::ComposedParagraph;
 use crate::renderer::DEFAULT_DPI;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// 기본 폰트 fallback 경로
 pub const DEFAULT_FALLBACK_FONT: &str = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf";
@@ -58,6 +59,9 @@ pub struct DocumentCore {
     pub(crate) layout_engine: LayoutEngine,
     /// 내부 클립보드
     pub(crate) clipboard: Option<ClipboardData>,
+    /// [Task #1161] 떠 있는 개체(treat_as_char=false) 반복 붙여넣기 cascade 카운터.
+    /// 새 컨트롤 복사 시 0 으로 리셋, 붙여넣기마다 +1 하여 위치 오프셋 누적(한컴 정합).
+    pub(crate) paste_cascade_count: u32,
     /// 문단부호(¶) 표시 여부
     pub(crate) show_paragraph_marks: bool,
     /// 조판부호 표시 여부 (개체 마커 [표]/[그림] 등, 문단부호 포함)
@@ -90,7 +94,8 @@ pub struct DocumentCore {
     /// 이벤트 로그 (Command 실행 시 누적)
     pub(crate) event_log: Vec<DocumentEvent>,
     /// 글상자 오버플로우 연결 캐시 (섹션별, 지연 계산)
-    pub(crate) overflow_links_cache: RefCell<HashMap<usize, Vec<queries::doc_tree_nav::OverflowLink>>>,
+    pub(crate) overflow_links_cache:
+        RefCell<HashMap<usize, Vec<queries::doc_tree_nav::OverflowLink>>>,
     /// Undo/Redo용 Document 스냅샷 저장소 (ID → Document 클론)
     pub(crate) snapshot_store: Vec<(u32, Document)>,
     /// 다음 스냅샷 ID
@@ -148,27 +153,37 @@ impl DocumentCore {
                 fonts.insert(resolved.to_string());
             }
         }
-        let fonts_json: Vec<String> = fonts.iter().map(|f| {
-            // 폰트 이름의 특수문자를 JSON 이스케이프 처리
-            let escaped: String = f.chars().flat_map(|c| match c {
+        let fonts_json: Vec<String> = fonts
+            .iter()
+            .map(|f| {
+                // 폰트 이름의 특수문자를 JSON 이스케이프 처리
+                let escaped: String = f
+                    .chars()
+                    .flat_map(|c| match c {
+                        '"' => vec!['\\', '"'],
+                        '\\' => vec!['\\', '\\'],
+                        '\n' => vec!['\\', 'n'],
+                        '\r' => vec!['\\', 'r'],
+                        '\t' => vec!['\\', 't'],
+                        c if c < '\x20' => vec![],
+                        c => vec![c],
+                    })
+                    .collect();
+                format!("\"{}\"", escaped)
+            })
+            .collect();
+
+        let escaped_fallback: String = self
+            .fallback_font
+            .chars()
+            .flat_map(|c| match c {
                 '"' => vec!['\\', '"'],
                 '\\' => vec!['\\', '\\'],
-                '\n' => vec!['\\', 'n'],
-                '\r' => vec!['\\', 'r'],
-                '\t' => vec!['\\', 't'],
-                c if c < '\x20' => vec![],
                 c => vec![c],
-            }).collect();
-            format!("\"{}\"", escaped)
-        }).collect();
-
-        let escaped_fallback: String = self.fallback_font.chars().flat_map(|c| match c {
-            '"' => vec!['\\', '"'],
-            '\\' => vec!['\\', '\\'],
-            c => vec![c],
-        }).collect();
+            })
+            .collect();
         format!(
-            "{{\"version\":\"{}.{}.{}.{}\",\"sectionCount\":{},\"pageCount\":{},\"encrypted\":{},\"fallbackFont\":\"{}\",\"fontsUsed\":[{}]}}",
+            "{{\"version\":\"{}.{}.{}.{}\",\"sectionCount\":{},\"pageCount\":{},\"encrypted\":{},\"hwp3Variant\":{},\"fallbackFont\":\"{}\",\"fontsUsed\":[{}]}}",
             self.document.header.version.major,
             self.document.header.version.minor,
             self.document.header.version.build,
@@ -176,6 +191,7 @@ impl DocumentCore {
             self.document.sections.len(),
             self.page_count(),
             self.document.header.encrypted,
+            self.document.is_hwp3_variant,
             escaped_fallback,
             fonts_json.join(","),
         )
@@ -188,9 +204,13 @@ impl DocumentCore {
 
     /// DPI를 설정하고 스타일을 재해소한 후 재페이지네이션한다.
     pub fn set_dpi(&mut self, dpi: f64) {
-        use crate::renderer::style_resolver::resolve_styles;
+        use crate::renderer::style_resolver::resolve_styles_with_variant;
         self.dpi = dpi;
-        self.styles = resolve_styles(&self.document.doc_info, dpi);
+        self.styles = resolve_styles_with_variant(
+            &self.document.doc_info,
+            dpi,
+            self.document.is_hwp3_variant,
+        );
         self.paginate();
     }
 
@@ -205,6 +225,7 @@ impl DocumentCore {
             fallback_font: DEFAULT_FALLBACK_FONT.to_string(),
             layout_engine: LayoutEngine::new(DEFAULT_DPI),
             clipboard: None,
+            paste_cascade_count: 0,
             show_paragraph_marks: false,
             show_control_codes: false,
             show_transparent_borders: false,

@@ -35,10 +35,14 @@ pub struct Paragraph {
     /// 각 컨트롤에 대응하는 CTRL_DATA 레코드 (라운드트립 보존용)
     /// controls[i]에 대응하는 CTRL_DATA가 있으면 ctrl_data_records[i] = Some(data)
     pub ctrl_data_records: Vec<Option<Vec<u8>>>,
-    /// char_count의 최상위 비트 (bit 31) 보존 (라운드트립용)
+    /// char_count의 최상위 비트 (bit 31) 파싱값.
+    /// HWP5 저장기는 현재 list scope의 마지막 문단 여부로 bit 31을 재생성한다.
     pub char_count_msb: bool,
-    /// PARA_HEADER 레코드의 12바이트 이후 추가 바이트 (라운드트립 보존용)
-    /// numCharShapes, numRangeTags, numLineSegs, instanceId 등
+    /// PARA_HEADER tail 보존용 바이트.
+    ///
+    /// raw_header_extra[0..6]은 numCharShapes/numRangeTags/numLineSegs 자리지만,
+    /// HWP5 저장기는 실제 배열 길이로 count 필드를 재생성하고 이 구간을 쓰지 않는다.
+    /// raw_header_extra[6..]은 instanceId 및 변경추적 suffix로 보존한다.
     pub raw_header_extra: Vec<u8>,
     /// 원본에 PARA_TEXT 레코드가 존재했는지 (라운드트립 보존용)
     pub has_para_text: bool,
@@ -126,37 +130,104 @@ pub struct CharShapeRef {
 }
 
 /// 줄 레이아웃 정보 (HWPTAG_PARA_LINE_SEG)
+///
+/// **표준**: `mydocs/tech/document_ir_lineseg_standard.md` (Task #604)
+/// 모든 i32 필드는 HWPUNIT (1 inch = 7200 HWPUNIT).
 #[derive(Debug, Clone, Default)]
 pub struct LineSeg {
-    /// 텍스트 시작 위치
+    /// 본 줄이 차지하는 텍스트 시작 위치 (UTF-16 code unit, 문단 시작 기준)
     pub text_start: u32,
-    /// 줄의 세로 위치
+    /// 페이지 내 흐름 y 좌표 (HWPUNIT, 페이지 상단 기준 누적 절대값)
+    /// HWP3 파서는 현재 항상 0 (별도 task 에서 누적 계산 정정 권고)
     pub vertical_pos: i32,
-    /// 줄의 높이
+    /// 줄 높이 (HWPUNIT, line_spacing 포함)
     pub line_height: i32,
-    /// 텍스트 부분의 높이
+    /// 텍스트 부분의 높이 (HWPUNIT)
     pub text_height: i32,
-    /// 베이스라인까지 거리
+    /// 베이스라인까지 거리 (HWPUNIT, 줄 시작 기준)
     pub baseline_distance: i32,
-    /// 줄간격
+    /// 줄간격 (HWPUNIT)
     pub line_spacing: i32,
-    /// 컬럼에서의 시작 위치
+    /// wrap zone x 오프셋 (HWPUNIT, 단(column) 좌측 기준). 0 = wrap 없음
     pub column_start: i32,
-    /// 세그먼트 폭
+    /// 줄 너비 (HWPUNIT). 단 너비와 같으면 wrap 없음
     pub segment_width: i32,
-    /// 태그 플래그
+    /// 비트 플래그 (HWP5 PARA_LINE_SEG tag).
+    ///
+    /// 공식 스펙 기준:
+    /// - bit 0: 페이지의 첫 줄
+    /// - bit 1: 컬럼의 첫 줄
+    /// - bit 16: 텍스트가 배열되지 않은 빈 세그먼트
+    /// - bit 17: 줄의 첫 세그먼트
+    /// - bit 18: 줄의 마지막 세그먼트
+    /// - bit 19: auto-hyphenation 수행
+    /// - bit 20: indentation 적용
+    /// - bit 21: 문단 머리 모양 적용
+    /// - bit 31: 구현 편의 property
     pub tag: u32,
 }
 
 impl LineSeg {
+    pub const TAG_FIRST_LINE_OF_PAGE: u32 = 1 << 0;
+    pub const TAG_FIRST_LINE_OF_COLUMN: u32 = 1 << 1;
+    pub const TAG_EMPTY_SEGMENT: u32 = 1 << 16;
+    pub const TAG_FIRST_SEGMENT: u32 = 1 << 17;
+    pub const TAG_LAST_SEGMENT: u32 = 1 << 18;
+    pub const TAG_AUTO_HYPHENATION: u32 = 1 << 19;
+    pub const TAG_INDENTATION: u32 = 1 << 20;
+    pub const TAG_PARAGRAPH_HEAD: u32 = 1 << 21;
+    pub const TAG_IMPLEMENTATION_PROPERTY: u32 = 1 << 31;
+
+    /// 한 줄이 하나의 세그먼트로만 구성될 때 사용하는 HWP5 tag 조합.
+    pub const TAG_SINGLE_SEGMENT_LINE: u32 = Self::TAG_FIRST_SEGMENT | Self::TAG_LAST_SEGMENT;
+
     /// 페이지의 첫 줄인지 여부
     pub fn is_first_line_of_page(&self) -> bool {
-        self.tag & 0x01 != 0
+        self.tag & Self::TAG_FIRST_LINE_OF_PAGE != 0
+    }
+
+    /// 본 줄이 wrap zone (그림/표 옆) 안에 있는지 (포맷 무관 표준).
+    ///
+    /// 표준: `mydocs/tech/document_ir_lineseg_standard.md`
+    ///
+    /// `col_w_hu`: 단 너비 (HWPUNIT). 본 줄의 segment_width 와 비교.
+    ///
+    /// 판정 본질:
+    /// - `column_start > 0`: 단 좌측에서 떨어진 위치 시작 → wrap zone
+    /// - `segment_width > 0 AND segment_width < col_w_hu`: 너비가 단 너비보다 작음 → wrap zone
+    /// - 모두 거짓: full width 정상 줄
+    pub fn is_in_wrap_zone(&self, col_w_hu: i32) -> bool {
+        self.column_start > 0 || (self.segment_width > 0 && self.segment_width < col_w_hu)
     }
 
     /// 컬럼의 첫 줄인지 여부
     pub fn is_first_line_of_column(&self) -> bool {
-        self.tag & 0x02 != 0
+        self.tag & Self::TAG_FIRST_LINE_OF_COLUMN != 0
+    }
+
+    /// 텍스트가 배열되지 않은 빈 세그먼트인지 여부
+    pub fn is_empty_segment(&self) -> bool {
+        self.tag & Self::TAG_EMPTY_SEGMENT != 0
+    }
+
+    /// 줄의 첫 세그먼트인지 여부
+    pub fn is_first_segment(&self) -> bool {
+        self.tag & Self::TAG_FIRST_SEGMENT != 0
+    }
+
+    /// 줄의 마지막 세그먼트인지 여부
+    pub fn is_last_segment(&self) -> bool {
+        self.tag & Self::TAG_LAST_SEGMENT != 0
+    }
+
+    /// indentation 적용 여부
+    pub fn has_indentation(&self) -> bool {
+        self.tag & Self::TAG_INDENTATION != 0
+    }
+
+    /// 문단 머리 모양 적용 여부
+    pub fn has_paragraph_head(&self) -> bool {
+        self.tag & Self::TAG_PARAGRAPH_HEAD != 0
     }
 }
 
@@ -195,7 +266,7 @@ impl Paragraph {
                 text_height: 1000,
                 baseline_distance: 850,
                 line_spacing: 600,
-                tag: 0x00060000, // HWP 기본 플래그
+                tag: LineSeg::TAG_SINGLE_SEGMENT_LINE,
                 ..Default::default()
             }],
             ..Default::default()
@@ -204,7 +275,11 @@ impl Paragraph {
 
     /// 문자의 UTF-16 코드 유닛 수를 반환한다.
     fn char_utf16_len(c: char) -> u32 {
-        if (c as u32) > 0xFFFF { 2 } else { 1 }
+        if (c as u32) > 0xFFFF {
+            2
+        } else {
+            1
+        }
     }
 
     /// char_offset 위치에 텍스트를 삽입한다.
@@ -227,18 +302,50 @@ impl Paragraph {
         // 이 경우 char_offset을 text_len으로 clamp하되, UTF-16 위치는
         // 마지막 문자 + 후행 컨트롤 갭을 포함한 값으로 계산
         let effective_char_offset = char_offset.min(text_len);
+        let control_positions = self.control_text_positions();
+        let inserts_before_inline_control = char_offset <= text_len
+            && self
+                .controls
+                .iter()
+                .zip(control_positions.iter())
+                .any(|(ctrl, &pos)| {
+                    pos == effective_char_offset
+                        && matches!(
+                            ctrl,
+                            Control::Shape(_)
+                                | Control::Table(_)
+                                | Control::Picture(_)
+                                | Control::Equation(_)
+                                | Control::Footnote(_)
+                                | Control::Endnote(_)
+                                | Control::AutoNumber(_)
+                        )
+                });
 
         // 바이트 삽입 위치 계산
-        let byte_offset: usize = text_chars[..effective_char_offset].iter().map(|c| c.len_utf8()).sum();
+        let byte_offset: usize = text_chars[..effective_char_offset]
+            .iter()
+            .map(|c| c.len_utf8())
+            .sum();
 
         // 삽입 지점의 UTF-16 위치 결정
         let utf16_insert_pos: u32 = if char_offset > text_len && !self.char_offsets.is_empty() {
             // 텍스트 끝 이후 (인라인 컨트롤 뒤): 마지막 문자의 UTF-16 위치 + 폭 + 후행 갭
             let last_idx = self.char_offsets.len() - 1;
-            let last_char_end = self.char_offsets[last_idx] + Self::char_utf16_len(text_chars[last_idx]);
+            let last_char_end =
+                self.char_offsets[last_idx] + Self::char_utf16_len(text_chars[last_idx]);
             // 후행 컨트롤 수 = char_offset - text_len
             let trailing_ctrl_count = (char_offset - text_len) as u32;
             last_char_end + trailing_ctrl_count * 8
+        } else if inserts_before_inline_control {
+            if effective_char_offset == 0 {
+                0
+            } else if !self.char_offsets.is_empty() {
+                let prev_idx = effective_char_offset - 1;
+                self.char_offsets[prev_idx] + Self::char_utf16_len(text_chars[prev_idx])
+            } else {
+                0
+            }
         } else if effective_char_offset < self.char_offsets.len() {
             self.char_offsets[effective_char_offset]
         } else if !self.char_offsets.is_empty() {
@@ -351,21 +458,18 @@ impl Paragraph {
         } else {
             0
         };
-        let utf16_end: u32 = if del_end < self.char_offsets.len() {
-            self.char_offsets[del_end]
-        } else if !self.char_offsets.is_empty() {
-            let last_idx = self.char_offsets.len() - 1;
-            self.char_offsets[last_idx] + Self::char_utf16_len(text_chars[last_idx])
-        } else {
-            0
-        };
-        let utf16_delta = utf16_end - utf16_start;
+        let utf16_delta: u32 = text_chars[char_offset..del_end]
+            .iter()
+            .map(|c| Self::char_utf16_len(*c))
+            .sum();
+        let utf16_end = utf16_start + utf16_delta;
 
         // 1. 텍스트 삭제
         self.text.drain(byte_start..byte_end);
 
         // 2. char_offsets: 삭제 범위 제거 + 이후 엔트리 시프트
-        let mut updated_offsets = Vec::with_capacity(self.char_offsets.len().saturating_sub(actual_count));
+        let mut updated_offsets =
+            Vec::with_capacity(self.char_offsets.len().saturating_sub(actual_count));
         updated_offsets.extend_from_slice(&self.char_offsets[..char_offset]);
         for &offset in &self.char_offsets[del_end..] {
             updated_offsets.push(offset - utf16_delta);
@@ -420,7 +524,8 @@ impl Paragraph {
         }
         // start > end (역전)인 경우만 제거. start == end (빈 필드)는 유효한 상태이므로 유지.
         // IME 조합 중 delete→insert 사이클에서 필드가 일시적으로 비워질 수 있음.
-        self.field_ranges.retain(|fr| fr.start_char_idx <= fr.end_char_idx);
+        self.field_ranges
+            .retain(|fr| fr.start_char_idx <= fr.end_char_idx);
 
         // 6. char_count 갱신
         self.char_count -= actual_count as u32;
@@ -464,7 +569,9 @@ impl Paragraph {
         // 3. char_shapes 분할
         let mut new_char_shapes: Vec<CharShapeRef> = Vec::new();
         // 분할 지점에서의 활성 스타일 찾기
-        let mut active_style_id: u32 = self.char_shapes.first()
+        let mut active_style_id: u32 = self
+            .char_shapes
+            .first()
             .map(|cs| cs.char_shape_id)
             .unwrap_or(0);
         for cs in &self.char_shapes {
@@ -489,10 +596,13 @@ impl Paragraph {
         }
         // 새 문단의 시작(pos 0)에 스타일이 없으면 활성 스타일 추가
         if !has_zero_pos {
-            new_char_shapes.insert(0, CharShapeRef {
-                start_pos: 0,
-                char_shape_id: active_style_id,
-            });
+            new_char_shapes.insert(
+                0,
+                CharShapeRef {
+                    start_pos: 0,
+                    char_shape_id: active_style_id,
+                },
+            );
         }
 
         // 원래 문단의 char_shapes: 분할 지점 이후 제거
@@ -510,10 +620,14 @@ impl Paragraph {
         let orig_line_seg = self.line_segs.first().cloned();
         let (lh, th, bd, ls, sw, tag) = match orig_line_seg {
             Some(ref o) if o.line_height > 0 => (
-                o.line_height, o.text_height, o.baseline_distance,
-                o.line_spacing, o.segment_width, o.tag,
+                o.line_height,
+                o.text_height,
+                o.baseline_distance,
+                o.line_spacing,
+                o.segment_width,
+                o.tag,
             ),
-            _ => (400, 400, 320, 0, 0, 0x00060000),
+            _ => (400, 400, 320, 0, 0, LineSeg::TAG_SINGLE_SEGMENT_LINE),
         };
         let new_line_segs = vec![LineSeg {
             text_start: 0,
@@ -627,7 +741,12 @@ impl Paragraph {
         for cs in &other.char_shapes {
             let new_pos = cs.start_pos + utf16_end;
             // 중복 위치에 같은 스타일이면 스킵
-            if self.char_shapes.last().map(|last| last.start_pos == new_pos && last.char_shape_id == cs.char_shape_id).unwrap_or(false) {
+            if self
+                .char_shapes
+                .last()
+                .map(|last| last.start_pos == new_pos && last.char_shape_id == cs.char_shape_id)
+                .unwrap_or(false)
+            {
                 continue;
             }
             self.char_shapes.push(CharShapeRef {
@@ -640,10 +759,14 @@ impl Paragraph {
         let orig_line_seg = self.line_segs.first().cloned();
         let (lh, th, bd, ls, sw, tag) = match orig_line_seg {
             Some(ref o) if o.line_height > 0 => (
-                o.line_height, o.text_height, o.baseline_distance,
-                o.line_spacing, o.segment_width, o.tag,
+                o.line_height,
+                o.text_height,
+                o.baseline_distance,
+                o.line_spacing,
+                o.segment_width,
+                o.tag,
             ),
-            _ => (400, 400, 320, 0, 0, 0x00060000),
+            _ => (400, 400, 320, 0, 0, LineSeg::TAG_SINGLE_SEGMENT_LINE),
         };
         self.line_segs = vec![LineSeg {
             text_start: 0,
@@ -697,7 +820,9 @@ impl Paragraph {
             // 문단 끝 위치
             let last = *self.char_offsets.last().unwrap();
             let last_char = self.text.chars().nth(self.char_offsets.len() - 1);
-            last + last_char.map(|c| if (c as u32) > 0xFFFF { 2 } else { 1 }).unwrap_or(1)
+            last + last_char
+                .map(|c| if (c as u32) > 0xFFFF { 2 } else { 1 })
+                .unwrap_or(1)
         } else {
             0
         };
@@ -712,6 +837,140 @@ impl Paragraph {
             }
         }
         Some(result_id)
+    }
+
+    /// 인라인 컨트롤이 텍스트의 어느 character 인덱스에 위치하는지 반환한다.
+    ///
+    /// 일반 경로에서는 `char_offsets` 갭 (인라인 컨트롤당 8 UTF-16 코드 유닛) 의 길이만으로
+    /// position 을 분배한다 — 컨트롤 variant 를 보지 않으므로 각주·미주, 그림, 표, 수식,
+    /// 자동번호 등 모든 inline 컨트롤이 동일하게 character offset 을 부여받는다.
+    ///
+    /// `char_offsets` 가 비어있는 폴백 경로에서는 본문 흐름에서 1칸을 차지하는
+    /// Shape/Table/Picture/Equation/Footnote/Endnote 만 폭 1을 가산하고,
+    /// 그 외 컨트롤은 모두 position 0 에 누적된다 (정밀도 손실 분기).
+    ///
+    /// # Returns
+    ///
+    /// `positions[i]` = `controls[i]` 가 삽입되어야 할 텍스트 character 인덱스.
+    /// 컨트롤이 없으면 빈 벡터.
+    pub fn control_text_positions(&self) -> Vec<usize> {
+        let offsets = &self.char_offsets;
+        let total_controls = self.controls.len();
+
+        if total_controls == 0 {
+            return vec![];
+        }
+
+        if offsets.is_empty() {
+            // char_offsets가 없는 경우: 인라인 컨트롤을 순차적으로 배치
+            // secd/cold 등 비인라인 컨트롤은 position 0, 인라인 컨트롤은 순차 증가
+            let mut pos = 0usize;
+            let mut positions = Vec::with_capacity(total_controls);
+            for ctrl in &self.controls {
+                positions.push(pos);
+                if matches!(
+                    ctrl,
+                    Control::Shape(_)
+                        | Control::Table(_)
+                        | Control::Picture(_)
+                        | Control::Equation(_)
+                        | Control::Footnote(_)
+                        | Control::Endnote(_)
+                        | Control::AutoNumber(_)
+                ) {
+                    pos += 1;
+                }
+            }
+            return positions;
+        }
+
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut positions = Vec::with_capacity(total_controls);
+
+        // 첫 문자 이전의 갭: 확장 컨트롤이 텍스트 시작 전에 있는 경우
+        let gap_before = offsets[0] as usize;
+        let n_ctrls_before = gap_before / 8;
+        for _ in 0..n_ctrls_before {
+            if positions.len() >= total_controls {
+                break;
+            }
+            positions.push(0);
+        }
+
+        // 연속된 문자 사이의 갭
+        for i in 0..offsets.len().saturating_sub(1) {
+            if positions.len() >= total_controls {
+                break;
+            }
+            let current_off = offsets[i] as usize;
+            let next_off = offsets[i + 1] as usize;
+            let char_width = if chars.get(i).map_or(false, |&c| c as u32 > 0xFFFF) {
+                2
+            } else {
+                1
+            };
+            if next_off > current_off + char_width {
+                let gap = next_off - current_off - char_width;
+                let n_ctrls = gap / 8;
+                for _ in 0..n_ctrls {
+                    if positions.len() >= total_controls {
+                        break;
+                    }
+                    positions.push(i + 1); // 현재 문자 다음에 삽입
+                }
+            }
+        }
+
+        // 갭 분석으로 발견되지 않은 컨트롤의 위치를 텍스트의 `\u{FFFC}` marker
+        // 위치로 매핑한다. HWP3 파서가 char_offsets 에 control gap (8) 을 추가하지
+        // 않고 sequential [0,1,2,...] 만 push 하는 경우 갭 분석이 실패하여 control
+        // 들이 모두 paragraph 끝에 몰리는 회귀를 차단 (sample16 paragraph 394:
+        // 3 picture 가 같은 line 에 중복 emit). 갭 분석으로 채워진 positions 의
+        // 마지막 인덱스 이후를 search start 로 사용하여 중복 매핑 방지.
+        let already_filled = positions.len();
+        let mut search_start = positions.last().copied().unwrap_or(0);
+        while positions.len() < total_controls {
+            // search_start 위치부터 다음 \u{FFFC} marker 찾기
+            let next_marker = chars[search_start..]
+                .iter()
+                .position(|&c| c == '\u{FFFC}')
+                .map(|rel| search_start + rel);
+            match next_marker {
+                Some(abs_pos) => {
+                    positions.push(abs_pos);
+                    search_start = abs_pos + 1;
+                }
+                None => {
+                    // marker 더 이상 없으면 기존 동작 (chars.len() push)
+                    positions.push(chars.len());
+                }
+            }
+        }
+        let _ = already_filled; // 향후 디버그용 (현재 미사용)
+
+        positions
+    }
+
+    /// `char_offsets` 중 UTF-16 위치 `utf16_pos` 이상인 첫 번째 codepoint 의
+    /// 인덱스를 반환한다. 모든 entry 가 작으면 `char_offsets.len()` (텍스트 끝).
+    ///
+    /// `char_shapes[i].start_pos` 와 `line_segs[i].text_start` 같은 UTF-16
+    /// 단위 위치 필드를 codepoint 인덱스로 정규화할 때 사용한다.
+    ///
+    /// 본 메서드는 `document_core::helpers::utf16_pos_to_char_idx` 와 동일
+    /// 알고리즘이나, 시그니처 호환성 (raw `&[u32]` vs `&self`) 때문에 본체를
+    /// 자체 보유한다 — 의존성 방향 (model ← document_core) 보존. 알고리즘이
+    /// 1줄 (`iter().position`) 이라 silent drift 위험은 무시 가능.
+    ///
+    /// # Returns
+    ///
+    /// `char_offsets` 첫 entry 가 `utf16_pos` 이상인 인덱스. 모든 entry 가
+    /// 작으면 `char_offsets.len()`.
+    pub fn utf16_pos_to_char_idx(&self, utf16_pos: u32) -> usize {
+        self.char_offsets
+            .iter()
+            .position(|&off| off >= utf16_pos)
+            .unwrap_or(self.char_offsets.len())
     }
 
     /// [start_char_offset, end_char_offset) 범위에 new_char_shape_id를 적용한다.
@@ -740,7 +999,9 @@ impl Paragraph {
         } else if !self.char_offsets.is_empty() {
             let last = *self.char_offsets.last().unwrap();
             let last_char = self.text.chars().nth(self.char_offsets.len() - 1);
-            last + last_char.map(|c| if (c as u32) > 0xFFFF { 2 } else { 1 }).unwrap_or(1)
+            last + last_char
+                .map(|c| if (c as u32) > 0xFFFF { 2 } else { 1 })
+                .unwrap_or(1)
         } else {
             return;
         };
@@ -756,9 +1017,12 @@ impl Paragraph {
             let last_idx = self.char_offsets.len() - 1;
             let last_char = self.text.chars().nth(last_idx);
             self.char_offsets[last_idx]
-                + last_char.map(|c| if (c as u32) > 0xFFFF { 2 } else { 1 }).unwrap_or(1)
+                + last_char
+                    .map(|c| if (c as u32) > 0xFFFF { 2 } else { 1 })
+                    .unwrap_or(1)
         } else {
-            self.text.chars()
+            self.text
+                .chars()
                 .map(|c| if (c as u32) > 0xFFFF { 2u32 } else { 1u32 })
                 .sum()
         };
@@ -791,7 +1055,8 @@ impl Paragraph {
                 // 새 ID 삽입 (범위 시작점)
                 let insert_start = utf16_start.max(seg_start);
                 // 이미 같은 위치에 new_char_shape_id가 있는지 확인
-                let already_inserted = new_refs.last()
+                let already_inserted = new_refs
+                    .last()
                     .map(|r| r.start_pos == insert_start && r.char_shape_id == new_char_shape_id)
                     .unwrap_or(false);
                 if !already_inserted {
@@ -837,7 +1102,6 @@ impl Paragraph {
         self.char_shapes = merged;
     }
 }
-
 
 #[cfg(test)]
 mod tests;

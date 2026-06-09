@@ -1,12 +1,12 @@
 //! 문서 전체 구조 (Document, Section, SectionDef)
 
-use super::*;
 use super::bin_data::{BinData, BinDataContent};
 use super::footnote::FootnoteShape;
 use super::header_footer::MasterPage;
-use super::page::{PageDef, PageBorderFill};
+use super::page::{PageBorderFill, PageDef};
 use super::paragraph::Paragraph;
-use super::style::{CharShape, ParaShape, Style, BorderFill, Font, TabDef, Numbering, Bullet};
+use super::style::{BorderFill, Bullet, CharShape, Font, Numbering, ParaShape, Style, TabDef};
+use super::*;
 
 /// 파서가 모델링하지 않는 원시 레코드 (라운드트립 보존용)
 #[derive(Debug, Clone, Default)]
@@ -37,6 +37,10 @@ pub struct Document {
     /// 파서가 모델링하지 않는 추가 CFB 스트림 (라운드트립 보존용)
     /// (스트림 경로, 데이터)
     pub extra_streams: Vec<(String, Vec<u8>)>,
+    /// [Task #1001] HWP3 → HWP5 변환본 여부 (휴리스틱 식별).
+    /// 변환본의 ParaShape spacing/margin 은 HWP3 원본의 2배 단위로 저장되어
+    /// 한컴 viewer 와 일치하려면 typeset 단계에서 1/2 보정 필요.
+    pub is_hwp3_variant: bool,
 }
 
 /// 미리보기 데이터 (PrvImage, PrvText 스트림)
@@ -177,6 +181,10 @@ pub struct SectionDef {
     pub flags: u32,
     /// 단 간격
     pub column_spacing: HwpUnit16,
+    /// 세로 줄맞춤 간격 (0=off, 양수=HWPUNIT 단위)
+    pub line_grid: HwpUnit16,
+    /// 가로 줄맞춤 간격 (0=off, 양수=HWPUNIT 단위)
+    pub char_grid: HwpUnit16,
     /// 기본 탭 간격
     pub default_tab_spacing: HwpUnit,
     /// 쪽 번호 (0이면 앞 구역에 이어서)
@@ -225,6 +233,82 @@ pub struct SectionDef {
 }
 
 impl Document {
+    /// 외부 이미지 binDataId가 이미 로드되었는지 확인한다.
+    ///
+    /// 렌더러는 `bin_data_id - 1` 인덱스를 먼저 조회하므로, 저장소 엔트리의
+    /// `id` 필드보다 인덱스 위치를 우선한다. 인덱스가 없을 때만 `id` 검색으로
+    /// fallback한다.
+    pub(crate) fn external_image_loaded(&self, bin_data_id: u16) -> bool {
+        if bin_data_id == 0 {
+            return false;
+        }
+
+        if let Some(content) = self.bin_data_content.get((bin_data_id - 1) as usize) {
+            return !content.data.is_empty();
+        }
+
+        self.bin_data_content
+            .iter()
+            .any(|content| content.id == bin_data_id && !content.data.is_empty())
+    }
+
+    /// 외부 이미지 바이너리를 렌더러 조회 규칙에 맞는 위치에 주입한다.
+    ///
+    /// 반환값은 실제 주입 여부이다. 호출자는 true일 때 렌더 캐시를 무효화해야 한다.
+    pub(crate) fn inject_external_image_data(
+        &mut self,
+        bin_data_id: u16,
+        data: Vec<u8>,
+        extension: String,
+    ) -> bool {
+        if bin_data_id == 0 {
+            return false;
+        }
+
+        let idx = (bin_data_id as usize).saturating_sub(1);
+        if idx < self.bin_data_content.len() {
+            self.bin_data_content[idx].id = bin_data_id;
+            self.bin_data_content[idx].data = data;
+            self.bin_data_content[idx].extension = extension;
+        } else {
+            self.bin_data_content
+                .push(crate::model::bin_data::BinDataContent {
+                    id: bin_data_id,
+                    data,
+                    extension,
+                });
+        }
+
+        true
+    }
+
+    /// 같은 binDataId를 참조하는 외부 이미지의 표시 경로를 갱신한다.
+    pub(crate) fn update_external_image_display_path(
+        &mut self,
+        bin_data_id: u16,
+        display_path: &str,
+    ) {
+        for section in &mut self.sections {
+            for para in &mut section.paragraphs {
+                for ctrl in &mut para.controls {
+                    let pic = match ctrl {
+                        crate::model::control::Control::Picture(p) => p,
+                        crate::model::control::Control::Shape(s) => match s.as_mut() {
+                            crate::model::shape::ShapeObject::Picture(p) => p,
+                            _ => continue,
+                        },
+                        _ => continue,
+                    };
+                    if pic.image_attr.bin_data_id == bin_data_id
+                        && pic.image_attr.external_path.is_some()
+                    {
+                        pic.image_attr.external_path = Some(display_path.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     /// 배포용(읽기전용) 문서를 편집 가능한 일반 문서로 변환한다.
     ///
     /// 변환 내용:
@@ -246,7 +330,9 @@ impl Document {
         // 2. DocInfo: DISTRIBUTE_DOC_DATA 레코드 제거
         // HWPTAG_BEGIN(0x010) + 12 = 0x01C
         const TAG_DISTRIBUTE_DOC_DATA: u16 = 0x01C;
-        self.doc_info.extra_records.retain(|r| r.tag_id != TAG_DISTRIBUTE_DOC_DATA);
+        self.doc_info
+            .extra_records
+            .retain(|r| r.tag_id != TAG_DISTRIBUTE_DOC_DATA);
         // raw_stream의 surgical remove는 serializer 계층에서 처리
         self.doc_info.distribute_doc_data_removed = true;
 
@@ -263,7 +349,9 @@ impl Document {
         base_id: u32,
         mods: &super::style::CharShapeMods,
     ) -> u32 {
-        let base = self.doc_info.char_shapes
+        let base = self
+            .doc_info
+            .char_shapes
             .get(base_id as usize)
             .cloned()
             .unwrap_or_default();
@@ -291,7 +379,9 @@ impl Document {
         base_id: u16,
         mods: &super::style::ParaShapeMods,
     ) -> u16 {
-        let base = self.doc_info.para_shapes
+        let base = self
+            .doc_info
+            .para_shapes
             .get(base_id as usize)
             .cloned()
             .unwrap_or_default();
@@ -326,6 +416,78 @@ impl Document {
         self.doc_info.raw_stream_dirty = true;
         new_id
     }
+
+    /// [Task #741 후속] 외부 file path 그림 (HWP3 영역 영역 절대 경로 영역 저장된 image)
+    /// 영역 의 binary 영역 영역 base_dir 영역 영역 자동 load.
+    ///
+    /// HWP3 파일 영역 의 image 영역 영역 영역 원본 절대 경로 (예: "D:\\Work\\...\\rdb02.gif")
+    /// 영역 저장 영역. 본 환경 영역 영역 영역 path 영역 영역 access 부재 영역 영역 영역,
+    /// 본 helper 영역 영역 path 영역 영역 basename 영역 영역 추출 (`rdb02.gif`) → `base_dir`
+    /// 영역 영역 영역 file 영역 load → `bin_data_content` 영역 push 영역 → 기존 renderer
+    /// 영역 (svg / web_canvas / skia) 영역 영역 영역 image 영역 표시 영역.
+    ///
+    /// 반환: load 영역 image 영역.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn populate_external_images_from_dir(&mut self, base_dir: &std::path::Path) -> usize {
+        use crate::model::control::Control;
+        use crate::model::shape::ShapeObject;
+        use std::collections::BTreeMap;
+
+        let mut loaded = 0;
+        // (storage_id, basename, extension) 영역 영역 image 영역 수집
+        let mut to_load: BTreeMap<u16, (String, String)> = BTreeMap::new();
+        for section in &self.sections {
+            for para in &section.paragraphs {
+                for ctrl in &para.controls {
+                    let pic = match ctrl {
+                        Control::Picture(p) => p,
+                        Control::Shape(s) => match s.as_ref() {
+                            ShapeObject::Picture(p) => p,
+                            _ => continue,
+                        },
+                        _ => continue,
+                    };
+                    if let Some(ref path) = pic.image_attr.external_path {
+                        let id = pic.image_attr.bin_data_id;
+                        // 이미 load 영역 (bin_data_content 영역 영역 entry 보유) 영역 skip
+                        if self.external_image_loaded(id) {
+                            continue;
+                        }
+
+                        // path 영역 영역 basename 추출 (Windows / Unix 영역 모두 대응)
+                        let basename = path
+                            .rsplit(|c| c == '/' || c == '\\')
+                            .next()
+                            .unwrap_or(path);
+                        let ext = std::path::Path::new(basename)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        to_load.entry(id).or_insert((basename.to_string(), ext));
+                    }
+                }
+            }
+        }
+
+        for (id, (basename, ext)) in to_load {
+            let full_path = base_dir.join(&basename);
+            if let Ok(data) = std::fs::read(&full_path) {
+                if !self.inject_external_image_data(id, data, ext) {
+                    continue;
+                }
+
+                loaded += 1;
+
+                // [한컴 viewer 정합] 원본 절대 경로 영역 영역 access 부재 시 HWP file 영역
+                // 영역 같은 dir 영역 image 영역 발견 영역 영역 dialog 영역 영역 영역 의 path 영역
+                // resolved local path 영역 영역 갱신 (basename 영역만 부재 영역).
+                let resolved = full_path.to_string_lossy().to_string();
+                self.update_external_image_display_path(id, &resolved);
+            }
+        }
+        loaded
+    }
 }
 
 #[cfg(test)]
@@ -341,7 +503,12 @@ mod tests {
 
     #[test]
     fn test_hwp_version() {
-        let ver = HwpVersion { major: 5, minor: 0, build: 3, revision: 0 };
+        let ver = HwpVersion {
+            major: 5,
+            minor: 0,
+            build: 3,
+            revision: 0,
+        };
         assert_eq!(ver.major, 5);
     }
 
@@ -356,8 +523,16 @@ mod tests {
             },
             doc_info: DocInfo {
                 extra_records: vec![
-                    RawRecord { tag_id: 28, level: 0, data: vec![0u8; 256] }, // HWPTAG_DISTRIBUTE_DOC_DATA = HWPTAG_BEGIN(0x10=16) + 12 = 28
-                    RawRecord { tag_id: 99, level: 0, data: vec![1, 2, 3] }, // 다른 레코드
+                    RawRecord {
+                        tag_id: 28,
+                        level: 0,
+                        data: vec![0u8; 256],
+                    }, // HWPTAG_DISTRIBUTE_DOC_DATA = HWPTAG_BEGIN(0x10=16) + 12 = 28
+                    RawRecord {
+                        tag_id: 99,
+                        level: 0,
+                        data: vec![1, 2, 3],
+                    }, // 다른 레코드
                 ],
                 ..Default::default()
             },
@@ -402,7 +577,10 @@ mod tests {
         doc.doc_info.char_shapes.push(cs.clone());
 
         // bold=true로 수정 → 새 ID 생성
-        let mods = CharShapeMods { bold: Some(true), ..Default::default() };
+        let mods = CharShapeMods {
+            bold: Some(true),
+            ..Default::default()
+        };
         let id1 = doc.find_or_create_char_shape(0, &mods);
         assert_eq!(id1, 1);
         assert_eq!(doc.doc_info.char_shapes.len(), 2);
@@ -415,11 +593,14 @@ mod tests {
 
     #[test]
     fn test_find_or_create_para_shape_reuse() {
-        use super::style::{ParaShape, ParaShapeMods, Alignment};
+        use super::style::{Alignment, ParaShape, ParaShapeMods};
         let mut doc = Document::default();
         doc.doc_info.para_shapes.push(ParaShape::default());
 
-        let mods = ParaShapeMods { alignment: Some(Alignment::Center), ..Default::default() };
+        let mods = ParaShapeMods {
+            alignment: Some(Alignment::Center),
+            ..Default::default()
+        };
         let id1 = doc.find_or_create_para_shape(0, &mods);
         assert_eq!(id1, 1);
 

@@ -9,10 +9,12 @@ pub struct Font {
     pub raw_data: Option<Vec<u8>>,
     /// 글꼴 이름
     pub name: String,
-    /// 대체 글꼴 유형 (0: 알 수 없음, 1: TTF, 2: HFT)
+    /// 글꼴 유형 (0: 알 수 없음, 1: TTF, 2: HFT)
     pub alt_type: u8,
     /// 대체 글꼴 이름
     pub alt_name: Option<String>,
+    /// 글꼴 유형 정보 (HWP5 FACE_NAME type info 10바이트)
+    pub type_info: Option<[u8; 10]>,
     /// 기본 글꼴 이름
     pub default_name: Option<String>,
 }
@@ -119,7 +121,7 @@ impl PartialEq for CharShape {
 impl Eq for CharShape {}
 
 /// 밑줄 종류
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub enum UnderlineType {
     #[default]
     None,
@@ -336,10 +338,15 @@ pub struct Style {
     pub local_name: String,
     /// 영문 스타일 이름
     pub english_name: String,
-    /// 스타일 종류 (0: 문단, 1: 글자)
+    /// 스타일 종류 (0: 문단, 1: 글자) — 표 47/48
     pub style_type: u8,
     /// 다음 스타일 ID
     pub next_style_id: u8,
+    /// [Task #1058 후속] 언어 아이디 (INT16, default 1042=한국어).
+    /// 한컴 spec 표 47 의 next_style_id 다음 필드. 누락 시 ps_id/cs_id 가
+    /// 2 byte 앞당겨져 한컴이 잘못된 ParaShape 적용. footnote-01 의 정답지
+    /// 비교로 입증 — rhwp 의 style record size=28 vs 정답지 size=32 (4 byte 누락).
+    pub lang_id: i16,
     /// 문단 모양 ID 참조
     pub para_shape_id: u16,
     /// 글자 모양 ID 참조
@@ -475,6 +482,8 @@ pub struct GradientFill {
     pub center_y: i16,
     /// 번짐 정도 (0~100)
     pub blur: i16,
+    /// 번짐 중심 (0~100)
+    pub step_center: u8,
     /// 색상 목록
     pub colors: Vec<ColorRef>,
     /// 색상 위치 목록
@@ -497,7 +506,7 @@ pub struct ImageFill {
 }
 
 /// 이미지 채우기 유형
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub enum ImageFillMode {
     #[default]
     TileAll,
@@ -587,58 +596,118 @@ impl CharShapeMods {
         let mut cs = base.clone();
         // 수정된 CharShape는 원본 바이트와 달라지므로 raw_data 무효화
         cs.raw_data = None;
-        if let Some(v) = self.bold { cs.bold = v; }
-        if let Some(v) = self.italic { cs.italic = v; }
-        if let Some(v) = self.underline {
-            cs.underline_type = if v { UnderlineType::Bottom } else { UnderlineType::None };
+        if let Some(v) = self.bold {
+            cs.bold = v;
         }
-        if let Some(v) = self.strikethrough { cs.strikethrough = v; }
+        if let Some(v) = self.italic {
+            cs.italic = v;
+        }
+        if let Some(v) = self.underline {
+            cs.underline_type = if v {
+                UnderlineType::Bottom
+            } else {
+                UnderlineType::None
+            };
+        }
+        if let Some(v) = self.strikethrough {
+            cs.strikethrough = v;
+        }
         if let Some(id) = self.font_id {
             // 모든 언어에 동일한 글꼴 ID 적용
             for fid in &mut cs.font_ids {
                 *fid = id;
             }
         }
-        if let Some(v) = self.base_size { cs.base_size = v; }
-        if let Some(v) = self.text_color { cs.text_color = v; }
-        if let Some(v) = self.shade_color { cs.shade_color = v; }
+        if let Some(v) = self.base_size {
+            cs.base_size = v;
+        }
+        if let Some(v) = self.text_color {
+            cs.text_color = v;
+        }
+        if let Some(v) = self.shade_color {
+            cs.shade_color = v;
+        }
         // underline_type이 있으면 underline bool보다 우선
-        if let Some(v) = self.underline_type { cs.underline_type = v; }
-        if let Some(v) = self.underline_color { cs.underline_color = v; }
-        if let Some(v) = self.outline_type { cs.outline_type = v; }
-        if let Some(v) = self.shadow_type { cs.shadow_type = v; }
-        if let Some(v) = self.shadow_color { cs.shadow_color = v; }
-        if let Some(v) = self.shadow_offset_x { cs.shadow_offset_x = v; }
-        if let Some(v) = self.shadow_offset_y { cs.shadow_offset_y = v; }
-        if let Some(v) = self.strike_color { cs.strike_color = v; }
+        if let Some(v) = self.underline_type {
+            cs.underline_type = v;
+        }
+        if let Some(v) = self.underline_color {
+            cs.underline_color = v;
+        }
+        if let Some(v) = self.outline_type {
+            cs.outline_type = v;
+        }
+        if let Some(v) = self.shadow_type {
+            cs.shadow_type = v;
+        }
+        if let Some(v) = self.shadow_color {
+            cs.shadow_color = v;
+        }
+        if let Some(v) = self.shadow_offset_x {
+            cs.shadow_offset_x = v;
+        }
+        if let Some(v) = self.shadow_offset_y {
+            cs.shadow_offset_y = v;
+        }
+        if let Some(v) = self.strike_color {
+            cs.strike_color = v;
+        }
         // subscript/superscript: 상호 배타
         if let Some(v) = self.superscript {
             cs.superscript = v;
-            if v { cs.subscript = false; }
+            if v {
+                cs.subscript = false;
+            }
         }
         if let Some(v) = self.subscript {
             cs.subscript = v;
-            if v { cs.superscript = false; }
+            if v {
+                cs.superscript = false;
+            }
         }
-        if let Some(v) = self.ratios { cs.ratios = v; }
-        if let Some(v) = self.spacings { cs.spacings = v; }
-        if let Some(v) = self.relative_sizes { cs.relative_sizes = v; }
-        if let Some(v) = self.char_offsets { cs.char_offsets = v; }
+        if let Some(v) = self.ratios {
+            cs.ratios = v;
+        }
+        if let Some(v) = self.spacings {
+            cs.spacings = v;
+        }
+        if let Some(v) = self.relative_sizes {
+            cs.relative_sizes = v;
+        }
+        if let Some(v) = self.char_offsets {
+            cs.char_offsets = v;
+        }
         // emboss/engrave: 상호 배타
         if let Some(v) = self.emboss {
             cs.emboss = v;
-            if v { cs.engrave = false; }
+            if v {
+                cs.engrave = false;
+            }
         }
         if let Some(v) = self.engrave {
             cs.engrave = v;
-            if v { cs.emboss = false; }
+            if v {
+                cs.emboss = false;
+            }
         }
-        if let Some(ids) = self.font_ids { cs.font_ids = ids; }
-        if let Some(v) = self.border_fill_id { cs.border_fill_id = v; }
-        if let Some(v) = self.emphasis_dot { cs.emphasis_dot = v; }
-        if let Some(v) = self.underline_shape { cs.underline_shape = v; }
-        if let Some(v) = self.strike_shape { cs.strike_shape = v; }
-        if let Some(v) = self.kerning { cs.kerning = v; }
+        if let Some(ids) = self.font_ids {
+            cs.font_ids = ids;
+        }
+        if let Some(v) = self.border_fill_id {
+            cs.border_fill_id = v;
+        }
+        if let Some(v) = self.emphasis_dot {
+            cs.emphasis_dot = v;
+        }
+        if let Some(v) = self.underline_shape {
+            cs.underline_shape = v;
+        }
+        if let Some(v) = self.strike_shape {
+            cs.strike_shape = v;
+        }
+        if let Some(v) = self.kerning {
+            cs.kerning = v;
+        }
         cs
     }
 }
@@ -667,8 +736,8 @@ pub struct ParaShapeMods {
     pub auto_space_kr_num: Option<bool>,
     pub vertical_align: Option<u8>,
     // 줄바꿈 모드
-    pub english_break_unit: Option<u8>,  // 0=단어, 1=하이픈, 2=글자
-    pub korean_break_unit: Option<u8>,   // 0=어절, 1=글자
+    pub english_break_unit: Option<u8>, // 0=단어, 1=하이픈, 2=글자
+    pub korean_break_unit: Option<u8>,  // 0=어절, 1=글자
     // 탭 설정 탭 속성
     pub tab_def_id: Option<u16>,
     // 번호/글머리표 ID
@@ -684,17 +753,37 @@ impl ParaShapeMods {
         let mut ps = base.clone();
         // 수정된 ParaShape는 원본 바이트와 달라지므로 raw_data 무효화
         ps.raw_data = None;
-        if let Some(v) = self.alignment { ps.alignment = v; }
-        if let Some(v) = self.line_spacing { ps.line_spacing = v; }
-        if let Some(v) = self.line_spacing_type { ps.line_spacing_type = v; }
-        if let Some(v) = self.indent { ps.indent = v; }
-        if let Some(v) = self.margin_left { ps.margin_left = v; }
-        if let Some(v) = self.margin_right { ps.margin_right = v; }
-        if let Some(v) = self.spacing_before { ps.spacing_before = v; }
-        if let Some(v) = self.spacing_after { ps.spacing_after = v; }
+        if let Some(v) = self.alignment {
+            ps.alignment = v;
+        }
+        if let Some(v) = self.line_spacing {
+            ps.line_spacing = v;
+        }
+        if let Some(v) = self.line_spacing_type {
+            ps.line_spacing_type = v;
+        }
+        if let Some(v) = self.indent {
+            ps.indent = v;
+        }
+        if let Some(v) = self.margin_left {
+            ps.margin_left = v;
+        }
+        if let Some(v) = self.margin_right {
+            ps.margin_right = v;
+        }
+        if let Some(v) = self.spacing_before {
+            ps.spacing_before = v;
+        }
+        if let Some(v) = self.spacing_after {
+            ps.spacing_after = v;
+        }
         // 확장 탭: 구조체 필드 + attr1/attr2 비트 동기화
         fn set_bit(val: &mut u32, bit: u32, on: bool) {
-            if on { *val |= 1 << bit; } else { *val &= !(1 << bit); }
+            if on {
+                *val |= 1 << bit;
+            } else {
+                *val &= !(1 << bit);
+            }
         }
         if let Some(v) = self.head_type {
             ps.head_type = v;
@@ -704,16 +793,30 @@ impl ParaShapeMods {
             ps.para_level = v;
             ps.attr1 = (ps.attr1 & !(0x07 << 25)) | ((v as u32 & 0x07) << 25);
         }
-        if let Some(v) = self.widow_orphan { set_bit(&mut ps.attr1, 16, v); }
-        if let Some(v) = self.keep_with_next { set_bit(&mut ps.attr1, 17, v); }
-        if let Some(v) = self.keep_lines { set_bit(&mut ps.attr1, 18, v); }
-        if let Some(v) = self.page_break_before { set_bit(&mut ps.attr1, 19, v); }
-        if let Some(v) = self.font_line_height { set_bit(&mut ps.attr1, 22, v); }
+        if let Some(v) = self.widow_orphan {
+            set_bit(&mut ps.attr1, 16, v);
+        }
+        if let Some(v) = self.keep_with_next {
+            set_bit(&mut ps.attr1, 17, v);
+        }
+        if let Some(v) = self.keep_lines {
+            set_bit(&mut ps.attr1, 18, v);
+        }
+        if let Some(v) = self.page_break_before {
+            set_bit(&mut ps.attr1, 19, v);
+        }
+        if let Some(v) = self.font_line_height {
+            set_bit(&mut ps.attr1, 22, v);
+        }
         if let Some(v) = self.single_line {
             ps.attr2 = (ps.attr2 & !0x03) | if v { 1 } else { 0 };
         }
-        if let Some(v) = self.auto_space_kr_en { set_bit(&mut ps.attr2, 4, v); }
-        if let Some(v) = self.auto_space_kr_num { set_bit(&mut ps.attr2, 5, v); }
+        if let Some(v) = self.auto_space_kr_en {
+            set_bit(&mut ps.attr2, 4, v);
+        }
+        if let Some(v) = self.auto_space_kr_num {
+            set_bit(&mut ps.attr2, 5, v);
+        }
         if let Some(v) = self.vertical_align {
             ps.attr1 = (ps.attr1 & !(0x03 << 20)) | ((v as u32 & 0x03) << 20);
         }
@@ -723,10 +826,18 @@ impl ParaShapeMods {
         if let Some(v) = self.korean_break_unit {
             ps.attr1 = (ps.attr1 & !(0x01 << 7)) | ((v as u32 & 0x01) << 7);
         }
-        if let Some(v) = self.tab_def_id { ps.tab_def_id = v; }
-        if let Some(v) = self.numbering_id { ps.numbering_id = v; }
-        if let Some(v) = self.border_fill_id { ps.border_fill_id = v; }
-        if let Some(v) = self.border_spacing { ps.border_spacing = v; }
+        if let Some(v) = self.tab_def_id {
+            ps.tab_def_id = v;
+        }
+        if let Some(v) = self.numbering_id {
+            ps.numbering_id = v;
+        }
+        if let Some(v) = self.border_fill_id {
+            ps.border_fill_id = v;
+        }
+        if let Some(v) = self.border_spacing {
+            ps.border_spacing = v;
+        }
         ps
     }
 }

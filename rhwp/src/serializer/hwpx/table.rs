@@ -28,7 +28,10 @@ use std::io::Write;
 
 use quick_xml::Writer;
 
-use crate::model::shape::{CommonObjAttr, TextWrap, VertAlign, VertRelTo, HorzAlign, HorzRelTo};
+use crate::model::paragraph::LineSeg;
+use crate::model::shape::{
+    CommonObjAttr, HorzAlign, HorzRelTo, TextFlow, TextWrap, VertAlign, VertRelTo,
+};
 use crate::model::table::{Cell, Table, TablePageBreak, VerticalAlign};
 
 use super::context::SerializeContext;
@@ -54,7 +57,7 @@ pub fn write_table<W: Write>(
     let id_str = table.common.instance_id.to_string();
     let z_order = table.common.z_order.to_string();
     let text_wrap = text_wrap_str(table.common.text_wrap);
-    let text_flow = text_flow_str(table.common.text_wrap);
+    let text_flow = text_flow_str(table.common.text_flow);
     let lock = bool01(false);
     let page_break = table_page_break_str(table.page_break);
     let repeat_header = bool01(table.repeat_header);
@@ -62,6 +65,7 @@ pub fn write_table<W: Write>(
     let col_cnt = table.col_count.to_string();
     let cell_spacing = table.cell_spacing.to_string();
     let border_fill_id_ref = table.border_fill_id.to_string();
+    let no_adjust = bool01((table.attr | table.raw_table_record_attr) & 0x08 != 0);
 
     start_tag_attrs(
         w,
@@ -80,7 +84,7 @@ pub fn write_table<W: Write>(
             ("colCnt", &col_cnt),
             ("cellSpacing", &cell_spacing),
             ("borderFillIDRef", &border_fill_id_ref),
-            ("noAdjust", "0"),
+            ("noAdjust", no_adjust),
         ],
     )?;
 
@@ -93,11 +97,7 @@ pub fn write_table<W: Write>(
     // tr[]: 행 단위 반복. 각 행에 속한 셀 (cell.row == r) 을 col 오름차순으로 출력.
     for row_idx in 0..table.row_count {
         start_tag(w, "hp:tr")?;
-        let mut row_cells: Vec<&Cell> = table
-            .cells
-            .iter()
-            .filter(|c| c.row == row_idx)
-            .collect();
+        let mut row_cells: Vec<&Cell> = table.cells.iter().filter(|c| c.row == row_idx).collect();
         row_cells.sort_by_key(|c| c.col);
         for cell in row_cells {
             write_cell(w, cell, ctx)?;
@@ -227,7 +227,14 @@ fn write_sub_list<W: Write>(
         "hp:subList",
         &[
             ("id", ""),
-            ("textDirection", if cell.text_direction == 1 { "VERTICAL" } else { "HORIZONTAL" }),
+            (
+                "textDirection",
+                if cell.text_direction == 1 {
+                    "VERTICAL"
+                } else {
+                    "HORIZONTAL"
+                },
+            ),
             ("lineWrap", "BREAK"),
             ("vertAlign", cell_vert_align_str(cell.vertical_align)),
             ("linkListIDRef", "0"),
@@ -240,14 +247,14 @@ fn write_sub_list<W: Write>(
     )?;
 
     // 셀 내부 문단 재귀 — 각 문단은 간단한 <hp:p><hp:run><hp:t>텍스트</hp:t></hp:run></hp:p> 구조
-    for (pi, para) in cell.paragraphs.iter().enumerate() {
+    for para in cell.paragraphs.iter() {
         ctx.para_shape_ids.reference(para.para_shape_id);
         ctx.style_ids.reference(para.style_id as u16);
         if let Some(cs_ref) = para.char_shapes.first() {
             ctx.char_shape_ids.reference(cs_ref.char_shape_id);
         }
 
-        let pi_str = pi.to_string();
+        let pi_str = ctx.next_para_id().to_string();
         let ppr = para.para_shape_id.to_string();
         let sp = para.style_id.to_string();
         start_tag_attrs(
@@ -263,7 +270,11 @@ fn write_sub_list<W: Write>(
             ],
         )?;
 
-        let cs = para.char_shapes.first().map(|r| r.char_shape_id).unwrap_or(0);
+        let cs = para
+            .char_shapes
+            .first()
+            .map(|r| r.char_shape_id)
+            .unwrap_or(0);
         let cs_str = cs.to_string();
         start_tag_attrs(w, "hp:run", &[("charPrIDRef", &cs_str)])?;
         // 텍스트만 출력 (탭·소프트브레이크는 Stage 3 범위에서 제외 — section.rs 와 동일 방식으로 단순화)
@@ -272,6 +283,7 @@ fn write_sub_list<W: Write>(
 
         // <hp:linesegarray> 최소 1개 lineseg
         start_tag(w, "hp:linesegarray")?;
+        let line_flags = LineSeg::TAG_SINGLE_SEGMENT_LINE.to_string();
         empty_tag(
             w,
             "hp:lineseg",
@@ -284,7 +296,7 @@ fn write_sub_list<W: Write>(
                 ("spacing", "600"),
                 ("horzpos", "0"),
                 ("horzsize", "12964"),
-                ("flags", "393216"),
+                ("flags", line_flags.as_str()),
             ],
         )?;
         end_tag(w, "hp:linesegarray")?;
@@ -297,7 +309,7 @@ fn write_sub_list<W: Write>(
 }
 
 fn write_cell_text<W: Write>(w: &mut Writer<W>, text: &str) -> Result<(), SerializeError> {
-    use quick_xml::events::{BytesStart, BytesEnd, BytesText, Event};
+    use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
     // <hp:t>text</hp:t>
     w.write_event(Event::Start(BytesStart::new("hp:t")))
         .map_err(|e| SerializeError::XmlError(e.to_string()))?;
@@ -343,7 +355,11 @@ fn write_cell_margin<W: Write>(w: &mut Writer<W>, cell: &Cell) -> Result<(), Ser
 // ---------- enum 변환 헬퍼 ----------
 
 fn bool01(b: bool) -> &'static str {
-    if b { "1" } else { "0" }
+    if b {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 fn text_wrap_str(w: TextWrap) -> &'static str {
@@ -358,12 +374,12 @@ fn text_wrap_str(w: TextWrap) -> &'static str {
     }
 }
 
-/// textFlow: TextWrap 에 따라 결정 (한컴 관찰값 기준).
-fn text_flow_str(w: TextWrap) -> &'static str {
-    use TextWrap::*;
-    match w {
-        Square | Tight | Through => "BOTH_SIDES",
-        _ => "BOTH_SIDES",
+fn text_flow_str(f: TextFlow) -> &'static str {
+    match f {
+        TextFlow::BothSides => "BOTH_SIDES",
+        TextFlow::LeftOnly => "LEFT_ONLY",
+        TextFlow::RightOnly => "RIGHT_ONLY",
+        TextFlow::LargestOnly => "LARGEST_ONLY",
     }
 }
 
@@ -479,7 +495,9 @@ mod tests {
         let cc = xml.find("colCnt=").unwrap();
         let bf = xml.find("borderFillIDRef=").unwrap();
         let na = xml.find("noAdjust=").unwrap();
-        assert!(ip < zp && zp < nt && nt < tw && tw < tf && tf < rc && rc < cc && cc < bf && bf < na);
+        assert!(
+            ip < zp && zp < nt && nt < tw && tw < tf && tf < rc && rc < cc && cc < bf && bf < na
+        );
     }
 
     #[test]
@@ -537,5 +555,133 @@ mod tests {
         write_table(&mut w, &t, &mut ctx).unwrap();
         // 99 는 등록되지 않은 borderFill → unresolved
         assert!(ctx.border_fill_ids.unresolved().contains(&99u16));
+    }
+
+    #[test]
+    fn text_flow_default_is_both_sides() {
+        let t = empty_table(1, 1);
+        let xml = serialize(&t);
+        assert!(xml.contains(r#"textFlow="BOTH_SIDES""#), "{}", xml);
+    }
+
+    #[test]
+    fn text_flow_left_only_serialized() {
+        let mut t = empty_table(1, 1);
+        t.common.text_flow = TextFlow::LeftOnly;
+        let xml = serialize(&t);
+        assert!(xml.contains(r#"textFlow="LEFT_ONLY""#), "{}", xml);
+    }
+
+    #[test]
+    fn text_flow_right_only_serialized() {
+        let mut t = empty_table(1, 1);
+        t.common.text_flow = TextFlow::RightOnly;
+        let xml = serialize(&t);
+        assert!(xml.contains(r#"textFlow="RIGHT_ONLY""#), "{}", xml);
+    }
+
+    #[test]
+    fn text_flow_largest_only_serialized() {
+        let mut t = empty_table(1, 1);
+        t.common.text_flow = TextFlow::LargestOnly;
+        let xml = serialize(&t);
+        assert!(xml.contains(r#"textFlow="LARGEST_ONLY""#), "{}", xml);
+    }
+
+    #[test]
+    fn cell_paragraph_ids_are_globally_unique() {
+        // 2×2 표 = 셀 4개, 각 셀에 문단 1개 → id="0", id="1", id="2", id="3"
+        let t = empty_table(2, 2);
+        let xml = serialize(&t);
+        assert_eq!(
+            xml.matches(r#"<hp:p id="0""#).count(),
+            1,
+            "셀 문단 id=0 이 중복됨: {}",
+            &xml[..xml.len().min(400)]
+        );
+        for expected_id in 0..4u32 {
+            assert!(
+                xml.contains(&format!(r#"<hp:p id="{}""#, expected_id)),
+                "id={} 가 없음",
+                expected_id
+            );
+        }
+    }
+
+    #[test]
+    fn cell_para_ids_continue_from_context_counter() {
+        // 컨텍스트 카운터를 5 앞당긴 뒤 직렬화하면 셀 문단 id가 5부터 시작해야 함.
+        // 본문 문단이 먼저 id 0~4를 소비한 상황을 모사한다.
+        let doc = Document::default();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        for _ in 0..5 {
+            ctx.next_para_id();
+        }
+        let t = empty_table(1, 2); // 셀 2개 × 문단 1개 → id=5, id=6 이어야 함
+        let mut w: Writer<Vec<u8>> = Writer::new(Vec::new());
+        write_table(&mut w, &t, &mut ctx).unwrap();
+        let xml = String::from_utf8(w.into_inner()).unwrap();
+        assert!(
+            xml.contains(r#"<hp:p id="5""#),
+            "첫 셀 문단은 id=5 여야 함 (카운터 오프셋 5): {}",
+            &xml[..xml.len().min(600)]
+        );
+        assert!(
+            xml.contains(r#"<hp:p id="6""#),
+            "두 번째 셀 문단은 id=6 여야 함"
+        );
+    }
+
+    #[test]
+    fn two_sequential_tables_have_no_para_id_collision() {
+        // 같은 ctx로 표 두 개를 연달아 직렬화 — 두 번째 표가 카운터를 초기화하면
+        // id=0 이 2번 나타나므로 회귀를 탐지할 수 있다.
+        let doc = Document::default();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let mut w: Writer<Vec<u8>> = Writer::new(Vec::new());
+        write_table(&mut w, &empty_table(2, 2), &mut ctx).unwrap(); // id 0-3
+        write_table(&mut w, &empty_table(2, 2), &mut ctx).unwrap(); // id 4-7
+        let xml = String::from_utf8(w.into_inner()).unwrap();
+
+        assert_eq!(
+            xml.matches(r#"<hp:p id="0""#).count(),
+            1,
+            "id=0 이 중복 — 두 번째 표가 카운터를 재사용했을 가능성"
+        );
+        for expected_id in 0..8u32 {
+            assert!(
+                xml.contains(&format!(r#"<hp:p id="{}""#, expected_id)),
+                "id={} 가 없음 (총 8개 문단이어야 함)",
+                expected_id
+            );
+        }
+    }
+
+    #[test]
+    fn multi_para_cells_all_get_unique_ids() {
+        // 셀당 문단 3개, 2×2 표 → 총 12개 문단, id=0..11 전부 1회씩
+        let doc = Document::default();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let mut t = empty_table(2, 2);
+        for cell in &mut t.cells {
+            cell.paragraphs.push(Paragraph::default());
+            cell.paragraphs.push(Paragraph::default());
+        }
+        let mut w: Writer<Vec<u8>> = Writer::new(Vec::new());
+        write_table(&mut w, &t, &mut ctx).unwrap();
+        let xml = String::from_utf8(w.into_inner()).unwrap();
+
+        let p_count = xml.matches("<hp:p ").count();
+        assert_eq!(p_count, 12, "문단 수가 12여야 함: {}", p_count);
+
+        for expected_id in 0..12u32 {
+            assert_eq!(
+                xml.matches(&format!(r#"<hp:p id="{}""#, expected_id))
+                    .count(),
+                1,
+                "id={} 가 없거나 중복됨",
+                expected_id
+            );
+        }
     }
 }

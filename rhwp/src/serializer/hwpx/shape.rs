@@ -17,8 +17,10 @@ use std::io::Write;
 
 use quick_xml::Writer;
 
+use crate::model::paragraph::{LineSeg, Paragraph};
 use crate::model::shape::{
-    CommonObjAttr, HorzAlign, HorzRelTo, LineShape, RectangleShape, TextWrap, VertAlign, VertRelTo,
+    CommonObjAttr, HorzAlign, HorzRelTo, LineShape, RectangleShape, TextBox, TextFlow, TextWrap,
+    VertAlign, VertRelTo,
 };
 
 use super::utils::{empty_tag, end_tag, start_tag, start_tag_attrs};
@@ -29,7 +31,10 @@ use super::SerializeError;
 // =====================================================================
 
 /// `<hp:rect>` 직렬화 진입점. Rectangle IR → XML.
-pub fn write_rect<W: Write>(w: &mut Writer<W>, rect: &RectangleShape) -> Result<(), SerializeError> {
+pub fn write_rect<W: Write>(
+    w: &mut Writer<W>,
+    rect: &RectangleShape,
+) -> Result<(), SerializeError> {
     let c = &rect.common;
     // 속성 (부모 AbstractShapeObjectType + 자신):
     // id, zOrder, numberingType, textWrap, textFlow, lock, dropcapstyle,
@@ -37,6 +42,7 @@ pub fn write_rect<W: Write>(w: &mut Writer<W>, rect: &RectangleShape) -> Result<
     let id_str = c.instance_id.to_string();
     let z_order = c.z_order.to_string();
     let tw = text_wrap_str(c.text_wrap);
+    let tf = text_flow_str(c.text_flow);
 
     start_tag_attrs(
         w,
@@ -46,7 +52,7 @@ pub fn write_rect<W: Write>(w: &mut Writer<W>, rect: &RectangleShape) -> Result<
             ("zOrder", &z_order),
             ("numberingType", "NONE"),
             ("textWrap", tw),
-            ("textFlow", "BOTH_SIDES"),
+            ("textFlow", tf),
             ("lock", "0"),
             ("dropcapstyle", "None"),
             ("href", ""),
@@ -56,10 +62,17 @@ pub fn write_rect<W: Write>(w: &mut Writer<W>, rect: &RectangleShape) -> Result<
         ],
     )?;
 
-    // 기본 자식: sz, pos, outMargin (최소 뼈대)
+    // 기본 자식: sz, pos, outMargin
     write_sz(w, c)?;
     write_pos(w, c)?;
     write_out_margin(w, c)?;
+
+    // drawText: 글상자 내부 문단
+    if let Some(ref tb) = rect.drawing.text_box {
+        if !tb.paragraphs.is_empty() {
+            write_draw_text(w, tb)?;
+        }
+    }
 
     end_tag(w, "hp:rect")?;
     Ok(())
@@ -75,6 +88,7 @@ pub fn write_line<W: Write>(w: &mut Writer<W>, line: &LineShape) -> Result<(), S
     let id_str = c.instance_id.to_string();
     let z_order = c.z_order.to_string();
     let tw = text_wrap_str(c.text_wrap);
+    let tf = text_flow_str(c.text_flow);
     let sx = line.start.x.to_string();
     let sy = line.start.y.to_string();
     let ex = line.end.x.to_string();
@@ -89,7 +103,7 @@ pub fn write_line<W: Write>(w: &mut Writer<W>, line: &LineShape) -> Result<(), S
             ("zOrder", &z_order),
             ("numberingType", "NONE"),
             ("textWrap", tw),
-            ("textFlow", "BOTH_SIDES"),
+            ("textFlow", tf),
             ("lock", "0"),
             ("dropcapstyle", "None"),
             ("href", ""),
@@ -123,6 +137,7 @@ pub fn write_container_open<W: Write>(
     let id_str = common.instance_id.to_string();
     let z_order = common.z_order.to_string();
     let tw = text_wrap_str(common.text_wrap);
+    let tf = text_flow_str(common.text_flow);
 
     start_tag_attrs(
         w,
@@ -132,7 +147,7 @@ pub fn write_container_open<W: Write>(
             ("zOrder", &z_order),
             ("numberingType", "NONE"),
             ("textWrap", tw),
-            ("textFlow", "BOTH_SIDES"),
+            ("textFlow", tf),
             ("lock", "0"),
             ("dropcapstyle", "None"),
             ("href", ""),
@@ -150,6 +165,112 @@ pub fn write_container_open<W: Write>(
 
 pub fn write_container_close<W: Write>(w: &mut Writer<W>) -> Result<(), SerializeError> {
     end_tag(w, "hp:container")
+}
+
+// =====================================================================
+// <hp:drawText> — 글상자 내부 텍스트
+// =====================================================================
+
+/// `<hp:drawText>` 직렬화 — TextBox의 paragraphs를 subList로 출력.
+pub fn write_draw_text<W: Write>(w: &mut Writer<W>, tb: &TextBox) -> Result<(), SerializeError> {
+    let ml = tb.margin_left.to_string();
+    let mr = tb.margin_right.to_string();
+    let mt = tb.margin_top.to_string();
+    let mb = tb.margin_bottom.to_string();
+    let mw = tb.max_width.to_string();
+
+    start_tag_attrs(w, "hp:drawText", &[("lastWidth", &mw)])?;
+
+    empty_tag(
+        w,
+        "hp:textMargin",
+        &[("left", &ml), ("right", &mr), ("top", &mt), ("bottom", &mb)],
+    )?;
+
+    start_tag_attrs(
+        w,
+        "hp:subList",
+        &[
+            ("id", ""),
+            ("textDirection", "HORIZONTAL"),
+            ("lineWrap", "BREAK"),
+            ("vertAlign", "TOP"),
+            ("linkListIDRef", "0"),
+            ("linkListNextIDRef", "0"),
+            ("textWidth", "0"),
+            ("textHeight", "0"),
+            ("hasTextRef", "0"),
+            ("hasNumRef", "0"),
+        ],
+    )?;
+
+    for (idx, p) in tb.paragraphs.iter().enumerate() {
+        write_draw_text_paragraph(w, p, idx)?;
+    }
+
+    end_tag(w, "hp:subList")?;
+    end_tag(w, "hp:drawText")?;
+    Ok(())
+}
+
+fn write_draw_text_paragraph<W: Write>(
+    w: &mut Writer<W>,
+    p: &Paragraph,
+    idx: usize,
+) -> Result<(), SerializeError> {
+    let id = idx.to_string();
+    let ps_id = p.para_shape_id.to_string();
+    let st_id = p.style_id.to_string();
+
+    start_tag_attrs(
+        w,
+        "hp:p",
+        &[
+            ("id", &id),
+            ("paraPrIDRef", &ps_id),
+            ("styleIDRef", &st_id),
+            ("pageBreak", "0"),
+            ("columnBreak", "0"),
+            ("merged", "0"),
+        ],
+    )?;
+
+    let cs = p.char_shapes.first().map(|r| r.char_shape_id).unwrap_or(0);
+    let cs_str = cs.to_string();
+    start_tag_attrs(w, "hp:run", &[("charPrIDRef", &cs_str)])?;
+
+    // simple text output — XML escape
+    start_tag(w, "hp:t")?;
+    w.write_event(quick_xml::events::Event::Text(
+        quick_xml::events::BytesText::new(&super::utils::xml_escape(&p.text)),
+    ))
+    .map_err(|e| SerializeError::XmlError(format!("drawText text: {e}")))?;
+    end_tag(w, "hp:t")?;
+
+    end_tag(w, "hp:run")?;
+
+    // minimal lineseg
+    start_tag(w, "hp:linesegarray")?;
+    let line_flags = LineSeg::TAG_SINGLE_SEGMENT_LINE.to_string();
+    empty_tag(
+        w,
+        "hp:lineseg",
+        &[
+            ("textpos", "0"),
+            ("vertpos", "0"),
+            ("vertsize", "1000"),
+            ("textheight", "1000"),
+            ("baseline", "850"),
+            ("spacing", "600"),
+            ("horzpos", "0"),
+            ("horzsize", "42520"),
+            ("flags", line_flags.as_str()),
+        ],
+    )?;
+    end_tag(w, "hp:linesegarray")?;
+
+    end_tag(w, "hp:p")?;
+    Ok(())
 }
 
 // =====================================================================
@@ -208,7 +329,11 @@ fn write_out_margin<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<()
 }
 
 fn bool01(b: bool) -> &'static str {
-    if b { "1" } else { "0" }
+    if b {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 fn text_wrap_str(w: TextWrap) -> &'static str {
@@ -220,6 +345,15 @@ fn text_wrap_str(w: TextWrap) -> &'static str {
         TopAndBottom => "TOP_AND_BOTTOM",
         BehindText => "BEHIND_TEXT",
         InFrontOfText => "IN_FRONT_OF_TEXT",
+    }
+}
+
+fn text_flow_str(f: TextFlow) -> &'static str {
+    match f {
+        TextFlow::BothSides => "BOTH_SIDES",
+        TextFlow::LeftOnly => "LEFT_ONLY",
+        TextFlow::RightOnly => "RIGHT_ONLY",
+        TextFlow::LargestOnly => "LARGEST_ONLY",
     }
 }
 
@@ -267,8 +401,8 @@ fn horz_align_str(h: HorzAlign) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::shape::{LineShape, RectangleShape};
     use crate::model::Point;
-    use crate::model::shape::{RectangleShape, LineShape};
 
     fn serialize_rect(rect: &RectangleShape) -> String {
         let mut w: Writer<Vec<u8>> = Writer::new(Vec::new());

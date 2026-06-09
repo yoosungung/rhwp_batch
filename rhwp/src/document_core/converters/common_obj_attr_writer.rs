@@ -7,7 +7,7 @@
 //! 라운드트립 테스트로 검증한다.
 
 use crate::model::shape::{
-    CommonObjAttr, HorzAlign, HorzRelTo, SizeCriterion, TextWrap, VertAlign, VertRelTo,
+    CommonObjAttr, HorzAlign, HorzRelTo, SizeCriterion, TextFlow, TextWrap, VertAlign, VertRelTo,
 };
 use crate::serializer::byte_writer::ByteWriter;
 
@@ -64,16 +64,22 @@ pub fn serialize_common_obj_attr(common: &CommonObjAttr) -> Vec<u8> {
 
 /// `CommonObjAttr` 의 enum 필드들로부터 attr u32 비트를 합성한다.
 ///
-/// 비트 레이아웃 (parser/control/shape.rs:247 의 역방향):
+/// 비트 레이아웃 (parser/control/shape.rs 의 역방향):
 /// - bit 0: treat_as_char
 /// - bit 3-4: vert_rel_to (Paper=0, Page=1, Para=2)
 /// - bit 5-7: vert_align
 /// - bit 8-9: horz_rel_to
 /// - bit 10-12: horz_align
+/// - bit 13: flow_with_text (HWPX object contract)
+/// - bit 14: allow_overlap (HWPX object contract)
 /// - bit 15-17: width_criterion
 /// - bit 18-19: height_criterion
 /// - bit 21-23: text_wrap
-fn pack_common_attr_bits(common: &CommonObjAttr) -> u32 {
+/// - bit 24-25: text_flow
+/// - bit 20: size protect when VertRelTo is Para
+/// - bit 26: HWPX GenShape storage high bit 후보
+/// - bit 28: HWPX GenShape numbering category high bit 후보
+pub(crate) fn pack_common_attr_bits(common: &CommonObjAttr) -> u32 {
     let mut a: u32 = 0;
     if common.treat_as_char {
         a |= 0x01;
@@ -82,9 +88,25 @@ fn pack_common_attr_bits(common: &CommonObjAttr) -> u32 {
     a |= (vert_align_to_bits(common.vert_align) & 0x07) << 5;
     a |= (horz_rel_to_to_bits(common.horz_rel_to) & 0x03) << 8;
     a |= (horz_align_to_bits(common.horz_align) & 0x07) << 10;
+    if common.flow_with_text {
+        a |= 1 << 13;
+    }
+    if common.allow_overlap {
+        a |= 1 << 14;
+    }
+    if common.size_protect {
+        a |= 1 << 20;
+    }
     a |= (width_criterion_to_bits(common.width_criterion) & 0x07) << 15;
     a |= (height_criterion_to_bits(common.height_criterion) & 0x03) << 18;
     a |= (text_wrap_to_bits(common.text_wrap) & 0x07) << 21;
+    a |= (text_flow_to_bits(common.text_flow) & 0x03) << 24;
+    if common.hwp5_gen_shape_attr_bit26 {
+        a |= 1 << 26;
+    }
+    if common.hwp5_gen_shape_attr_bit28 {
+        a |= 1 << 28;
+    }
     a
 }
 
@@ -157,6 +179,15 @@ fn text_wrap_to_bits(v: TextWrap) -> u32 {
     }
 }
 
+fn text_flow_to_bits(v: TextFlow) -> u32 {
+    match v {
+        TextFlow::BothSides => 0,
+        TextFlow::LeftOnly => 1,
+        TextFlow::RightOnly => 2,
+        TextFlow::LargestOnly => 3,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,15 +203,26 @@ mod tests {
             width: 12000,
             height: 8000,
             z_order: 7,
-            margin: Padding { left: 100, right: 200, top: 300, bottom: 400 },
+            margin: Padding {
+                left: 100,
+                right: 200,
+                top: 300,
+                bottom: 400,
+            },
             instance_id: 0xCAFEBABE,
             prevent_page_break: 0,
             treat_as_char: false,
+            flow_with_text: false,
+            allow_overlap: false,
+            hwp5_gen_shape_attr_bit26: false,
+            size_protect: false,
+            hwp5_gen_shape_attr_bit28: false,
             vert_rel_to: VertRelTo::Para,
             vert_align: VertAlign::Top,
             horz_rel_to: HorzRelTo::Para,
             horz_align: HorzAlign::Left,
             text_wrap: TextWrap::TopAndBottom,
+            text_flow: TextFlow::BothSides,
             width_criterion: SizeCriterion::Absolute,
             height_criterion: SizeCriterion::Absolute,
             description: String::new(),
@@ -206,6 +248,17 @@ mod tests {
         assert_eq!(parsed.instance_id, original.instance_id);
         assert_eq!(parsed.prevent_page_break, original.prevent_page_break);
         assert_eq!(parsed.treat_as_char, original.treat_as_char);
+        assert_eq!(parsed.flow_with_text, original.flow_with_text);
+        assert_eq!(parsed.allow_overlap, original.allow_overlap);
+        assert_eq!(
+            parsed.hwp5_gen_shape_attr_bit26,
+            original.hwp5_gen_shape_attr_bit26
+        );
+        assert_eq!(parsed.size_protect, original.size_protect);
+        assert_eq!(
+            parsed.hwp5_gen_shape_attr_bit28,
+            original.hwp5_gen_shape_attr_bit28
+        );
         assert_eq!(parsed.vert_rel_to, original.vert_rel_to);
         assert_eq!(parsed.horz_rel_to, original.horz_rel_to);
         assert_eq!(parsed.text_wrap, original.text_wrap);
@@ -220,6 +273,32 @@ mod tests {
         let parsed = parse_common_obj_attr(&bytes);
         assert!(parsed.treat_as_char);
         assert_eq!(parsed.text_wrap, TextWrap::BehindText);
+    }
+
+    #[test]
+    fn roundtrip_hwpx_object_contract_bits() {
+        let mut original = make_sample();
+        original.flow_with_text = true;
+        original.allow_overlap = true;
+        original.hwp5_gen_shape_attr_bit26 = true;
+        original.size_protect = true;
+        original.hwp5_gen_shape_attr_bit28 = true;
+
+        let bytes = serialize_common_obj_attr(&original);
+        let attr = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+
+        assert_ne!(attr & (1 << 13), 0);
+        assert_ne!(attr & (1 << 14), 0);
+        assert_ne!(attr & (1 << 20), 0);
+        assert_ne!(attr & (1 << 26), 0);
+        assert_ne!(attr & (1 << 28), 0);
+
+        let parsed = parse_common_obj_attr(&bytes);
+        assert!(parsed.flow_with_text);
+        assert!(parsed.allow_overlap);
+        assert!(parsed.size_protect);
+        assert!(parsed.hwp5_gen_shape_attr_bit26);
+        assert!(parsed.hwp5_gen_shape_attr_bit28);
     }
 
     #[test]
@@ -258,6 +337,63 @@ mod tests {
         let bytes = serialize_common_obj_attr(&make_sample());
         // attr(4) + vert_off(4) + horz_off(4) + w(4) + h(4) + z(4)
         //  + margin(8) + inst(4) + prev(4) + desc_len(2) = 42
-        assert!(bytes.len() >= 42, "예상 42바이트 이상, 실제={}", bytes.len());
+        assert!(
+            bytes.len() >= 42,
+            "예상 42바이트 이상, 실제={}",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn roundtrip_text_flow_left_only() {
+        // HWPX 출처: attr=0, text_flow=LeftOnly → bits 24-25 = 0b01
+        let mut original = make_sample();
+        original.text_flow = TextFlow::LeftOnly;
+        let bytes = serialize_common_obj_attr(&original);
+        let parsed = parse_common_obj_attr(&bytes);
+        assert_eq!(parsed.text_flow, TextFlow::LeftOnly);
+    }
+
+    #[test]
+    fn roundtrip_text_flow_right_only() {
+        let mut original = make_sample();
+        original.text_flow = TextFlow::RightOnly;
+        let bytes = serialize_common_obj_attr(&original);
+        let parsed = parse_common_obj_attr(&bytes);
+        assert_eq!(parsed.text_flow, TextFlow::RightOnly);
+    }
+
+    #[test]
+    fn roundtrip_text_flow_largest_only() {
+        let mut original = make_sample();
+        original.text_flow = TextFlow::LargestOnly;
+        let bytes = serialize_common_obj_attr(&original);
+        let parsed = parse_common_obj_attr(&bytes);
+        assert_eq!(parsed.text_flow, TextFlow::LargestOnly);
+    }
+
+    #[test]
+    fn text_flow_bits_position() {
+        // bit 24-25 에 정확히 위치하는지 검증
+        let mut original = make_sample();
+        original.text_flow = TextFlow::LeftOnly; // 0b01
+        let bytes = serialize_common_obj_attr(&original);
+        let attr = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert_eq!((attr >> 24) & 0x03, 1, "LeftOnly 는 bit24-25 = 0b01");
+
+        original.text_flow = TextFlow::RightOnly; // 0b10
+        let bytes = serialize_common_obj_attr(&original);
+        let attr = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert_eq!((attr >> 24) & 0x03, 2, "RightOnly 는 bit24-25 = 0b10");
+    }
+
+    #[test]
+    fn text_flow_default_is_both_sides() {
+        // 기본값이 BOTH_SIDES(0) 인지 확인
+        let original = make_sample();
+        assert_eq!(original.text_flow, TextFlow::BothSides);
+        let bytes = serialize_common_obj_attr(&original);
+        let parsed = parse_common_obj_attr(&bytes);
+        assert_eq!(parsed.text_flow, TextFlow::BothSides);
     }
 }
