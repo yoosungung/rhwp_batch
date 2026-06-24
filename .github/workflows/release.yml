@@ -114,8 +114,9 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           TARGET="x86_64-unknown-linux-gnu"
-          tar -xzf "artifacts/${BIN_NAME}-${TAG}-${TARGET}.tar.gz"
-          install -Dm755 "${BIN_NAME}" dist/rhwp-batch
+          mkdir -p staging dist
+          tar -xzf "artifacts/${BIN_NAME}-${TAG}-${TARGET}.tar.gz" -C staging
+          install -Dm755 "staging/${BIN_NAME}" dist/rhwp-batch
         env:
           BIN_NAME: rhwp-batch
 
