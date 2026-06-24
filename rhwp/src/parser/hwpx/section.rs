@@ -13,7 +13,10 @@ use crate::model::control::{
 use crate::model::document::{Section, SectionDef};
 use crate::model::footnote::{Endnote, Footnote};
 use crate::model::header_footer::{Footer, Header, HeaderFooterApply, MasterPage};
-use crate::model::image::{CropInfo, ImageAttr, ImageEffect};
+use crate::model::image::{
+    CropInfo, EffectColor, EffectPoint, EffectRgb, ImageAttr, ImageEffect, PictureEffects,
+    PictureShadow,
+};
 use crate::model::page::{
     BindingMethod, ColumnDef, ColumnDirection, ColumnType, PageBorderBasis, PageBorderFill,
     PageBorderUiBasis, PageDef,
@@ -723,14 +726,10 @@ fn parse_paragraph(
         }
     }
 
-    // 기본 line_seg (빈 문단이라도 최소 1개)
-    if para.line_segs.is_empty() {
-        para.line_segs.push(LineSeg {
-            text_start: 0,
-            tag: LineSeg::TAG_SINGLE_SEGMENT_LINE,
-            ..Default::default()
-        });
-    }
+    // [#1380] 원본에 `<hp:linesegarray>` 가 없는 문단은 line_segs 를 빈 채로 유지한다.
+    // 종전에는 zero-default LineSeg 1개를 합성 주입했으나, serializer 가 이 주입분을
+    // `vertsize="0" ...` lineseg 로 방출하여 원본 무 → RT 유 비대칭을 만들었다.
+    // 한컴은 lineseg 가 없으면 열 때 재계산하므로 빈 채 보존이 안전하다.
 
     // [Task #1058 후속] HWPX `<hp:p id>` → HWP PARA_HEADER instance_id 매핑.
     // raw_header_extra 구조 (serializer 정합 — body_text.rs:241):
@@ -831,6 +830,7 @@ fn parse_note_pr_children(
     end_tag: &[u8],
 ) -> Result<(), HwpxError> {
     let is_end_note = end_tag == b"endNotePr";
+    let mut saw_above_line = false;
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
@@ -841,6 +841,15 @@ fn parse_note_pr_children(
                     b"autoNumFormat" => {
                         for attr in e.attributes().flatten() {
                             match attr.key.as_ref() {
+                                b"type" => {
+                                    if let Ok(s) = std::str::from_utf8(&attr.value) {
+                                        shape.number_format =
+                                            crate::model::footnote::FootnoteShape::number_format_from_name(
+                                                s,
+                                                shape.number_format,
+                                            );
+                                    }
+                                }
                                 b"suffixChar" => {
                                     if let Ok(s) = std::str::from_utf8(&attr.value) {
                                         if let Some(c) = s.chars().next() {
@@ -861,6 +870,9 @@ fn parse_note_pr_children(
                                             shape.user_char = c;
                                         }
                                     }
+                                }
+                                b"supscript" => {
+                                    shape.number_code_superscript = parse_bool_attr(&attr);
                                 }
                                 _ => {}
                             }
@@ -926,10 +938,10 @@ fn parse_note_pr_children(
                     b"noteSpacing" => {
                         for attr in e.attributes().flatten() {
                             match attr.key.as_ref() {
-                                // [Task #1050] HWP5 spec 의 정답지 매핑:
-                                // betweenNotes → raw_unknown (실제는 between-notes spacing)
-                                // belowLine → note_spacing
-                                // aboveLine → separator_margin_bottom
+                                // 공식 미주/각주 모양 의미:
+                                // betweenNotes → 앞 번호 주석 내용과 다음 번호 주석 내용 사이
+                                // belowLine → 구분선과 주석 내용 사이
+                                // aboveLine → 본문과 구분선 사이
                                 b"betweenNotes" => {
                                     if let Ok(s) = std::str::from_utf8(&attr.value) {
                                         if let Ok(v) = s.parse::<u16>() {
@@ -947,16 +959,20 @@ fn parse_note_pr_children(
                                 b"aboveLine" => {
                                     if let Ok(s) = std::str::from_utf8(&attr.value) {
                                         if let Ok(v) = s.parse::<i16>() {
-                                            shape.separator_margin_bottom = v;
+                                            shape.separator_margin_top = v;
+                                            saw_above_line = true;
                                         }
                                     }
                                 }
                                 _ => {}
                             }
                         }
-                        // [Task #1050] separator_margin_top: HWPX 미보유 → 한컴 default -1 (sentinel).
-                        // 단, 미주 noteLine type="NONE" 에서는 한컴 저장본이 0을 유지한다.
-                        if shape.separator_margin_top == 0 && shape.separator_line_type != 0 {
+                        // 일부 오래된 HWPX에는 aboveLine 이 생략될 수 있으므로 기존 sentinel
+                        // fallback 만 유지한다. aboveLine 이 있으면 공식 "구분선 위" 값으로 쓴다.
+                        if !saw_above_line
+                            && shape.separator_margin_top == 0
+                            && shape.separator_line_type != 0
+                        {
                             shape.separator_margin_top =
                                 if is_end_note && shape.separator_length > 0 {
                                     224
@@ -970,23 +986,19 @@ fn parse_note_pr_children(
                             match attr.key.as_ref() {
                                 b"type" => {
                                     if let Ok(s) = std::str::from_utf8(&attr.value) {
-                                        let (numbering, attr_bits) = match s {
-                                            "CONTINUOUS" | "continue" => (
-                                                crate::model::footnote::FootnoteNumbering::Continue,
-                                                0u32,
-                                            ),
-                                            "ON_SECTION" | "RESTART_SECTION" | "restartSection" => (
-                                                crate::model::footnote::FootnoteNumbering::RestartSection,
-                                                1u32,
-                                            ),
-                                            "ON_PAGE" | "RESTART_PAGE" | "restartPage" => (
-                                                crate::model::footnote::FootnoteNumbering::RestartPage,
-                                                2u32,
-                                            ),
+                                        let numbering = match s {
+                                            "CONTINUOUS" | "continue" => {
+                                                crate::model::footnote::FootnoteNumbering::Continue
+                                            }
+                                            "ON_SECTION" | "RESTART_SECTION" | "restartSection" => {
+                                                crate::model::footnote::FootnoteNumbering::RestartSection
+                                            }
+                                            "ON_PAGE" | "RESTART_PAGE" | "restartPage" => {
+                                                crate::model::footnote::FootnoteNumbering::RestartPage
+                                            }
                                             _ => continue,
                                         };
                                         shape.numbering = numbering;
-                                        shape.attr = (shape.attr & !(0x03 << 8)) | (attr_bits << 8);
                                     }
                                 }
                                 b"newNum" => {
@@ -1002,28 +1014,30 @@ fn parse_note_pr_children(
                     }
                     b"placement" => {
                         for attr in e.attributes().flatten() {
-                            if attr.key.as_ref() == b"place" {
-                                if let Ok(s) = std::str::from_utf8(&attr.value) {
-                                    let (placement, attr_bits) = match s {
-                                        "END_OF_SECTION" | "BELOW_TEXT" | "sectionEnd"
-                                        | "belowText" => (
-                                            crate::model::footnote::FootnotePlacement::BelowText,
-                                            1u32,
-                                        ),
-                                        "RIGHT_COLUMN" | "rightColumn" => (
-                                            crate::model::footnote::FootnotePlacement::RightColumn,
-                                            2u32,
-                                        ),
-                                        "END_OF_DOCUMENT" | "EACH_COLUMN" | "documentEnd"
-                                        | "eachColumn" => (
-                                            crate::model::footnote::FootnotePlacement::EachColumn,
-                                            0u32,
-                                        ),
-                                        _ => continue,
-                                    };
-                                    shape.placement = placement;
-                                    shape.attr = (shape.attr & !(0x03 << 8)) | (attr_bits << 8);
+                            match attr.key.as_ref() {
+                                b"place" => {
+                                    if let Ok(s) = std::str::from_utf8(&attr.value) {
+                                        let placement = match s {
+                                            "END_OF_SECTION" | "BELOW_TEXT" | "sectionEnd"
+                                            | "belowText" => {
+                                                crate::model::footnote::FootnotePlacement::BelowText
+                                            }
+                                            "RIGHT_COLUMN" | "rightColumn" => {
+                                                crate::model::footnote::FootnotePlacement::RightColumn
+                                            }
+                                            "END_OF_DOCUMENT" | "EACH_COLUMN" | "documentEnd"
+                                            | "eachColumn" => {
+                                                crate::model::footnote::FootnotePlacement::EachColumn
+                                            }
+                                            _ => continue,
+                                        };
+                                        shape.placement = placement;
+                                    }
                                 }
+                                b"beneathText" => {
+                                    shape.print_inline_after_text = parse_bool_attr(&attr);
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -1047,6 +1061,7 @@ fn parse_note_pr_children(
         }
         buf.clear();
     }
+    shape.attr = shape.encode_attr();
     Ok(())
 }
 
@@ -1869,7 +1884,7 @@ fn pack_hwpx_common_obj_attr(common: &CommonObjAttr) -> u32 {
     attr
 }
 
-/// 표 캡션 파싱
+/// `<hp:caption>` 파싱 — 표(#1387)·그림/도형/묶음(#1403) 공유.
 fn parse_table_caption(
     e: &quick_xml::events::BytesStart,
     reader: &mut Reader<&[u8]>,
@@ -1936,8 +1951,18 @@ fn parse_table_cell(
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
             b"borderFillIDRef" => cell.border_fill_id = parse_u16(&attr),
-            b"header" => cell.is_header = attr_str(&attr) == "1",
-            b"hasMargin" => cell.apply_inner_margin = attr_str(&attr) == "1",
+            b"header" => cell.set_header(parse_bool(&attr)),
+            b"hasMargin" => cell.set_apply_inner_margin(parse_bool(&attr)),
+            b"protect" => cell.set_cell_protect(parse_bool(&attr)),
+            b"editable" => cell.set_editable_in_form(parse_bool(&attr)),
+            // 셀 필드 이름 (누름틀 셀 필드, #493). 직렬화기는 무명 셀도 name=""로
+            // 항상 방출하므로 빈 값은 None — HWP5 파서(parse_cell_field_name)와
+            // 동일 의미. 누락 시 HWPX 로드에서 getFieldList가 셀 필드를 반환하지 못하고
+            // HWPX 라운드트립에서 셀 필드 이름이 유실된다.
+            b"name" => {
+                let v = attr_str(&attr);
+                cell.field_name = if v.is_empty() { None } else { Some(v) };
+            }
             _ => {}
         }
     }
@@ -2131,8 +2156,10 @@ fn parse_picture(
     let mut padding = crate::model::Padding::default();
     let mut border_x = [0i32; 4];
     let mut border_y = [0i32; 4];
+    let mut img_dim: (u32, u32) = (0, 0); // [#1389] hp:imgDim 원본 이미지 픽셀 크기
     let mut href: Option<String> = None;
     let mut picture_instance_id = 0;
+    let mut effects = PictureEffects::default();
 
     // <hp:pic> 요소 자체의 속성 파싱
     for attr in e.attributes().flatten() {
@@ -2172,6 +2199,7 @@ fn parse_picture(
 
     // 이미지 속성 읽기
     let mut has_pos = false; // <pos> 파싱 여부 — <offset>이 덮어쓰지 않도록 방지
+    let mut caption: Option<crate::model::shape::Caption> = None;
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
@@ -2180,6 +2208,13 @@ fn parse_picture(
             }
             Ok(Event::Start(ref ce)) if local_name(ce.name().as_ref()) == b"shapeComment" => {
                 common.description = read_dutmal_text(reader, b"shapeComment")?;
+            }
+            Ok(Event::Start(ref ce)) if local_name(ce.name().as_ref()) == b"effects" => {
+                effects = parse_picture_effects(reader)?;
+            }
+            // 그림 캡션 (#1403) — 미적재 시 roundtrip 에서 캡션 subList 소실
+            Ok(Event::Start(ref ce)) if local_name(ce.name().as_ref()) == b"caption" => {
+                caption = Some(parse_table_caption(ce, reader)?);
             }
             Ok(Event::Start(ref ce)) | Ok(Event::Empty(ref ce)) => {
                 let cname = ce.name();
@@ -2223,6 +2258,16 @@ fn parse_picture(
                                         common.height = v;
                                     }
                                 }
+                                _ => {}
+                            }
+                        }
+                    }
+                    // [#1389] 원본 이미지 픽셀 크기 — verbatim 적재
+                    b"imgDim" => {
+                        for attr in ce.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"dimwidth" => img_dim.0 = parse_u32(&attr),
+                                b"dimheight" => img_dim.1 = parse_u32(&attr),
                                 _ => {}
                             }
                         }
@@ -2352,6 +2397,10 @@ fn parse_picture(
                                 }
                                 b"bright" => img_attr.brightness = parse_i8(&attr),
                                 b"contrast" => img_attr.contrast = parse_i8(&attr),
+                                b"alpha" => {
+                                    img_attr.transparency =
+                                        parse_picture_transparency_attr(&attr_str(&attr));
+                                }
                                 b"effect" => {
                                     img_attr.effect = match attr_str(&attr).as_str() {
                                         "REAL_PIC" => ImageEffect::RealPic,
@@ -2431,8 +2480,159 @@ fn parse_picture(
     pic.border_x = border_x;
     pic.border_y = border_y;
     pic.instance_id = picture_instance_id;
+    pic.effects = effects;
+    pic.caption = caption;
+    pic.img_dim = img_dim;
 
     Ok(Control::Picture(Box::new(pic)))
+}
+
+fn parse_picture_effects(reader: &mut Reader<&[u8]>) -> Result<PictureEffects, HwpxError> {
+    let mut effects = PictureEffects::default();
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"shadow" => {
+                effects.shadow = Some(parse_picture_shadow(e, reader)?);
+            }
+            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"shadow" => {
+                effects.shadow = Some(parse_picture_shadow_attrs(e));
+            }
+            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"effects" => break,
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(HwpxError::XmlError(format!("effects: {}", e))),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(effects)
+}
+
+fn parse_picture_shadow(
+    e: &quick_xml::events::BytesStart<'_>,
+    reader: &mut Reader<&[u8]>,
+) -> Result<PictureShadow, HwpxError> {
+    let mut shadow = parse_picture_shadow_attrs(e);
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref e)) => match local_name(e.name().as_ref()) {
+                b"skew" => shadow.skew = Some(parse_effect_point(e)),
+                b"scale" => shadow.scale = Some(parse_effect_point(e)),
+                b"effectsColor" => {
+                    shadow.color = Some(parse_effect_color_attrs(e));
+                }
+                _ => {}
+            },
+            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"effectsColor" => {
+                shadow.color = Some(parse_effect_color(e, reader)?);
+            }
+            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"shadow" => break,
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(HwpxError::XmlError(format!("shadow: {}", e))),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(shadow)
+}
+
+fn parse_picture_transparency_attr(raw: &str) -> u8 {
+    let Ok(value) = raw.trim().parse::<f64>() else {
+        return 0;
+    };
+    if !value.is_finite() {
+        return 0;
+    }
+    if value <= 1.0 {
+        (value * 100.0).round().clamp(0.0, 100.0) as u8
+    } else {
+        let alpha = value.clamp(0.0, 255.0).round() as u8;
+        crate::model::image::alpha_byte_to_transparency_percent(alpha)
+    }
+}
+
+fn parse_picture_shadow_attrs(e: &quick_xml::events::BytesStart<'_>) -> PictureShadow {
+    let mut shadow = PictureShadow::default();
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"style" => shadow.style = Some(attr_str(&attr)),
+            b"alpha" => shadow.alpha = Some(attr_str(&attr)),
+            b"radius" => shadow.radius = Some(attr_str(&attr)),
+            b"direction" => shadow.direction = Some(attr_str(&attr)),
+            b"distance" => shadow.distance = Some(attr_str(&attr)),
+            b"alignStyle" => shadow.align_style = Some(attr_str(&attr)),
+            b"rotationStyle" => shadow.rotation_style = Some(attr_str(&attr)),
+            _ => {}
+        }
+    }
+    shadow
+}
+
+fn parse_effect_point(e: &quick_xml::events::BytesStart<'_>) -> EffectPoint {
+    let mut point = EffectPoint::default();
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"x" => point.x = Some(attr_str(&attr)),
+            b"y" => point.y = Some(attr_str(&attr)),
+            _ => {}
+        }
+    }
+    point
+}
+
+fn parse_effect_color(
+    e: &quick_xml::events::BytesStart<'_>,
+    reader: &mut Reader<&[u8]>,
+) -> Result<EffectColor, HwpxError> {
+    let mut color = parse_effect_color_attrs(e);
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"rgb" => {
+                color.rgb = Some(parse_effect_rgb(e));
+            }
+            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"effectsColor" => break,
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(HwpxError::XmlError(format!("effectsColor: {}", e))),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(color)
+}
+
+fn parse_effect_color_attrs(e: &quick_xml::events::BytesStart<'_>) -> EffectColor {
+    let mut color = EffectColor::default();
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"type" => color.color_type = Some(attr_str(&attr)),
+            b"schemeIdx" => color.scheme_idx = Some(attr_str(&attr)),
+            b"systemIdx" => color.system_idx = Some(attr_str(&attr)),
+            b"presetIdx" => color.preset_idx = Some(attr_str(&attr)),
+            _ => {}
+        }
+    }
+    color
+}
+
+fn parse_effect_rgb(e: &quick_xml::events::BytesStart<'_>) -> EffectRgb {
+    let mut rgb = EffectRgb::default();
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"r" => rgb.r = Some(attr_str(&attr)),
+            b"g" => rgb.g = Some(attr_str(&attr)),
+            b"b" => rgb.b = Some(attr_str(&attr)),
+            _ => {}
+        }
+    }
+    rgb
 }
 
 // ─── 그리기 객체 공통 속성 파싱 ───
@@ -2552,6 +2752,15 @@ fn parse_object_element_attrs(
             b"instid" => ids.instid = parse_u32(&attr),
             b"groupLevel" => shape_attr.group_level = attr_str(&attr).parse().unwrap_or(0),
             b"ratio" => ids.round_rate = parse_u8(&attr).min(100),
+            // [Task #1379] numberingType (캡션 번호 범주) 보존 — exam_kor 등 광범위 사용.
+            b"numberingType" => {
+                common.numbering_type = match attr_str(&attr).to_ascii_uppercase().as_str() {
+                    "PICTURE" => crate::model::shape::ObjectNumberingType::Picture,
+                    "TABLE" => crate::model::shape::ObjectNumberingType::Table,
+                    "EQUATION" => crate::model::shape::ObjectNumberingType::Equation,
+                    _ => crate::model::shape::ObjectNumberingType::None,
+                };
+            }
             _ => {}
         }
     }
@@ -3232,12 +3441,16 @@ fn parse_draw_text(reader: &mut Reader<&[u8]>, text_box: &mut TextBox) -> Result
                                 // 가 세로쓰기 (`layout_vertical_textbox_text_with_paras`)
                                 // 활성화. "VERTICAL"/"VERTICALALL" 모두 code 1.
                                 b"textDirection" => {
-                                    let direction_code: u32 = match attr_str(&attr).as_str() {
+                                    let dir = attr_str(&attr);
+                                    let direction_code: u32 = match dir.as_str() {
                                         "VERTICAL" | "VERTICALALL" => 1,
                                         _ => 0,
                                     };
                                     text_box.list_attr =
                                         (text_box.list_attr & !0b111) | direction_code;
+                                    // [Task #1379] VERTICAL/VERTICALALL 구분 보존
+                                    // — serializer 역방출용 (list_attr 만으로는 구분 불가).
+                                    text_box.vertical_all = dir == "VERTICALALL";
                                 }
                                 _ => {}
                             }
@@ -3301,11 +3514,16 @@ fn parse_shape_object(
     let object_ids = parse_object_element_attrs(e, &mut common, &mut shape_attr);
 
     let tag_name = String::from_utf8_lossy(shape_type).to_string();
+    let mut caption: Option<crate::model::shape::Caption> = None;
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref ce)) if local_name(ce.name().as_ref()) == b"shapeComment" => {
                 common.description = read_dutmal_text(reader, b"shapeComment")?;
+            }
+            // 도형 캡션 (#1403) — 미적재 시 roundtrip 에서 캡션 subList 소실
+            Ok(Event::Start(ref ce)) if local_name(ce.name().as_ref()) == b"caption" => {
+                caption = Some(parse_table_caption(ce, reader)?);
             }
             Ok(Event::Start(ref ce)) | Ok(Event::Empty(ref ce)) => {
                 let cname = ce.name();
@@ -3467,7 +3685,7 @@ fn parse_shape_object(
         shadow_alpha,
         inst_id: object_ids.instid,
         text_box,
-        ..Default::default()
+        caption,
     };
 
     let shape = match shape_type {
@@ -3542,9 +3760,18 @@ fn parse_container(
 
     parse_object_element_attrs(e, &mut common, &mut shape_attr);
 
+    let mut caption: Option<crate::model::shape::Caption> = None;
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
+            // 묶음 개체 캡션 (#1403) — 미적재 시 roundtrip 에서 캡션 subList 소실
+            Ok(Event::Start(ref ce)) if local_name(ce.name().as_ref()) == b"caption" => {
+                caption = Some(parse_table_caption(ce, reader)?);
+            }
+            // 묶음 개체 설명 (#1392) — 미적재 시 roundtrip 에서 소실
+            Ok(Event::Start(ref ce)) if local_name(ce.name().as_ref()) == b"shapeComment" => {
+                common.description = read_dutmal_text(reader, b"shapeComment")?;
+            }
             Ok(Event::Start(ref ce)) | Ok(Event::Empty(ref ce)) => {
                 let cname = ce.name();
                 let local = local_name(cname.as_ref());
@@ -3605,7 +3832,7 @@ fn parse_container(
         common,
         shape_attr,
         children,
-        caption: None,
+        caption,
     };
 
     Ok(Control::Shape(Box::new(ShapeObject::Group(group))))
@@ -4162,7 +4389,22 @@ fn parse_ctrl_autonum(
                 if local == b"autoNumFormat" {
                     for attr in ce.attributes().flatten() {
                         match attr.key.as_ref() {
-                            b"type" => an.format = parse_u8(&attr),
+                            // autoNumFormat type 은 문자열 enum (DIGIT/CIRCLE_DIGIT/…).
+                            // 과거 parse_u8 은 문자열을 0으로만 떨궈 DIGIT 외 형식을 잃었다.
+                            // pageNum formatType 과 동일한 문자열→코드 매핑을 사용한다.
+                            b"type" => {
+                                an.format = match attr_str(&attr).as_str() {
+                                    "DIGIT" => 0,
+                                    "CIRCLE_DIGIT" => 1,
+                                    "ROMAN_CAPITAL" => 2,
+                                    "ROMAN_SMALL" => 3,
+                                    "LATIN_CAPITAL" => 4,
+                                    "LATIN_SMALL" => 5,
+                                    "HANGUL" => 6,
+                                    "HANJA" => 7,
+                                    _ => 0,
+                                };
+                            }
                             b"userChar" => {
                                 let s = attr_str(&attr);
                                 an.user_symbol = s.chars().next().unwrap_or('\0');
@@ -4217,7 +4459,7 @@ fn parse_ctrl_field_begin(
                 let cname = ce.name();
                 let local = local_name(cname.as_ref());
                 if local == b"parameters" {
-                    parse_field_parameters(reader, &mut f)?;
+                    parse_field_parameters(ce, reader, &mut f)?;
                 } else if local == b"subList" && f.field_type == FieldType::Memo {
                     f.memo_paragraphs = parse_sublist_paragraphs(reader, b"subList")?;
                 } else {
@@ -4241,15 +4483,63 @@ fn parse_ctrl_field_begin(
 }
 
 /// `<parameters>` 내부에서 Command 문자열 파라미터를 추출한다.
-fn parse_field_parameters(reader: &mut Reader<&[u8]>, field: &mut Field) -> Result<(), HwpxError> {
+/// XML 텍스트/속성값 이스케이프 (#1391 parameters verbatim 재조립용).
+fn escape_xml_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn parse_field_parameters(
+    start: &quick_xml::events::BytesStart,
+    reader: &mut Reader<&[u8]>,
+    field: &mut Field,
+) -> Result<(), HwpxError> {
     let mut buf = Vec::new();
     let mut in_command = false;
     let mut in_memo_number = false;
+
+    // [#1391] parameters 요소 원문 verbatim 재조립 — IR 이 Command/Number 만
+    // 추출하므로 무손실 roundtrip 을 위해 자식 시퀀스를 그대로 보존한다.
+    // parameters 자식은 stringParam/integerParam(name 속성 + 텍스트)만으로
+    // 단순하므로 이벤트 재방출이 안전하다.
+    let mut raw = String::from("<hp:parameters");
+    for attr in start.attributes().flatten() {
+        raw.push(' ');
+        raw.push_str(&String::from_utf8_lossy(attr.key.as_ref()));
+        raw.push_str("=\"");
+        raw.push_str(&escape_xml_text(&attr_str(&attr)));
+        raw.push('"');
+    }
+    raw.push('>');
+
+    // 현재 열린 파라미터 요소 태그(닫을 때 사용).
+    let mut open_param: Option<String> = None;
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref ce)) => {
                 let cname = ce.name();
                 let local = local_name(cname.as_ref());
+                let tag = String::from_utf8_lossy(cname.as_ref()).to_string();
+                raw.push('<');
+                raw.push_str(&tag);
+                for attr in ce.attributes().flatten() {
+                    raw.push(' ');
+                    raw.push_str(&String::from_utf8_lossy(attr.key.as_ref()));
+                    raw.push_str("=\"");
+                    raw.push_str(&escape_xml_text(&attr_str(&attr)));
+                    raw.push('"');
+                }
+                raw.push('>');
+                open_param = Some(tag);
                 if local == b"stringParam" {
                     for attr in ce.attributes().flatten() {
                         if attr.key.as_ref() == b"name" && attr_str(&attr) == "Command" {
@@ -4268,6 +4558,16 @@ fn parse_field_parameters(reader: &mut Reader<&[u8]>, field: &mut Field) -> Resu
             Ok(Event::Empty(ref ce)) => {
                 let cname = ce.name();
                 let local = local_name(cname.as_ref());
+                raw.push('<');
+                raw.push_str(&String::from_utf8_lossy(cname.as_ref()));
+                for attr in ce.attributes().flatten() {
+                    raw.push(' ');
+                    raw.push_str(&String::from_utf8_lossy(attr.key.as_ref()));
+                    raw.push_str("=\"");
+                    raw.push_str(&escape_xml_text(&attr_str(&attr)));
+                    raw.push('"');
+                }
+                raw.push_str("/>");
                 if local == b"stringParam" {
                     for attr in ce.attributes().flatten() {
                         if attr.key.as_ref() == b"name" && attr_str(&attr) == "Command" {
@@ -4277,28 +4577,39 @@ fn parse_field_parameters(reader: &mut Reader<&[u8]>, field: &mut Field) -> Resu
                 }
             }
             Ok(Event::Text(ref t)) => {
+                let decoded = t.decode().unwrap_or_default();
+                raw.push_str(&escape_xml_text(&decoded));
                 if in_command {
-                    field.command.push_str(&t.decode().unwrap_or_default());
+                    field.command.push_str(&decoded);
                 } else if in_memo_number {
-                    if let Ok(value) = t.decode().unwrap_or_default().trim().parse::<u32>() {
+                    if let Ok(value) = decoded.trim().parse::<u32>() {
                         field.memo_index = value;
                     }
                 }
             }
             Ok(Event::GeneralRef(ref r)) => {
+                let decoded = decode_xml_general_ref(r);
+                raw.push_str(&escape_xml_text(&decoded));
                 if in_command {
-                    field.command.push_str(&decode_xml_general_ref(r));
+                    field.command.push_str(&decoded);
                 }
             }
             Ok(Event::End(ref ee)) => {
                 let eename = ee.name();
                 let local = local_name(eename.as_ref());
+                if local == b"parameters" {
+                    raw.push_str("</hp:parameters>");
+                    break;
+                }
+                if let Some(tag) = open_param.take() {
+                    raw.push_str("</");
+                    raw.push_str(&tag);
+                    raw.push('>');
+                }
                 if local == b"stringParam" {
                     in_command = false;
                 } else if local == b"integerParam" {
                     in_memo_number = false;
-                } else if local == b"parameters" {
-                    break;
                 }
             }
             Ok(Event::Eof) => break,
@@ -4307,6 +4618,7 @@ fn parse_field_parameters(reader: &mut Reader<&[u8]>, field: &mut Field) -> Resu
         }
         buf.clear();
     }
+    field.raw_parameters_xml = Some(raw);
     Ok(())
 }
 
@@ -4686,6 +4998,10 @@ fn parse_equation(
                     b"script" => {
                         in_script = true;
                     }
+                    // 수식 설명 (#1392) — 미적재 시 roundtrip 에서 소실
+                    b"shapeComment" => {
+                        common.description = read_dutmal_text(reader, b"shapeComment")?;
+                    }
                     _ => {}
                 }
             }
@@ -4754,7 +5070,10 @@ fn calc_utf16_len_from_parts(parts: &[String]) -> u32 {
     parts
         .iter()
         .map(|s| match s.as_str() {
-            "\u{0002}" | "\u{0003}" | "\u{0004}" => 8,
+            // [#1382] \u{0012}(AUTO_NUMBER) 포함 — placeholder 공백을 포함해 8유닛
+            // (offsets 조립 루프와 동일 축). 종전 `_` 분기(1유닛)로 빠져 char_shapes
+            // 경계가 offsets 축과 어긋났다 (143E 각주 run 경계 2 → 정답 9).
+            "\u{0002}" | "\u{0003}" | "\u{0004}" | "\u{0012}" => 8,
             _ => s
                 .chars()
                 .map(|c| {
@@ -4846,6 +5165,52 @@ fn parse_form_object(
                 form.properties
                     .insert("Command".to_string(), attr_str(&attr));
             }
+            // 버튼류 전용 속성 (라운드트립 보존; writer 가 동일 키로 읽음)
+            b"radioGroupName" => {
+                form.properties
+                    .insert("RadioGroupName".to_string(), attr_str(&attr));
+            }
+            b"triState" => {
+                form.properties
+                    .insert("TriState".to_string(), attr_str(&attr));
+            }
+            b"backStyle" => {
+                form.properties
+                    .insert("BackStyle".to_string(), attr_str(&attr));
+            }
+            // Edit 전용 속성 (라운드트립 보존)
+            b"multiLine" => {
+                form.properties
+                    .insert("MultiLine".to_string(), attr_str(&attr));
+            }
+            b"passwordChar" => {
+                form.properties
+                    .insert("PasswordChar".to_string(), attr_str(&attr));
+            }
+            b"maxLength" => {
+                form.properties
+                    .insert("MaxLength".to_string(), attr_str(&attr));
+            }
+            b"scrollBars" => {
+                form.properties
+                    .insert("ScrollBars".to_string(), attr_str(&attr));
+            }
+            b"tabKeyBehavior" => {
+                form.properties
+                    .insert("TabKeyBehavior".to_string(), attr_str(&attr));
+            }
+            b"numOnly" => {
+                form.properties
+                    .insert("Number".to_string(), attr_str(&attr));
+            }
+            b"readOnly" => {
+                form.properties
+                    .insert("ReadOnly".to_string(), attr_str(&attr));
+            }
+            b"alignText" => {
+                form.properties
+                    .insert("AlignText".to_string(), attr_str(&attr));
+            }
             _ => {}
         }
     }
@@ -4853,7 +5218,8 @@ fn parse_form_object(
     // 자식 요소 순회
     let end_tag = local_name(e.name().as_ref()).to_vec();
     let mut buf = Vec::new();
-    let mut list_items: Vec<String> = Vec::new();
+    // (value, displayText) 쌍으로 보존 — comboBox 항목
+    let mut list_items: Vec<(String, String)> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -4891,22 +5257,72 @@ fn parse_form_object(
                 let local = local_name(cname.as_ref());
                 match local {
                     b"sz" => {
-                        // <hp:sz width="..." height="..."/>
+                        // <hp:sz width="..." widthRelTo="..." height="..." heightRelTo="..." protect="..."/>
                         for attr in ce.attributes().flatten() {
                             match attr.key.as_ref() {
                                 b"width" => form.width = parse_u32(&attr),
                                 b"height" => form.height = parse_u32(&attr),
+                                b"widthRelTo" => {
+                                    form.properties
+                                        .insert("SzWidthRelTo".to_string(), attr_str(&attr));
+                                }
+                                b"heightRelTo" => {
+                                    form.properties
+                                        .insert("SzHeightRelTo".to_string(), attr_str(&attr));
+                                }
+                                b"protect" => {
+                                    form.properties
+                                        .insert("SzProtect".to_string(), attr_str(&attr));
+                                }
                                 _ => {}
                             }
                         }
                     }
-                    b"listItem" => {
-                        // <hp:listItem value="..."/> (comboBox 항목)
+                    b"pos" => {
+                        // <hp:pos .../> 앵커링 (표준 ShapePositionType 11속성) — 라운드트립 보존
                         for attr in ce.attributes().flatten() {
-                            if attr.key.as_ref() == b"value" {
-                                list_items.push(attr_str(&attr));
+                            let key = match attr.key.as_ref() {
+                                b"treatAsChar" => "PosTreatAsChar",
+                                b"affectLSpacing" => "PosAffectLSpacing",
+                                b"flowWithText" => "PosFlowWithText",
+                                b"allowOverlap" => "PosAllowOverlap",
+                                b"holdAnchorAndSO" => "PosHoldAnchorAndSO",
+                                b"vertRelTo" => "PosVertRelTo",
+                                b"horzRelTo" => "PosHorzRelTo",
+                                b"vertAlign" => "PosVertAlign",
+                                b"horzAlign" => "PosHorzAlign",
+                                b"vertOffset" => "PosVertOffset",
+                                b"horzOffset" => "PosHorzOffset",
+                                _ => continue,
+                            };
+                            form.properties.insert(key.to_string(), attr_str(&attr));
+                        }
+                    }
+                    b"outMargin" => {
+                        // <hp:outMargin left=".." right=".." top=".." bottom=".."/> — 라운드트립 보존
+                        for attr in ce.attributes().flatten() {
+                            let key = match attr.key.as_ref() {
+                                b"left" => "OutMarginLeft",
+                                b"right" => "OutMarginRight",
+                                b"top" => "OutMarginTop",
+                                b"bottom" => "OutMarginBottom",
+                                _ => continue,
+                            };
+                            form.properties.insert(key.to_string(), attr_str(&attr));
+                        }
+                    }
+                    b"listItem" => {
+                        // <hp:listItem displayText="..." value="..."/> (comboBox 항목)
+                        let mut value = String::new();
+                        let mut display = String::new();
+                        for attr in ce.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"value" => value = attr_str(&attr),
+                                b"displayText" => display = attr_str(&attr),
+                                _ => {}
                             }
                         }
+                        list_items.push((value, display));
                     }
                     b"formCharPr" => {
                         // <hp:formCharPr charPrIDRef="0" followContext="0" autoSz="1" wordWrap="0"/>
@@ -4948,11 +5364,13 @@ fn parse_form_object(
         buf.clear();
     }
 
-    // comboBox 항목 목록을 properties에 저장
+    // comboBox 항목 목록(값 + 표시 텍스트)을 properties에 저장
     if !list_items.is_empty() {
-        for (i, item) in list_items.iter().enumerate() {
+        for (i, (value, display)) in list_items.iter().enumerate() {
             form.properties
-                .insert(format!("listItem{}", i), item.clone());
+                .insert(format!("listItem{}", i), value.clone());
+            form.properties
+                .insert(format!("listItemDisplay{}", i), display.clone());
         }
     }
 
@@ -5294,6 +5712,87 @@ mod tests {
         assert_eq!(section.paragraphs[0].para_shape_id, 0);
     }
 
+    // ---------- #1382: autoNum 폭 축 일관화 ----------
+
+    #[test]
+    fn task1382_calc_counts_autonum_as_8_units() {
+        // \u{0012}(AUTO_NUMBER) 는 placeholder 포함 8유닛 — offsets 축과 동일.
+        let parts = vec!["\u{0012}".to_string(), " ".to_string()];
+        assert_eq!(calc_utf16_len_from_parts(&parts), 9);
+    }
+
+    #[test]
+    fn task1382_autonum_run_boundary_on_offsets_axis() {
+        // 143E 각주 패턴: run1(ctrl autoNum + 공백) + run2(텍스트) →
+        // run2 경계는 offsets 축 9 (autoNum 8 + 공백 1). 종전 1유닛 축에서는 2.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="10"><hp:ctrl><hp:autoNum num="1" numType="FOOTNOTE"/></hp:ctrl><hp:t> </hp:t></hp:run>
+    <hp:run charPrIDRef="11"><hp:t>본문</hp:t></hp:run>
+  </hp:p>
+</hs:sec>"#;
+        let section = parse_hwpx_section(xml).unwrap();
+        let p = &section.paragraphs[0];
+        assert_eq!(p.text, "  본문", "placeholder 공백 + 실제 공백 + 텍스트");
+        assert_eq!(p.char_offsets, vec![0, 8, 9, 10]);
+        assert_eq!(
+            p.char_shapes
+                .iter()
+                .map(|c| (c.start_pos, c.char_shape_id))
+                .collect::<Vec<_>>(),
+            vec![(0, 10), (9, 11)],
+            "run2 경계는 offsets 축 9"
+        );
+    }
+
+    #[test]
+    fn task1380_no_linesegarray_keeps_line_segs_empty() {
+        // 원본에 <hp:linesegarray> 가 없는 문단은 zero-default 를 주입하지 않고
+        // line_segs 를 빈 채 유지한다 (#1380 — 원본 무 → RT 무 대칭의 전제).
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:t>텍스트 있음</hp:t>
+    </hp:run>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        assert!(
+            section.paragraphs[0].line_segs.is_empty(),
+            "linesegarray 부재 문단에 zero-default 가 주입되면 안 됨: {:?}",
+            section.paragraphs[0].line_segs
+        );
+    }
+
+    #[test]
+    fn task1380_linesegarray_values_loaded_as_is() {
+        // <hp:linesegarray> 가 있으면 9개 필드를 그대로 적재한다.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:t>한 줄</hp:t>
+    </hp:run>
+    <hp:linesegarray>
+      <hp:lineseg textpos="0" vertpos="15360" vertsize="2197" textheight="2197" baseline="1867" spacing="1098" horzpos="0" horzsize="42520" flags="393216"/>
+    </hp:linesegarray>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let segs = &section.paragraphs[0].line_segs;
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].vertical_pos, 15360);
+        assert_eq!(segs[0].line_height, 2197);
+        assert_eq!(segs[0].tag, 393216);
+    }
+
     #[test]
     fn test_parse_text_preserves_xml_general_refs() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -5337,12 +5836,22 @@ mod tests {
         let section = parse_hwpx_section(xml).unwrap();
 
         assert_eq!(section.section_def.endnote_shape.separator_length, 0x2ff8);
-        assert_eq!(section.section_def.endnote_shape.separator_margin_top, 224);
         assert_eq!(
-            section.section_def.endnote_shape.separator_margin_bottom,
-            850
+            section
+                .section_def
+                .endnote_shape
+                .separator_above_margin_hu(),
+            850,
+            "aboveLine은 공식 '구분선 위' 값"
         );
-        assert_eq!(section.section_def.endnote_shape.note_spacing, 567);
+        assert_eq!(
+            section
+                .section_def
+                .endnote_shape
+                .separator_below_margin_hu(),
+            567,
+            "belowLine은 공식 '구분선 아래' 값"
+        );
         assert_eq!(
             section.section_def.endnote_shape.separator_line_width, 1,
             "HWPX noteLine width도 공통 선 굵기 코드표를 사용해야 함"
@@ -5380,6 +5889,7 @@ mod tests {
             crate::model::footnote::FootnotePlacement::BelowText
         );
         assert_eq!((section.section_def.endnote_shape.attr >> 8) & 0x03, 1);
+        assert_eq!((section.section_def.endnote_shape.attr >> 10) & 0x03, 0);
     }
 
     #[test]
@@ -5408,7 +5918,45 @@ mod tests {
             crate::model::footnote::FootnoteNumbering::RestartSection
         );
         assert_eq!(section.section_def.endnote_shape.start_number, 5);
-        assert_eq!((section.section_def.endnote_shape.attr >> 8) & 0x03, 1);
+        assert_eq!((section.section_def.endnote_shape.attr >> 8) & 0x03, 0);
+        assert_eq!((section.section_def.endnote_shape.attr >> 10) & 0x03, 1);
+    }
+
+    #[test]
+    fn test_parse_endnote_shape_attr_table134_flags() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr textDirection="HORIZONTAL" spaceColumns="1134" tabStop="8000" outlineShapeIDRef="1" masterPageCnt="0">
+        <hp:endNotePr>
+          <hp:autoNumFormat type="USER_CHAR" userChar="*" prefixChar="[" suffixChar="]" supscript="1"/>
+          <hp:noteLine length="0" type="NONE" width="0.12 mm" color="#000000"/>
+          <hp:noteSpacing betweenNotes="0" belowLine="567" aboveLine="850"/>
+          <hp:numbering type="ON_PAGE" newNum="1"/>
+          <hp:placement place="END_OF_SECTION" beneathText="1"/>
+        </hp:endNotePr>
+      </hp:secPr>
+    </hp:run>
+  </hp:p>
+</hs:sec>"##;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let shape = &section.section_def.endnote_shape;
+
+        assert_eq!(
+            shape.number_format,
+            crate::model::footnote::NumberFormat::UserChar
+        );
+        assert_eq!(shape.user_char, '*');
+        assert!(shape.number_code_superscript);
+        assert!(shape.print_inline_after_text);
+        assert_eq!((shape.attr & 0xff), 0x81);
+        assert_eq!((shape.attr >> 8) & 0x03, 1);
+        assert_eq!((shape.attr >> 10) & 0x03, 2);
+        assert_ne!(shape.attr & (1 << 12), 0);
+        assert_ne!(shape.attr & (1 << 13), 0);
     }
 
     /// [#1199] HWPX 미주/각주 ctrl 의 prefixChar(코드포인트 숫자) 가
@@ -6037,7 +6585,8 @@ mod tests {
         loop {
             match reader.read_event_into(&mut buf).unwrap() {
                 Event::Start(ref e) if local_name(e.name().as_ref()) == b"parameters" => {
-                    parse_field_parameters(&mut reader, &mut field).unwrap();
+                    let start = e.to_owned();
+                    parse_field_parameters(&start, &mut reader, &mut field).unwrap();
                     break;
                 }
                 Event::Eof => panic!("parameters not found"),

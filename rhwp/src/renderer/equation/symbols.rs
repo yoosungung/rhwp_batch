@@ -168,6 +168,13 @@ static OPERATORS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(
         ("DOTEQ", "≐"),
         ("PROPTO", "∝"),
         // 집합/논리
+        // 소형 이항 집합연산자 — 본문 크기로 렌더(#1342, BIG_OPERATORS 오분류 → 1.5배 확대 버그 수정)
+        ("UNION", "∪"),
+        ("SMALLUNION", "∪"),
+        ("CUP", "∪"),
+        ("INTER", "∩"),
+        ("SMALLINTER", "∩"),
+        ("CAP", "∩"),
         ("SUBSET", "⊂"),
         ("SUPERSET", "⊃"),
         ("SUBSETEQ", "⊆"),
@@ -282,15 +289,10 @@ static BIG_OPERATORS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::
         ("COPROD", "∐"),
         ("SMCOPROD", "∐"),
         ("AMALG", "∐"),
-        // 집합
-        ("UNION", "∪"),
+        // 집합 — 소형 이항 연산자(UNION/CUP/INTER/CAP 등)는 본문 크기 OPERATORS 로 분리(#1342).
+        //         여기에는 위/아래 첨자를 받아 1.5배 확대되는 진짜 큰 형태(BIG*)만 남긴다.
         ("BIGCUP", "∪"),
-        ("SMALLUNION", "∪"),
-        ("CUP", "∪"),
-        ("INTER", "∩"),
         ("BIGCAP", "∩"),
-        ("SMALLINTER", "∩"),
-        ("CAP", "∩"),
         ("SQCUP", "⊔"),
         ("BIGSQCUP", "⊔"),
         ("SQCAP", "⊓"),
@@ -611,6 +613,19 @@ pub fn lookup_function(cmd: &str) -> Option<&'static str> {
     FUNCTIONS.get(cmd).copied()
 }
 
+/// HWP 수식 스크립트 PUA(사용자 정의 영역) 특수기호 → 표준 기호 매핑
+///
+/// 한컴 수식 편집기는 일부 기호를 PUA(U+E000~F8FF)로 저장한다. 매핑이 없으면
+/// 글리프 미존재로 두부(▦)가 렌더된다.
+/// - `U+E04D`: 조건부 확률 막대 `|` (예: `P(A|B)`) — #1343
+static EQUATION_PUA: LazyLock<HashMap<char, &'static str>> =
+    LazyLock::new(|| HashMap::from([('\u{E04D}', "|")]));
+
+/// PUA 영역 수식 기호 조회 (#1343)
+pub fn lookup_equation_pua(ch: char) -> Option<&'static str> {
+    EQUATION_PUA.get(&ch).copied()
+}
+
 /// 글자 장식 종류
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum DecoKind {
@@ -689,6 +704,29 @@ mod tests {
         assert!(is_big_operator("SUM"));
         assert!(is_big_operator("PROD"));
         assert!(!is_big_operator("alpha"));
+    }
+
+    /// #1342: 소형 집합연산자(∩/∪)는 큰 연산자가 아니어야 한다(1.5배 확대 방지).
+    /// 큰 형태(BIG*)만 big operator 로 유지.
+    #[test]
+    fn test_set_operators_not_big() {
+        // 소형 — 본문 크기로 렌더되어야 하므로 big 이 아님
+        assert!(!is_big_operator("CAP"));
+        assert!(!is_big_operator("CUP"));
+        assert!(!is_big_operator("UNION"));
+        assert!(!is_big_operator("INTER"));
+        assert!(!is_big_operator("SMALLINTER"));
+        assert!(!is_big_operator("SMALLUNION"));
+        // 큰 형태는 유지
+        assert!(is_big_operator("BIGCUP"));
+        assert!(is_big_operator("BIGCAP"));
+        // 제거 후에도 기호 매핑은 정상(OPERATORS 로 이동)
+        assert_eq!(lookup_symbol("CAP"), Some("∩"));
+        assert_eq!(lookup_symbol("CUP"), Some("∪"));
+        assert_eq!(lookup_symbol("SMALLINTER"), Some("∩"));
+        assert_eq!(lookup_symbol("SMALLUNION"), Some("∪"));
+        assert_eq!(lookup_symbol("cap"), Some("∩"));
+        assert_eq!(lookup_symbol("cup"), Some("∪"));
     }
 
     #[test]

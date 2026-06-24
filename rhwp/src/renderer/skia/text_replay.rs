@@ -709,7 +709,7 @@ impl SkiaTextReplay<'_> {
             let font = make_mark_font(font_size * 0.5);
             let mut mark_paint = Paint::default();
             mark_paint.set_anti_alias(true);
-            mark_paint.set_color(Color::from_argb(255, 74, 144, 217));
+            mark_paint.set_color(Color::from_argb(255, 0, 102, 255));
             let y = if baseline > 0.0 {
                 bbox.y + baseline
             } else {

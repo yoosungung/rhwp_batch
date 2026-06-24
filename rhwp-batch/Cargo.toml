@@ -1,6 +1,6 @@
 [package]
 name = "rhwp-batch"
-version = "0.7.15"
+version = "0.7.17"
 edition = "2021"
 description = "CLI batch tool for HWP/HWPX conversion and template filling"
 license = "MIT"

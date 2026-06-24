@@ -144,13 +144,13 @@ impl HtmlRenderer {
                                 };
                                 let mid_x = (cx + next_x) / 2.0 - mark_font_size * 0.25;
                                 self.output.push_str(&format!(
-                                    "<span class=\"para-mark\" style=\"position:absolute;left:{}px;top:{}px;font-size:{}px;color:#4A90D9;\">\u{2228}</span>\n",
+                                    "<span class=\"para-mark\" style=\"position:absolute;left:{}px;top:{}px;font-size:{}px;color:#0066FF;\">\u{2228}</span>\n",
                                     mid_x, node.bbox.y, mark_font_size,
                                 ));
                             } else if c == '\t' {
                                 let cx = node.bbox.x + char_positions[i];
                                 self.output.push_str(&format!(
-                                    "<span class=\"para-mark\" style=\"position:absolute;left:{}px;top:{}px;font-size:{}px;color:#4A90D9;\">\u{2192}</span>\n",
+                                    "<span class=\"para-mark\" style=\"position:absolute;left:{}px;top:{}px;font-size:{}px;color:#0066FF;\">\u{2192}</span>\n",
                                     cx, node.bbox.y, mark_font_size,
                                 ));
                             }
@@ -169,7 +169,7 @@ impl HtmlRenderer {
                             "\u{21B5}"
                         };
                         self.output.push_str(&format!(
-                            "<span class=\"para-mark\" style=\"position:absolute;left:{}px;top:{}px;font-size:{}px;color:#4A90D9;\">{}</span>\n",
+                            "<span class=\"para-mark\" style=\"position:absolute;left:{}px;top:{}px;font-size:{}px;color:#0066FF;\">{}</span>\n",
                             mark_x, node.bbox.y, font_size, mark,
                         ));
                     }

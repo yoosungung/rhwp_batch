@@ -64,6 +64,39 @@ fn test_build_empty_page() {
 }
 
 #[test]
+fn compact_endnote_tail_log_tolerance_allows_line_box_bleed_only() {
+    let col_bottom = 1092.3;
+
+    assert!(is_tolerated_endnote_column_bottom_bleed(
+        true,
+        col_bottom + 43.3,
+        col_bottom
+    ));
+    assert!(!is_tolerated_endnote_column_bottom_bleed(
+        true,
+        col_bottom + 49.0,
+        col_bottom
+    ));
+    assert!(is_tolerated_endnote_column_bottom_bleed_with_limit(
+        true,
+        col_bottom + 64.0,
+        col_bottom,
+        ENDNOTE_EQUATION_TAIL_LINE_BOX_OVERFLOW_LOG_TOLERANCE_PX,
+    ));
+    assert!(!is_tolerated_endnote_column_bottom_bleed_with_limit(
+        true,
+        col_bottom + 69.0,
+        col_bottom,
+        ENDNOTE_EQUATION_TAIL_LINE_BOX_OVERFLOW_LOG_TOLERANCE_PX,
+    ));
+    assert!(!is_tolerated_endnote_column_bottom_bleed(
+        false,
+        col_bottom + 1.0,
+        col_bottom
+    ));
+}
+
+#[test]
 fn test_build_page_with_paragraph() {
     let engine = LayoutEngine::with_default_dpi();
     let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
@@ -968,6 +1001,7 @@ fn test_expand_numbering_format_digit() {
         ],
         start_number: 0,
         level_start_numbers: [1, 1, 1, 1, 1, 1, 1],
+        raw_para_heads: None,
     };
     let counters = [3, 2, 1, 0, 0, 0, 0];
     let result =
@@ -1005,6 +1039,7 @@ fn test_expand_numbering_format_hangul() {
         ],
         start_number: 0,
         level_start_numbers: [1, 1, 1, 1, 1, 1, 1],
+        raw_para_heads: None,
     };
     let counters = [1, 3, 0, 0, 0, 0, 0];
     let result =

@@ -481,3 +481,27 @@ fn test_roundtrip_group_picture_child() {
         panic!("Expected Shape control");
     }
 }
+
+#[test]
+fn issue1452_picture_transparency_updates_hwp_extra_byte() {
+    let mut pic = Picture::default();
+    pic.crop.right = 1000;
+    pic.crop.bottom = 500;
+    pic.image_attr.transparency = 50;
+
+    let bytes = serialize_picture_data(&pic);
+    assert_eq!(
+        bytes.last().copied(),
+        Some(127),
+        "HWP 그림 추가 속성의 마지막 alpha byte는 50% 투명도에서 127이어야 한다"
+    );
+
+    pic.raw_picture_extra = vec![0; 18];
+    pic.image_attr.transparency = 100;
+    let bytes = serialize_picture_data(&pic);
+    assert_eq!(
+        bytes.last().copied(),
+        Some(255),
+        "원본 raw_picture_extra가 있어도 마지막 alpha byte는 현재 투명도와 동기화되어야 한다"
+    );
+}

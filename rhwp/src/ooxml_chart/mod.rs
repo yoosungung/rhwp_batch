@@ -8,11 +8,13 @@
 //! - `c:barChart` (세로/가로 막대)
 //! - `c:lineChart` (꺾은선)
 //! - `c:pieChart` (원형)
+//! - `c:bar3DChart`·`c:pie3DChart`·`c:ofPieChart` — **2D 근사 라우팅** (C1a #1453):
+//!   3D막대→평면 막대, 3D원형/ofPie→단일 원형. 입체감·보조플롯은 미표현(후속 C2).
 //! - **콤보 차트** (barChart + lineChart 혼합) — 시리즈별 타입 보존
 //! - **이중 Y축** (primary + secondary) — 시리즈별 축 그룹 매핑
 //!
 //! ## 범위 외
-//! - 3D 차트, 영역/산점도, 추세선, 애니메이션, 세밀 스타일
+//! - 3D 입체감·ofPie 보조플롯, 영역/산점도, stock(HLC), 추세선, 애니메이션, 세밀 스타일
 
 pub mod parser;
 pub mod renderer;
@@ -27,6 +29,21 @@ pub struct OoxmlChart {
     pub categories: Vec<String>,
     /// 시리즈 중 하나라도 보조축을 쓰면 true
     pub has_secondary_axis: bool,
+    /// 막대(bar/bar3D) plot의 `c:grouping` (clustered/stacked/percentStacked).
+    /// 막대 렌더러만 사용. line/pie 무관. (C1a #1453 막대 누적 보정)
+    pub grouping: BarGrouping,
+}
+
+/// 막대 차트 그룹화 방식 (`c:grouping`). line 누적은 미지원(C1d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BarGrouping {
+    /// 묶은(side-by-side). `clustered`/`standard` 흡수.
+    #[default]
+    Clustered,
+    /// 누적 (시리즈를 카테고리별로 쌓음).
+    Stacked,
+    /// 백분율 누적 (카테고리 합을 100%로 정규화).
+    PercentStacked,
 }
 
 /// 차트 종류

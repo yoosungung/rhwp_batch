@@ -3,11 +3,1239 @@ use crate::model::document::{Document, Section};
 use crate::model::paragraph::{LineSeg, Paragraph};
 use crate::paint::LAYER_TREE_SCHEMA;
 use crate::parser::control::parse_common_obj_attr;
+use serde_json::Value;
 
 #[test]
 fn test_create_empty_document() {
     let doc = HwpDocument::create_empty();
     assert_eq!(doc.page_count(), 1);
+}
+
+/// [#1386] createEmpty는 구역 1개 + 빈 문단 1개를 포함해 생성 직후
+/// 편집/조회/내보내기가 가능해야 한다 (구역 0개 → 모든 API 실패 회귀 방지).
+#[test]
+fn test_create_empty_document_is_editable() {
+    let mut doc = HwpDocument::create_empty();
+    assert_eq!(doc.get_section_count(), 1, "기본 구역 1개");
+
+    // 편집: 구역 0 / 문단 0에 텍스트 삽입이 성공해야 한다
+    doc.insert_text_native(0, 0, 0, "새 문서 첫 문단")
+        .expect("createEmpty 문서에 insertText가 동작해야 한다 (#1386)");
+
+    // 조회: 삽입한 텍스트가 읽혀야 한다
+    let text = doc
+        .get_text_range_native(0, 0, 0, 8)
+        .expect("getTextRange가 동작해야 한다");
+    assert!(
+        text.contains("새 문서"),
+        "삽입 텍스트가 조회되어야 한다: {text}"
+    );
+
+    // 내보내기: HWP/HWPX 직렬화가 모두 성공해야 한다
+    let hwp = doc
+        .export_hwp_with_adapter()
+        .expect("createEmpty 문서 exportHwp");
+    assert!(!hwp.is_empty());
+    let hwpx = doc
+        .export_hwpx_native()
+        .expect("createEmpty 문서 exportHwpx");
+    assert!(!hwpx.is_empty());
+
+    // 재파싱: 내보낸 HWP가 다시 열리고 텍스트가 보존되어야 한다
+    let reparsed =
+        crate::document_core::DocumentCore::from_bytes(&hwp).expect("exportHwp 결과 재파싱");
+    assert!(
+        reparsed.document().sections[0]
+            .paragraphs
+            .iter()
+            .any(|p| p.text.contains("새 문서")),
+        "재파싱 문서에 삽입 텍스트가 보존되어야 한다"
+    );
+}
+
+fn issue_1481_json_usize(json: &str, key: &str) -> usize {
+    let parsed: Value = serde_json::from_str(json).expect("JSON 파싱");
+    parsed[key].as_u64().expect("usize 값") as usize
+}
+
+fn issue_1481_table<'a>(doc: &'a HwpDocument, para_idx: usize) -> &'a crate::model::table::Table {
+    use crate::model::control::Control;
+
+    doc.document.sections[0].paragraphs[para_idx]
+        .controls
+        .iter()
+        .find_map(|control| match control {
+            Control::Table(table) => Some(table.as_ref()),
+            _ => None,
+        })
+        .expect("표 컨트롤")
+}
+
+fn issue_1481_first_page_render_tree(
+    doc: &HwpDocument,
+) -> crate::renderer::render_tree::PageRenderTree {
+    let dpi = 96.0;
+    let styles = crate::renderer::style_resolver::resolve_styles(&doc.document.doc_info, dpi);
+    let engine = crate::renderer::layout::LayoutEngine::new(dpi);
+    let section = &doc.document.sections[0];
+    let composed: Vec<_> = section
+        .paragraphs
+        .iter()
+        .map(crate::renderer::composer::compose_paragraph)
+        .collect();
+    let sec_mt = doc
+        .measured_tables
+        .first()
+        .map(|tables| tables.as_slice())
+        .unwrap_or(&[]);
+    let page = &doc.pagination[0].pages[0];
+
+    engine.build_render_tree(
+        page,
+        &section.paragraphs,
+        &section.paragraphs,
+        &section.paragraphs,
+        &composed,
+        &styles,
+        &section.section_def.footnote_shape,
+        &doc.document.bin_data_content,
+        None,
+        sec_mt,
+        Some(&section.section_def.page_border_fill),
+        section.section_def.outline_numbering_id,
+        &[],
+    )
+}
+
+fn issue_1481_find_table_and_host_mark_y(
+    node: &crate::renderer::render_tree::RenderNode,
+    para_idx: usize,
+    table_y: &mut Option<f64>,
+    mark_y: &mut Option<f64>,
+) {
+    use crate::renderer::render_tree::RenderNodeType;
+
+    match &node.node_type {
+        RenderNodeType::Table(table) if table.para_index == Some(para_idx) => {
+            *table_y = Some(node.bbox.y);
+        }
+        RenderNodeType::TextRun(run)
+            if run.para_index == Some(para_idx)
+                && run.cell_context.is_none()
+                && run.text.is_empty()
+                && run.is_para_end =>
+        {
+            *mark_y = Some(node.bbox.y);
+        }
+        _ => {}
+    }
+
+    for child in &node.children {
+        issue_1481_find_table_and_host_mark_y(child, para_idx, table_y, mark_y);
+    }
+}
+
+fn issue_1481_collect_outside_empty_para_marks(
+    node: &crate::renderer::render_tree::RenderNode,
+    marks: &mut Vec<(usize, f64)>,
+) {
+    use crate::renderer::render_tree::RenderNodeType;
+
+    if let RenderNodeType::TextRun(run) = &node.node_type {
+        if let Some(para_idx) = run.para_index {
+            if run.cell_context.is_none() && run.text.is_empty() && run.is_para_end {
+                marks.push((para_idx, node.bbox.y));
+            }
+        }
+    }
+
+    for child in &node.children {
+        issue_1481_collect_outside_empty_para_marks(child, marks);
+    }
+}
+
+fn issue_1481_collect_layer_control_mark_y(value: &Value, marks: &mut Vec<f64>) {
+    match value {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("textControlMark")
+                && map.get("isParaEnd").and_then(Value::as_bool) == Some(true)
+            {
+                if let Some(y) = map
+                    .get("bbox")
+                    .and_then(|bbox| bbox.get("y"))
+                    .and_then(Value::as_f64)
+                {
+                    marks.push(y);
+                }
+            }
+            for child in map.values() {
+                issue_1481_collect_layer_control_mark_y(child, marks);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                issue_1481_collect_layer_control_mark_y(item, marks);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn issue_1481_layer_control_mark_y(doc: &HwpDocument) -> Vec<f64> {
+    let json = doc
+        .get_page_layer_tree_native(0)
+        .expect("PageLayerTree JSON");
+    let parsed: Value = serde_json::from_str(&json).expect("PageLayerTree JSON 파싱");
+    let mut marks = Vec::new();
+    issue_1481_collect_layer_control_mark_y(&parsed, &mut marks);
+    marks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    marks
+}
+
+#[test]
+fn issue_1470_style_update_reflows_and_keeps_margin_unit() {
+    use crate::model::style::{CharShape, ParaShape, Style};
+
+    let mut doc = HwpDocument::create_empty();
+    doc.document.doc_info.char_shapes.push(CharShape::default());
+    doc.document.doc_info.para_shapes.push(ParaShape::default());
+    doc.document.doc_info.styles.push(Style {
+        local_name: "바탕글".to_string(),
+        english_name: "Normal".to_string(),
+        lang_id: 1042,
+        para_shape_id: 0,
+        char_shape_id: 0,
+        ..Default::default()
+    });
+    doc.insert_text_native(0, 0, 0, "스타일 줄간격 검증")
+        .expect("텍스트 입력");
+
+    let style_id = doc.create_style(
+        r#"{"name":"검증 스타일","englishName":"Issue1470","type":0,"nextStyleId":0,"baseParaShapeId":0,"baseCharShapeId":0}"#,
+    );
+    assert!(style_id >= 0, "스타일 생성");
+    doc.apply_style_native(0, 0, style_id as usize)
+        .expect("스타일 적용");
+
+    let before_spacing = doc.document.sections[0].paragraphs[0]
+        .line_segs
+        .first()
+        .map(|ls| ls.line_spacing)
+        .unwrap_or_default();
+
+    assert!(
+        doc.update_style_shapes(
+            style_id as u32,
+            "{}",
+            r#"{"marginLeft":3000,"lineSpacing":300,"lineSpacingType":"Percent"}"#,
+        ),
+        "스타일 문단 모양 수정"
+    );
+
+    let para = &doc.document.sections[0].paragraphs[0];
+    let ps = &doc.document.doc_info.para_shapes[para.para_shape_id as usize];
+    assert_eq!(para.style_id, style_id as u8);
+    assert_eq!(
+        ps.margin_left, 3000,
+        "15pt raw(2x) 여백이 30pt로 중복 변환되면 안 됨"
+    );
+    assert_eq!(ps.line_spacing, 300);
+    let after_spacing = para
+        .line_segs
+        .first()
+        .map(|ls| ls.line_spacing)
+        .unwrap_or_default();
+    assert_ne!(
+        after_spacing, before_spacing,
+        "스타일 줄간격 변경 후 LineSeg가 즉시 재계산되어야 한다"
+    );
+}
+
+#[test]
+fn issue_1470_style_apply_preserves_direct_char_shape() {
+    use crate::model::paragraph::CharShapeRef;
+    use crate::model::style::{CharShape, ParaShape, Style};
+
+    let mut doc = HwpDocument::create_empty();
+    doc.document.doc_info.char_shapes = vec![
+        CharShape {
+            base_size: 1000,
+            ..Default::default()
+        },
+        CharShape {
+            base_size: 1200,
+            ..Default::default()
+        },
+        CharShape {
+            bold: true,
+            ..Default::default()
+        },
+    ];
+    doc.document.doc_info.para_shapes = vec![
+        ParaShape::default(),
+        ParaShape {
+            margin_left: 1000,
+            ..Default::default()
+        },
+    ];
+    doc.document.doc_info.styles = vec![
+        Style {
+            local_name: "바탕글".to_string(),
+            english_name: "Normal".to_string(),
+            lang_id: 1042,
+            para_shape_id: 0,
+            char_shape_id: 0,
+            ..Default::default()
+        },
+        Style {
+            local_name: "새 문단 스타일".to_string(),
+            english_name: "Issue1470Apply".to_string(),
+            lang_id: 1042,
+            para_shape_id: 1,
+            char_shape_id: 1,
+            ..Default::default()
+        },
+    ];
+    doc.insert_text_native(0, 0, 0, "가나다라")
+        .expect("텍스트 입력");
+
+    let para = &mut doc.document.sections[0].paragraphs[0];
+    para.style_id = 0;
+    para.para_shape_id = 0;
+    para.char_shapes = vec![CharShapeRef {
+        start_pos: 0,
+        char_shape_id: 0,
+    }];
+    para.apply_char_shape_range(1, 3, 2);
+
+    doc.apply_style_native(0, 0, 1).expect("문단 스타일 적용");
+
+    let para = &doc.document.sections[0].paragraphs[0];
+    assert_eq!(para.style_id, 1);
+    assert_eq!(para.para_shape_id, 1);
+    let refs: Vec<(u32, u32)> = para
+        .char_shapes
+        .iter()
+        .map(|cs| (cs.start_pos, cs.char_shape_id))
+        .collect();
+    assert_eq!(
+        refs,
+        vec![(0, 1), (1, 2), (3, 1)],
+        "스타일 기본 글자 모양만 새 스타일로 바뀌고 직접 글자 모양 range는 유지되어야 한다"
+    );
+}
+
+#[test]
+fn issue_1470_style_update_preserves_direct_char_shape() {
+    use crate::model::paragraph::CharShapeRef;
+    use crate::model::style::{CharShape, ParaShape, Style};
+
+    let mut doc = HwpDocument::create_empty();
+    doc.document.doc_info.char_shapes = vec![
+        CharShape {
+            base_size: 1000,
+            ..Default::default()
+        },
+        CharShape {
+            base_size: 1200,
+            ..Default::default()
+        },
+        CharShape {
+            bold: true,
+            ..Default::default()
+        },
+    ];
+    doc.document.doc_info.para_shapes = vec![
+        ParaShape::default(),
+        ParaShape {
+            margin_left: 1000,
+            ..Default::default()
+        },
+    ];
+    doc.document.doc_info.styles = vec![
+        Style {
+            local_name: "바탕글".to_string(),
+            english_name: "Normal".to_string(),
+            lang_id: 1042,
+            para_shape_id: 0,
+            char_shape_id: 0,
+            ..Default::default()
+        },
+        Style {
+            local_name: "편집 대상 스타일".to_string(),
+            english_name: "Issue1470Update".to_string(),
+            lang_id: 1042,
+            para_shape_id: 1,
+            char_shape_id: 1,
+            ..Default::default()
+        },
+    ];
+    doc.insert_text_native(0, 0, 0, "가나다라")
+        .expect("텍스트 입력");
+
+    let para = &mut doc.document.sections[0].paragraphs[0];
+    para.style_id = 1;
+    para.para_shape_id = 1;
+    para.char_shapes = vec![CharShapeRef {
+        start_pos: 0,
+        char_shape_id: 1,
+    }];
+    para.apply_char_shape_range(1, 3, 2);
+
+    assert!(
+        doc.update_style_shapes(1, r#"{"fontSize":1400}"#, "{}"),
+        "스타일 글자 모양 수정"
+    );
+
+    let updated_csid = doc.document.doc_info.styles[1].char_shape_id as u32;
+    assert_ne!(
+        updated_csid, 1,
+        "스타일 CharShape가 새 ID로 갱신되어야 한다"
+    );
+
+    let para = &doc.document.sections[0].paragraphs[0];
+    let refs: Vec<(u32, u32)> = para
+        .char_shapes
+        .iter()
+        .map(|cs| (cs.start_pos, cs.char_shape_id))
+        .collect();
+    assert_eq!(
+        refs,
+        vec![(0, updated_csid), (1, 2), (3, updated_csid)],
+        "스타일 편집 전파 시 직접 글자 모양 range는 유지되어야 한다"
+    );
+}
+
+#[test]
+fn issue_1470_character_style_does_not_replace_para_style() {
+    use crate::model::paragraph::CharShapeRef;
+    use crate::model::style::{CharShape, ParaShape, Style};
+
+    let mut doc = HwpDocument::create_empty();
+    doc.document.doc_info.char_shapes = vec![
+        CharShape {
+            base_size: 1000,
+            ..Default::default()
+        },
+        CharShape {
+            italic: true,
+            ..Default::default()
+        },
+    ];
+    doc.document.doc_info.para_shapes = vec![ParaShape::default()];
+    doc.document.doc_info.styles = vec![
+        Style {
+            local_name: "바탕글".to_string(),
+            english_name: "Normal".to_string(),
+            lang_id: 1042,
+            para_shape_id: 0,
+            char_shape_id: 0,
+            ..Default::default()
+        },
+        Style {
+            local_name: "글자 스타일".to_string(),
+            english_name: "Issue1470Char".to_string(),
+            style_type: 1,
+            lang_id: 1042,
+            para_shape_id: 0,
+            char_shape_id: 1,
+            ..Default::default()
+        },
+    ];
+    doc.insert_text_native(0, 0, 0, "글자스타일")
+        .expect("텍스트 입력");
+
+    let para = &mut doc.document.sections[0].paragraphs[0];
+    para.style_id = 0;
+    para.para_shape_id = 0;
+    para.char_shapes = vec![CharShapeRef {
+        start_pos: 0,
+        char_shape_id: 0,
+    }];
+
+    doc.apply_style_native(0, 0, 1).expect("글자 스타일 적용");
+
+    let para = &doc.document.sections[0].paragraphs[0];
+    assert_eq!(
+        para.style_id, 0,
+        "글자 스타일은 문단 스타일 ID를 바꾸지 않는다"
+    );
+    assert_eq!(
+        para.para_shape_id, 0,
+        "글자 스타일은 문단 모양 ID를 바꾸지 않는다"
+    );
+    assert_eq!(
+        para.char_shape_id_at(0),
+        Some(1),
+        "글자 스타일 CharShape는 글자 모양에 적용되어야 한다"
+    );
+}
+
+#[test]
+fn issue_1470_create_table_ex_applies_size_options() {
+    use crate::model::control::Control;
+
+    let mut doc = HwpDocument::create_empty();
+    let col_widths = [4000, 6000];
+    let row_heights = [3000, 5000];
+    doc.create_table_ex_native(0, 0, 0, 2, 2, true, Some(&col_widths), Some(&row_heights))
+        .expect("확장 표 생성");
+
+    let table = doc.document.sections[0].paragraphs[0]
+        .controls
+        .iter()
+        .find_map(|c| match c {
+            Control::Table(t) => Some(t),
+            _ => None,
+        })
+        .expect("표 컨트롤");
+    assert!(
+        table.common.treat_as_char,
+        "상세 옵션의 글자처럼 취급이 반영되어야 한다"
+    );
+    assert_eq!(table.common.width, 10000);
+    assert_eq!(table.common.height, 8000);
+    assert_eq!(table.cells[0].width, 4000);
+    assert_eq!(table.cells[1].width, 6000);
+    assert_eq!(table.cells[0].height, 3000);
+    assert_eq!(table.cells[2].height, 5000);
+}
+
+#[test]
+fn issue_1481_create_table_keeps_first_line_mark_for_escape() {
+    use crate::model::control::Control;
+
+    let mut doc = HwpDocument::create_empty();
+    let table_result = doc
+        .create_table_ex_native(0, 0, 1, 3, 5, false, None, None)
+        .expect("상세 대화상자 경로의 일반 표 생성");
+    let table_para_idx = issue_1481_json_usize(&table_result, "paraIdx");
+    let section = &doc.document.sections[0];
+
+    assert_eq!(table_para_idx, 0, "새 문서 첫 표는 첫 줄에 만들어져야 한다");
+    assert!(
+        section.paragraphs.len() >= 2,
+        "표 뒤 빈 문단은 유지되어야 한다"
+    );
+    assert!(section.paragraphs[0].text.is_empty());
+    assert_eq!(section.paragraphs[0].char_count, 9);
+    assert!(section.paragraphs[0].has_para_text);
+    assert!(!section.paragraphs[0].line_segs.is_empty());
+    assert!(matches!(
+        section.paragraphs[table_para_idx].controls.first(),
+        Some(Control::Table(_))
+    ));
+    assert!(section.paragraphs[table_para_idx + 1].text.is_empty());
+    assert!(section.paragraphs[table_para_idx + 1].controls.is_empty());
+    assert_eq!(section.paragraphs[table_para_idx + 1].char_count, 1);
+    assert!(!section.paragraphs[table_para_idx + 1].line_segs.is_empty());
+
+    let moved = doc
+        .move_vertical(0, 0, 0, -1, 0.0, table_para_idx as u32, 0, 0, 0)
+        .expect("첫 셀에서 위쪽 이동");
+    let moved: Value = serde_json::from_str(&moved).expect("moveVertical JSON");
+    assert_eq!(
+        moved["paragraphIndex"].as_u64(),
+        Some(table_para_idx as u64)
+    );
+    assert_eq!(moved["charOffset"].as_u64(), Some(0));
+    assert!(
+        moved.get("parentParaIndex").is_none(),
+        "첫 셀 위쪽 이동은 같은 첫 줄의 표 밖 조판부호 위치로 나가야 한다"
+    );
+
+    let tree = issue_1481_first_page_render_tree(&doc);
+    let mut table_y = None;
+    let mut host_mark_y = None;
+    issue_1481_find_table_and_host_mark_y(
+        &tree.root,
+        table_para_idx,
+        &mut table_y,
+        &mut host_mark_y,
+    );
+    let table_y = table_y.expect("표 렌더 노드 y");
+    let host_mark_y = host_mark_y.expect("표 host 문단부호 y");
+    assert!(
+        (table_y - host_mark_y).abs() < 1.0,
+        "기본 자리차지 표의 첫 조판부호는 빈 줄이 아니라 표 상단과 겹쳐야 한다: table_y={table_y}, mark_y={host_mark_y}"
+    );
+    doc.set_show_paragraph_marks(true);
+    let layer_marks = issue_1481_layer_control_mark_y(&doc);
+    let layer_marks_above_table = layer_marks
+        .iter()
+        .filter(|y| **y < table_y - 1.0)
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        layer_marks_above_table.is_empty(),
+        "새 문서 빈 문단 끝에서 표를 만들 때 생성 경로가 빈 줄을 남기면 안 된다: table_y={table_y}, layer_marks_above={layer_marks_above_table:?}, all={layer_marks:?}"
+    );
+    doc.set_show_paragraph_marks(false);
+
+    let mut outside_marks = Vec::new();
+    issue_1481_collect_outside_empty_para_marks(&tree.root, &mut outside_marks);
+    let marks_above_table = outside_marks
+        .iter()
+        .filter(|(_, y)| *y < table_y - 1.0)
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        marks_above_table.is_empty(),
+        "표 생성 직후 표 위에 별도 빈 줄 조판부호가 있으면 안 된다: table_y={table_y}, marks={marks_above_table:?}, all={outside_marks:?}"
+    );
+
+    let enter_result = doc
+        .split_paragraph_native(0, table_para_idx, 0)
+        .expect("표 앞 조판부호 위치 Enter");
+    let enter_para_idx = issue_1481_json_usize(&enter_result, "paraIdx");
+    assert_eq!(
+        enter_para_idx,
+        table_para_idx + 1,
+        "자리차지 표 앞 Enter는 표 아래 문단으로 커서를 보내야 한다"
+    );
+    let section_after_enter = &doc.document.sections[0];
+    assert!(matches!(
+        section_after_enter.paragraphs[table_para_idx]
+            .controls
+            .first(),
+        Some(Control::Table(_))
+    ));
+    assert_eq!(
+        section_after_enter.paragraphs[table_para_idx].char_count, 9,
+        "Enter 후에도 표 host 문단은 빈 문단으로 분리되면 안 된다"
+    );
+    assert!(section_after_enter.paragraphs[enter_para_idx]
+        .text
+        .is_empty());
+    assert!(section_after_enter.paragraphs[enter_para_idx]
+        .controls
+        .is_empty());
+    assert_eq!(section_after_enter.paragraphs[enter_para_idx].char_count, 1);
+    assert!(section_after_enter
+        .paragraphs
+        .get(enter_para_idx + 1)
+        .map(|p| p.text.is_empty() && p.controls.is_empty())
+        .unwrap_or(false));
+
+    let tree_after_enter = issue_1481_first_page_render_tree(&doc);
+    let mut table_y_after = None;
+    let mut host_mark_y_after = None;
+    issue_1481_find_table_and_host_mark_y(
+        &tree_after_enter.root,
+        table_para_idx,
+        &mut table_y_after,
+        &mut host_mark_y_after,
+    );
+    let table_y_after = table_y_after.expect("Enter 후 표 렌더 노드 y");
+    let host_mark_y_after = host_mark_y_after.expect("Enter 후 표 host 문단부호 y");
+    assert!(
+        (table_y_after - host_mark_y_after).abs() < 1.0,
+        "Enter 후에도 표 host 조판부호는 표 상단과 겹쳐야 한다: table_y={table_y_after}, mark_y={host_mark_y_after}"
+    );
+    let mut outside_marks_after = Vec::new();
+    issue_1481_collect_outside_empty_para_marks(&tree_after_enter.root, &mut outside_marks_after);
+    let marks_above_table_after = outside_marks_after
+        .iter()
+        .filter(|(_, y)| *y < table_y_after - 1.0)
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        marks_above_table_after.is_empty(),
+        "Enter 후에도 표 위에 별도 빈 줄 조판부호가 있으면 안 된다: table_y={table_y_after}, marks={marks_above_table_after:?}, all={outside_marks_after:?}"
+    );
+}
+
+#[test]
+fn issue_1481_create_table_preserves_user_blank_line_above() {
+    use crate::model::control::Control;
+
+    let mut doc = HwpDocument::create_empty();
+    doc.split_paragraph_native(0, 0, 0)
+        .expect("사용자가 만든 빈 줄");
+    let table_result = doc
+        .create_table_ex_native(0, 1, 1, 3, 5, false, None, None)
+        .expect("두 번째 빈 문단에 일반 표 생성");
+    let table_para_idx = issue_1481_json_usize(&table_result, "paraIdx");
+    let section = &doc.document.sections[0];
+
+    assert_eq!(
+        table_para_idx, 1,
+        "사용자가 표 위에 만든 빈 문단은 삭제하지 않고 현재 빈 문단만 표 host로 교체해야 한다"
+    );
+    assert!(section.paragraphs[0].text.is_empty());
+    assert!(section.paragraphs[0].controls.is_empty());
+    assert_eq!(section.paragraphs[0].char_count, 1);
+    assert!(matches!(
+        section.paragraphs[table_para_idx].controls.first(),
+        Some(Control::Table(_))
+    ));
+}
+
+#[test]
+fn issue_1481_create_table_empty_para_ignores_stale_offset() {
+    use crate::model::control::Control;
+
+    let mut doc = HwpDocument::create_empty();
+    let table_result = doc
+        .create_table_ex_native(0, 0, 2, 3, 5, false, None, None)
+        .expect("빈 문단의 초과 offset에서 일반 표 생성");
+    let table_para_idx = issue_1481_json_usize(&table_result, "paraIdx");
+    let section = &doc.document.sections[0];
+
+    assert_eq!(
+        table_para_idx, 0,
+        "빈 문단 offset이 초과되어도 표 위에 생성 경로의 빈 줄을 남기면 안 된다"
+    );
+    assert!(matches!(
+        section.paragraphs[table_para_idx].controls.first(),
+        Some(Control::Table(_))
+    ));
+
+    let tree = issue_1481_first_page_render_tree(&doc);
+    let mut table_y = None;
+    let mut host_mark_y = None;
+    issue_1481_find_table_and_host_mark_y(
+        &tree.root,
+        table_para_idx,
+        &mut table_y,
+        &mut host_mark_y,
+    );
+    let table_y = table_y.expect("표 렌더 노드 y");
+    let host_mark_y = host_mark_y.expect("표 host 문단부호 y");
+    assert!(
+        (table_y - host_mark_y).abs() < 1.0,
+        "빈 문단 초과 offset에서도 첫 조판부호는 표 상단과 겹쳐야 한다: table_y={table_y}, mark_y={host_mark_y}"
+    );
+}
+
+#[test]
+fn issue_1481_blank_template_create_table_has_no_generated_blank_above() {
+    use crate::model::control::Control;
+
+    let mut doc = HwpDocument::create_empty();
+    doc.create_blank_document_native()
+        .expect("Studio 새 문서 템플릿 생성");
+    let table_result = doc
+        .create_table_ex_native(0, 0, 2, 3, 5, false, None, None)
+        .expect("blank2010 기반 빈 문단 초과 offset에서 일반 표 생성");
+    let table_para_idx = issue_1481_json_usize(&table_result, "paraIdx");
+    let table_control_idx = issue_1481_json_usize(&table_result, "controlIdx");
+    let section = &doc.document.sections[0];
+
+    assert_eq!(
+        table_para_idx, 0,
+        "Studio 새 문서 템플릿에서도 첫 표는 첫 줄에 만들어져야 한다"
+    );
+    assert_eq!(
+        table_control_idx, 2,
+        "blank2010의 SectionDef/ColumnDef 구조 컨트롤 뒤에 표 컨트롤이 보존되어야 한다"
+    );
+    assert!(matches!(
+        section.paragraphs[table_para_idx]
+            .controls
+            .get(table_control_idx),
+        Some(Control::Table(_))
+    ));
+
+    let tree = issue_1481_first_page_render_tree(&doc);
+    let mut table_y = None;
+    let mut host_mark_y = None;
+    issue_1481_find_table_and_host_mark_y(
+        &tree.root,
+        table_para_idx,
+        &mut table_y,
+        &mut host_mark_y,
+    );
+    let table_y = table_y.expect("표 렌더 노드 y");
+    let host_mark_y = host_mark_y.expect("표 host 문단부호 y");
+    assert!(
+        (table_y - host_mark_y).abs() < 1.0,
+        "blank2010 경로에서도 첫 조판부호는 표 상단과 겹쳐야 한다: table_y={table_y}, mark_y={host_mark_y}"
+    );
+
+    doc.set_show_paragraph_marks(true);
+    let layer_marks = issue_1481_layer_control_mark_y(&doc);
+    let layer_marks_above_table = layer_marks
+        .iter()
+        .filter(|y| **y < table_y - 1.0)
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        layer_marks_above_table.is_empty(),
+        "blank2010 경로에서도 표 위에 생성 경로 빈 줄을 남기면 안 된다: table_y={table_y}, layer_marks_above={layer_marks_above_table:?}, all={layer_marks:?}"
+    );
+    doc.set_show_paragraph_marks(false);
+}
+
+#[test]
+fn issue_1481_insert_column_keeps_create_table_height() {
+    let mut doc = HwpDocument::create_empty();
+    let table_result = doc
+        .create_table_native(0, 0, 0, 3, 5)
+        .expect("일반 표 생성");
+    let table_para_idx = issue_1481_json_usize(&table_result, "paraIdx");
+
+    let (original_width, original_height, original_raw_height, row_height_sum) = {
+        let table = issue_1481_table(&doc, table_para_idx);
+        let raw_common = parse_common_obj_attr(&table.raw_ctrl_data);
+        (
+            table.common.width,
+            table.common.height,
+            raw_common.height,
+            table.get_row_heights().iter().sum::<u32>(),
+        )
+    };
+
+    assert!(
+        original_height > row_height_sum,
+        "일반 표는 셀 저장 height 합보다 큰 외곽 height를 가진다"
+    );
+
+    doc.insert_table_column_native(0, table_para_idx, 0, 0, false)
+        .expect("왼쪽 열 추가");
+
+    let table = issue_1481_table(&doc, table_para_idx);
+    let raw_common = parse_common_obj_attr(&table.raw_ctrl_data);
+
+    assert_eq!(table.col_count, 6);
+    assert!(
+        table.common.width > original_width,
+        "열 추가 후 표 폭은 기준 열 폭만큼 증가해야 한다"
+    );
+    assert_eq!(
+        table.common.height, original_height,
+        "열 추가는 행 수를 바꾸지 않으므로 표 외곽 height를 보존해야 한다"
+    );
+    assert_eq!(
+        raw_common.height, original_raw_height,
+        "직렬화 원본 raw height도 표 외곽 height와 함께 보존해야 한다"
+    );
+    assert_eq!(
+        raw_common.height, table.common.height,
+        "raw height와 in-memory common height는 동기화되어야 한다"
+    );
+}
+
+#[test]
+fn issue_1481_insert_row_keeps_create_table_display_height() {
+    let mut doc = HwpDocument::create_empty();
+    let table_result = doc
+        .create_table_native(0, 0, 0, 3, 5)
+        .expect("일반 표 생성");
+    let table_para_idx = issue_1481_json_usize(&table_result, "paraIdx");
+
+    let (original_height, original_raw_height, original_row_height_sum) = {
+        let table = issue_1481_table(&doc, table_para_idx);
+        let raw_common = parse_common_obj_attr(&table.raw_ctrl_data);
+        (
+            table.common.height,
+            raw_common.height,
+            table.get_row_heights().iter().sum::<u32>(),
+        )
+    };
+
+    assert!(
+        original_height > original_row_height_sum,
+        "일반 표는 셀 저장 height 합보다 큰 외곽 height를 가진다"
+    );
+
+    doc.insert_table_row_native(0, table_para_idx, 0, 0, false)
+        .expect("위쪽 줄 추가");
+
+    let table = issue_1481_table(&doc, table_para_idx);
+    let raw_common = parse_common_obj_attr(&table.raw_ctrl_data);
+    let expected_height = original_height + (original_height / 3);
+
+    assert_eq!(table.row_count, 4);
+    assert_eq!(
+        table.common.height, expected_height,
+        "줄 추가는 한 행의 표시 높이만큼 표 외곽 height를 늘려야 한다"
+    );
+    assert!(
+        table.common.height > original_raw_height,
+        "줄 추가 후 표 높이는 기존 외곽 height보다 커야 한다"
+    );
+    assert_eq!(
+        raw_common.height, table.common.height,
+        "raw height와 in-memory common height는 동기화되어야 한다"
+    );
+}
+
+#[test]
+fn issue_1481_delete_row_keeps_create_table_display_height() {
+    let mut doc = HwpDocument::create_empty();
+    let table_result = doc
+        .create_table_native(0, 0, 0, 3, 5)
+        .expect("일반 표 생성");
+    let table_para_idx = issue_1481_json_usize(&table_result, "paraIdx");
+
+    let (original_height, original_row_height_sum) = {
+        let table = issue_1481_table(&doc, table_para_idx);
+        (
+            table.common.height,
+            table.get_row_heights().iter().sum::<u32>(),
+        )
+    };
+
+    assert!(
+        original_height > original_row_height_sum,
+        "일반 표는 셀 저장 height 합보다 큰 외곽 height를 가진다"
+    );
+
+    doc.delete_table_row_native(0, table_para_idx, 0, 0)
+        .expect("줄 지우기");
+
+    let table = issue_1481_table(&doc, table_para_idx);
+    let raw_common = parse_common_obj_attr(&table.raw_ctrl_data);
+    let expected_height = original_height - (original_height / 3);
+
+    assert_eq!(table.row_count, 2);
+    assert_eq!(
+        table.common.height, expected_height,
+        "줄 삭제는 삭제 행의 표시 높이만큼 표 외곽 height를 줄여야 한다"
+    );
+    assert!(
+        table.common.height > table.get_row_heights().iter().sum::<u32>(),
+        "삭제 후에도 일반 표의 표시 height가 셀 저장 height 합으로 붕괴하면 안 된다"
+    );
+    assert_eq!(
+        raw_common.height, table.common.height,
+        "raw height와 in-memory common height는 동기화되어야 한다"
+    );
+}
+
+#[test]
+fn issue_1481_delete_column_keeps_create_table_height() {
+    let mut doc = HwpDocument::create_empty();
+    let table_result = doc
+        .create_table_native(0, 0, 0, 3, 5)
+        .expect("일반 표 생성");
+    let table_para_idx = issue_1481_json_usize(&table_result, "paraIdx");
+
+    let (original_width, original_height, original_raw_height, row_height_sum) = {
+        let table = issue_1481_table(&doc, table_para_idx);
+        let raw_common = parse_common_obj_attr(&table.raw_ctrl_data);
+        (
+            table.common.width,
+            table.common.height,
+            raw_common.height,
+            table.get_row_heights().iter().sum::<u32>(),
+        )
+    };
+
+    assert!(
+        original_height > row_height_sum,
+        "일반 표는 셀 저장 height 합보다 큰 외곽 height를 가진다"
+    );
+
+    doc.delete_table_column_native(0, table_para_idx, 0, 0)
+        .expect("칸 지우기");
+
+    let table = issue_1481_table(&doc, table_para_idx);
+    let raw_common = parse_common_obj_attr(&table.raw_ctrl_data);
+
+    assert_eq!(table.col_count, 4);
+    assert!(
+        table.common.width < original_width,
+        "열 삭제 후 표 폭은 삭제 열 폭만큼 줄어야 한다"
+    );
+    assert_eq!(
+        table.common.height, original_height,
+        "열 삭제는 행 수를 바꾸지 않으므로 표 외곽 height를 보존해야 한다"
+    );
+    assert_eq!(
+        raw_common.height, original_raw_height,
+        "직렬화 원본 raw height도 표 외곽 height와 함께 보존해야 한다"
+    );
+    assert_eq!(
+        raw_common.height, table.common.height,
+        "raw height와 in-memory common height는 동기화되어야 한다"
+    );
+}
+
+#[test]
+fn issue_1481_resize_bottom_row_keeps_create_table_display_height() {
+    let mut doc = HwpDocument::create_empty();
+    let table_result = doc
+        .create_table_native(0, 0, 0, 3, 5)
+        .expect("일반 표 생성");
+    let table_para_idx = issue_1481_json_usize(&table_result, "paraIdx");
+
+    let (original_height, original_raw_height, original_row_height_sum, last_row_cells) = {
+        let table = issue_1481_table(&doc, table_para_idx);
+        let raw_common = parse_common_obj_attr(&table.raw_ctrl_data);
+        let last_row = table.row_count - 1;
+        (
+            table.common.height,
+            raw_common.height,
+            table.get_row_heights().iter().sum::<u32>(),
+            table
+                .cells
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, cell)| (cell.row == last_row).then_some(idx))
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    assert!(
+        original_height > original_row_height_sum,
+        "일반 표는 셀 저장 height 합보다 큰 외곽 height를 가진다"
+    );
+    assert_eq!(original_height, original_raw_height);
+    assert_eq!(last_row_cells.len(), 5);
+
+    let updates = last_row_cells
+        .iter()
+        .map(|cell_idx| format!(r#"{{"cellIdx":{},"heightDelta":300}}"#, cell_idx))
+        .collect::<Vec<_>>()
+        .join(",");
+    doc.resize_table_cells_native(0, table_para_idx, 0, &format!("[{}]", updates))
+        .expect("하단 행 resize");
+
+    let table = issue_1481_table(&doc, table_para_idx);
+    let raw_common = parse_common_obj_attr(&table.raw_ctrl_data);
+    let row_height_sum = table.get_row_heights().iter().sum::<u32>();
+
+    assert_eq!(
+        table.common.height,
+        original_height + 300,
+        "하단선 resize는 기존 표시 height에 실제 행 높이 변화량만 반영해야 한다"
+    );
+    assert!(
+        table.common.height > row_height_sum,
+        "resize 후에도 생성 직후 표의 표시 height가 셀 저장 height 합으로 붕괴하면 안 된다"
+    );
+    assert_eq!(
+        raw_common.height, table.common.height,
+        "raw height와 in-memory common height는 동기화되어야 한다"
+    );
+}
+
+fn issue_1470_count_rendered_tables(
+    doc: &HwpDocument,
+    para_idx: usize,
+    control_idx: usize,
+) -> usize {
+    let layout = doc
+        .get_page_control_layout_native(0)
+        .expect("페이지 컨트롤 레이아웃");
+    let parsed: Value = serde_json::from_str(&layout).expect("레이아웃 JSON");
+    parsed["controls"]
+        .as_array()
+        .expect("controls 배열")
+        .iter()
+        .filter(|control| {
+            control["type"] == "table"
+                && control["paraIdx"].as_u64() == Some(para_idx as u64)
+                && control["controlIdx"].as_u64() == Some(control_idx as u64)
+        })
+        .count()
+}
+
+fn issue_1470_table_caption_number(doc: &HwpDocument, control_idx: usize) -> Option<(u16, u16)> {
+    use crate::model::control::Control;
+
+    let table = match doc.document.sections[0].paragraphs[0]
+        .controls
+        .get(control_idx)?
+    {
+        Control::Table(t) => t,
+        _ => return None,
+    };
+    table
+        .caption
+        .as_ref()?
+        .paragraphs
+        .first()?
+        .controls
+        .iter()
+        .find_map(|c| match c {
+            Control::AutoNumber(an) => Some((an.assigned_number, an.number)),
+            _ => None,
+        })
+}
+
+#[test]
+fn issue_1470_create_table_ex_tac_renders_once() {
+    let mut doc = HwpDocument::create_empty();
+    doc.insert_text_native(0, 0, 0, "본문 앞")
+        .expect("본문 텍스트 입력");
+    let insert_at = doc
+        .get_paragraph_length_native(0, 0)
+        .expect("문단 길이 조회");
+    let created = doc
+        .create_table_ex_native(
+            0,
+            0,
+            insert_at,
+            2,
+            2,
+            true,
+            Some(&[4000, 6000]),
+            Some(&[3000, 5000]),
+        )
+        .expect("TAC 표 생성");
+    let created: Value = serde_json::from_str(&created).expect("생성 결과 JSON");
+    let control_idx = created["controlIdx"].as_u64().expect("controlIdx") as usize;
+
+    assert_eq!(
+        issue_1470_count_rendered_tables(&doc, 0, control_idx),
+        1,
+        "문단 레이아웃에서 이미 그린 TAC 표를 PageItem 경로가 다시 그리면 안 된다"
+    );
+}
+
+#[test]
+fn issue_1470_create_table_ex_tac_caption_renders_once() {
+    let mut doc = HwpDocument::create_empty();
+    doc.insert_text_native(0, 0, 0, "캡션 표")
+        .expect("본문 텍스트 입력");
+    let insert_at = doc
+        .get_paragraph_length_native(0, 0)
+        .expect("문단 길이 조회");
+    let created = doc
+        .create_table_ex_native(0, 0, insert_at, 1, 1, true, None, None)
+        .expect("TAC 표 생성");
+    let created: Value = serde_json::from_str(&created).expect("생성 결과 JSON");
+    let control_idx = created["controlIdx"].as_u64().expect("controlIdx") as usize;
+    doc.set_table_properties_native(0, 0, control_idx, r#"{"hasCaption":true}"#)
+        .expect("캡션 생성");
+
+    assert_eq!(
+        issue_1470_count_rendered_tables(&doc, 0, control_idx),
+        1,
+        "캡션이 있는 TAC 표도 같은 컨트롤이 한 번만 렌더되어야 한다"
+    );
+}
+
+#[test]
+fn issue_1470_table_caption_keeps_autonumber_and_can_be_removed() {
+    use crate::model::control::Control;
+
+    let mut doc = HwpDocument::create_empty();
+    doc.create_table_ex_native(0, 0, 0, 1, 1, true, None, None)
+        .expect("표 생성");
+
+    doc.set_table_properties_native(0, 0, 0, r#"{"hasCaption":true}"#)
+        .expect("캡션 생성");
+    let table = match &doc.document.sections[0].paragraphs[0].controls[0] {
+        Control::Table(t) => t,
+        other => panic!("표가 아님: {other:?}"),
+    };
+    let caption = table.caption.as_ref().expect("캡션 존재");
+    let cap_para = caption.paragraphs.first().expect("캡션 문단");
+    assert_eq!(cap_para.text, "표  ");
+    assert_eq!(cap_para.char_count, 13);
+    assert_eq!(cap_para.char_offsets, vec![0, 1, 2, 11]);
+    assert!(
+        cap_para
+            .controls
+            .iter()
+            .any(|c| matches!(c, Control::AutoNumber(_))),
+        "표 캡션 번호는 literal 텍스트가 아니라 AutoNumber 컨트롤로 유지되어야 한다"
+    );
+
+    doc.set_table_properties_native(0, 0, 0, r#"{"hasCaption":false}"#)
+        .expect("캡션 삭제");
+    let table = match &doc.document.sections[0].paragraphs[0].controls[0] {
+        Control::Table(t) => t,
+        other => panic!("표가 아님: {other:?}"),
+    };
+    assert!(
+        table.caption.is_none(),
+        "hasCaption=false가 기존 캡션을 삭제해야 한다"
+    );
+    assert_eq!(table.attr & (1 << 29), 0, "캡션 attr bit도 내려야 한다");
+}
+
+#[test]
+fn issue_1470_table_caption_renumbers_after_delete() {
+    let mut doc = HwpDocument::create_empty();
+    for _ in 0..3 {
+        doc.create_table_ex_native(0, 0, 0, 1, 1, true, None, None)
+            .expect("표 생성");
+    }
+    for control_idx in 0..3 {
+        doc.set_table_properties_native(0, 0, control_idx, r#"{"hasCaption":true}"#)
+            .expect("캡션 생성");
+    }
+
+    assert_eq!(issue_1470_table_caption_number(&doc, 0), Some((1, 1)));
+    assert_eq!(issue_1470_table_caption_number(&doc, 1), Some((2, 2)));
+    assert_eq!(issue_1470_table_caption_number(&doc, 2), Some((3, 3)));
+
+    doc.set_table_properties_native(0, 0, 1, r#"{"hasCaption":false}"#)
+        .expect("중간 캡션 삭제");
+    doc.set_table_properties_native(
+        0,
+        0,
+        2,
+        r#"{"captionDirection":0,"captionVertAlign":1,"captionWidth":2400,"captionSpacing":600}"#,
+    )
+    .expect("뒤 캡션 속성 수정");
+
+    assert_eq!(
+        issue_1470_table_caption_number(&doc, 0),
+        Some((1, 1)),
+        "앞 표 캡션 번호는 1을 유지해야 한다"
+    );
+    assert_eq!(
+        issue_1470_table_caption_number(&doc, 1),
+        None,
+        "삭제한 중간 표 캡션은 없어야 한다"
+    );
+    assert_eq!(
+        issue_1470_table_caption_number(&doc, 2),
+        Some((2, 2)),
+        "중간 캡션 삭제 후 뒤 표 캡션의 assigned_number/number가 2로 재배정되어야 한다"
+    );
+
+    let svg = doc.render_page_svg_native(0).expect("SVG 렌더링");
+    assert!(
+        svg.contains(">표<") && svg.contains(">1<") && svg.contains(">2<") && !svg.contains(">3<"),
+        "렌더링 결과도 중간 캡션 삭제 후 표 1, 표 2만 표시해야 한다"
+    );
+}
+
+#[test]
+fn issue_1470_table_caption_edit_keeps_autonumber() {
+    use crate::model::control::Control;
+    use crate::model::shape::{CaptionDirection, CaptionVertAlign};
+
+    let mut doc = HwpDocument::create_empty();
+    doc.create_table_ex_native(0, 0, 0, 1, 1, true, None, None)
+        .expect("표 생성");
+    doc.set_table_properties_native(0, 0, 0, r#"{"hasCaption":true}"#)
+        .expect("캡션 생성");
+
+    doc.set_table_properties_native(
+        0,
+        0,
+        0,
+        r#"{"captionDirection":0,"captionVertAlign":1,"captionWidth":2400,"captionSpacing":600}"#,
+    )
+    .expect("캡션 속성 수정");
+
+    let table = match &doc.document.sections[0].paragraphs[0].controls[0] {
+        Control::Table(t) => t,
+        other => panic!("표가 아님: {other:?}"),
+    };
+    let caption = table.caption.as_ref().expect("캡션 존재");
+    assert_eq!(caption.direction, CaptionDirection::Left);
+    assert_eq!(caption.vert_align, CaptionVertAlign::Center);
+    assert_eq!(caption.width, 2400);
+    assert_eq!(caption.spacing, 600);
+
+    let cap_para = caption.paragraphs.first().expect("캡션 문단");
+    assert_eq!(cap_para.text, "표  ");
+    assert_eq!(cap_para.char_offsets, vec![0, 1, 2, 11]);
+    assert!(
+        cap_para.controls.iter().any(
+            |c| matches!(c, Control::AutoNumber(an) if an.assigned_number == 1 && an.number == 1)
+        ),
+        "캡션 속성 수정 후에도 AutoNumber 컨트롤과 번호가 유지되어야 한다"
+    );
 }
 
 #[test]
@@ -54,22 +1282,25 @@ fn test_page_layer_tree_export_uses_schema_contract() {
     let json = doc
         .get_page_layer_tree_native(0)
         .expect("empty document layer tree should export");
+    let parsed: Value = serde_json::from_str(&json).expect("PageLayerTree JSON");
 
-    assert!(json.contains(&format!(
-        "\"schemaVersion\":{}",
-        LAYER_TREE_SCHEMA.schema_version
-    )));
-    assert!(json.contains(&format!(
-        "\"resourceTableVersion\":{}",
-        LAYER_TREE_SCHEMA.resource_table_version
-    )));
-    assert!(json.contains(&format!("\"unit\":\"{}\"", LAYER_TREE_SCHEMA.unit)));
-    assert!(json.contains(&format!(
-        "\"coordinateSystem\":\"{}\"",
-        LAYER_TREE_SCHEMA.coordinate_system
-    )));
-    assert!(json.contains("\"profile\":\"screen\""));
-    assert!(json.contains("\"outputOptions\":{"));
+    assert_eq!(
+        parsed["schemaVersion"].as_u64(),
+        Some(LAYER_TREE_SCHEMA.schema_version as u64)
+    );
+    assert_eq!(
+        parsed["resourceTableVersion"].as_u64(),
+        Some(LAYER_TREE_SCHEMA.resource_table_version as u64)
+    );
+    assert_eq!(parsed["unit"].as_str(), Some(LAYER_TREE_SCHEMA.unit));
+    assert_eq!(
+        parsed["coordinateSystem"].as_str(),
+        Some(LAYER_TREE_SCHEMA.coordinate_system)
+    );
+    assert_eq!(parsed["profile"].as_str(), Some("screen"));
+    assert!(parsed["buildOptions"].is_object());
+    assert!(parsed["debugOptions"].is_object());
+    assert!(parsed["outputOptions"].is_object());
 }
 
 #[test]
@@ -84,12 +1315,34 @@ fn test_page_layer_tree_export_preserves_output_options() {
     let json = doc
         .get_page_layer_tree_native(0)
         .expect("layer tree should export output options");
+    let parsed: Value = serde_json::from_str(&json).expect("PageLayerTree JSON");
 
-    assert!(json.contains("\"showParagraphMarks\":true"));
-    assert!(json.contains("\"showControlCodes\":true"));
-    assert!(json.contains("\"showTransparentBorders\":true"));
-    assert!(json.contains("\"clipEnabled\":false"));
-    assert!(json.contains("\"debugOverlay\":true"));
+    assert_eq!(
+        parsed["buildOptions"]["showTransparentBorders"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(parsed["buildOptions"]["clipEnabled"].as_bool(), Some(false));
+    assert_eq!(parsed["debugOptions"]["debugOverlay"].as_bool(), Some(true));
+    assert_eq!(
+        parsed["outputOptions"]["showParagraphMarks"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        parsed["outputOptions"]["showControlCodes"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        parsed["outputOptions"]["showTransparentBorders"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        parsed["outputOptions"]["clipEnabled"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        parsed["outputOptions"]["debugOverlay"].as_bool(),
+        Some(true)
+    );
 }
 
 #[test]
@@ -2060,6 +3313,351 @@ fn test_paste_inline_picture_no_cascade() {
         offs,
         vec![1000, 1000, 1000],
         "inline 그림에 cascade 적용됨: {offs:?}"
+    );
+}
+
+/// 섹션 0에서 첫 번째 표 컨트롤의 (para_idx, ctrl_idx)를 찾는다.
+fn find_table_pos(doc: &HwpDocument) -> (usize, usize) {
+    use crate::model::control::Control;
+    for (pi, p) in doc.document.sections[0].paragraphs.iter().enumerate() {
+        for (ci, c) in p.controls.iter().enumerate() {
+            if matches!(c, Control::Table(_)) {
+                return (pi, ci);
+            }
+        }
+    }
+    panic!("표 컨트롤 없음");
+}
+
+/// #1323: 표 셀 안 이미지 붙여넣기 — merge_from 컨트롤 병합으로 그림·CTRL_DATA가
+/// 보존되어야 한다. 수정 전에는 에러 없이 조용히 누락되었다.
+#[test]
+fn test_paste_picture_into_table_cell() {
+    use crate::model::control::Control;
+
+    let mut doc = create_doc_with_floating_picture(true, 0, 0);
+    // CTRL_DATA 인덱스 정렬 검증용 레코드 부여
+    doc.document.sections[0].paragraphs[0].ctrl_data_records = vec![Some(vec![7, 7, 7])];
+    doc.copy_control_native(0, 0, &[], 0).expect("그림 복사");
+
+    doc.create_table_ex_native(0, 1, 0, 2, 2, true, None, None)
+        .expect("표 생성");
+    let (t_para, t_ctrl) = find_table_pos(&doc);
+
+    doc.paste_internal_in_cell_native(0, t_para, t_ctrl, 0, 0, 0)
+        .expect("셀에 그림 붙여넣기");
+
+    let table = match &doc.document.sections[0].paragraphs[t_para].controls[t_ctrl] {
+        Control::Table(t) => t,
+        other => panic!("표가 아님: {other:?}"),
+    };
+    let mut found = None;
+    for p in &table.cells[0].paragraphs {
+        for (i, c) in p.controls.iter().enumerate() {
+            if matches!(c, Control::Picture(_)) {
+                found = Some((p, i));
+            }
+        }
+    }
+    let (cell_para, pic_idx) = found.expect("셀 안에 그림 컨트롤이 보존되어야 한다 (#1323)");
+    assert_eq!(
+        cell_para.ctrl_data_records.get(pic_idx).cloned().flatten(),
+        Some(vec![7, 7, 7]),
+        "CTRL_DATA가 controls 인덱스 정렬을 유지한 채 보존되어야 한다"
+    );
+}
+
+/// #1323: path 기반 셀 붙여넣기(paste_internal_in_cell_by_path)도 동일하게 그림을 보존한다.
+#[test]
+fn test_paste_picture_into_cell_by_path() {
+    use crate::model::control::Control;
+
+    let mut doc = create_doc_with_floating_picture(true, 0, 0);
+    doc.copy_control_native(0, 0, &[], 0).expect("그림 복사");
+
+    doc.create_table_ex_native(0, 1, 0, 2, 2, true, None, None)
+        .expect("표 생성");
+    let (t_para, t_ctrl) = find_table_pos(&doc);
+
+    // path = [(ctrl_idx, cell_idx, cell_para_idx)] — 셀 1의 문단 0에 붙여넣기
+    doc.paste_internal_in_cell_by_path_native(0, t_para, &[(t_ctrl, 1, 0)], 0)
+        .expect("path 기반 셀 붙여넣기");
+
+    let table = match &doc.document.sections[0].paragraphs[t_para].controls[t_ctrl] {
+        Control::Table(t) => t,
+        other => panic!("표가 아님: {other:?}"),
+    };
+    let pic_count: usize = table.cells[1]
+        .paragraphs
+        .iter()
+        .map(|p| {
+            p.controls
+                .iter()
+                .filter(|c| matches!(c, Control::Picture(_)))
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        pic_count, 1,
+        "path 기반 붙여넣기에서도 그림 컨트롤이 보존되어야 한다 (#1323)"
+    );
+}
+
+/// #1323: 그림 캡션 안 붙여넣기(Control::Picture 분기)도 컨트롤을 보존한다.
+#[test]
+fn test_paste_picture_into_picture_caption() {
+    use crate::model::control::Control;
+    use crate::model::shape::Caption;
+
+    let mut doc = create_doc_with_floating_picture(true, 0, 0);
+    doc.copy_control_native(0, 0, &[], 0).expect("그림 복사");
+
+    // 본문 그림에 캡션 부여
+    match &mut doc.document.sections[0].paragraphs[0].controls[0] {
+        Control::Picture(p) => {
+            p.caption = Some(Caption {
+                paragraphs: vec![Paragraph::default()],
+                ..Default::default()
+            });
+        }
+        other => panic!("그림이 아님: {other:?}"),
+    }
+
+    doc.paste_internal_in_cell_native(0, 0, 0, 0, 0, 0)
+        .expect("캡션에 그림 붙여넣기");
+
+    let caption = match &doc.document.sections[0].paragraphs[0].controls[0] {
+        Control::Picture(p) => p.caption.as_ref().expect("캡션 존재"),
+        other => panic!("그림이 아님: {other:?}"),
+    };
+    let pic_count: usize = caption
+        .paragraphs
+        .iter()
+        .map(|p| {
+            p.controls
+                .iter()
+                .filter(|c| matches!(c, Control::Picture(_)))
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        pic_count, 1,
+        "캡션 안에 붙여넣은 그림 컨트롤이 보존되어야 한다 (#1323)"
+    );
+}
+
+/// #1323 부수 해소: 본문 문단 시작 Backspace 병합 시 병합 대상 문단의 컨트롤이
+/// 보존되어야 한다 (수정 전에는 merge_from이 controls를 드롭).
+#[test]
+fn test_merge_paragraph_preserves_controls() {
+    use crate::model::control::Control;
+
+    let mut doc = create_doc_with_floating_picture(true, 0, 0);
+    // 문단 1에 텍스트 입력 후 문단 0(그림 문단)으로 병합
+    doc.insert_text_native(0, 1, 0, "가나")
+        .expect("텍스트 입력");
+    doc.merge_paragraph_native(0, 1).expect("문단 병합");
+
+    let para = &doc.document.sections[0].paragraphs[0];
+    assert_eq!(para.text, "가나");
+    assert_eq!(
+        para.controls
+            .iter()
+            .filter(|c| matches!(c, Control::Picture(_)))
+            .count(),
+        1,
+        "백스페이스 병합 시 그림 컨트롤이 보존되어야 한다 (#1323)"
+    );
+    assert_eq!(
+        para.control_text_positions(),
+        vec![0],
+        "그림은 병합된 텍스트 앞 위치를 유지해야 한다"
+    );
+}
+
+/// #1323 부수 해소: 셀 문단 시작 Backspace 병합(merge_paragraph_in_cell) 시
+/// 병합 대상 셀 문단의 컨트롤이 보존되어야 한다.
+#[test]
+fn test_merge_paragraph_in_cell_preserves_controls() {
+    use crate::model::control::Control;
+
+    let mut doc = create_doc_with_floating_picture(true, 0, 0);
+    doc.create_table_ex_native(0, 1, 0, 2, 2, true, None, None)
+        .expect("표 생성");
+    let (t_para, t_ctrl) = find_table_pos(&doc);
+
+    // 셀 0에 그림 문단을 두 번째 문단으로 구성
+    let pic_para = doc.document.sections[0].paragraphs[0].clone();
+    match &mut doc.document.sections[0].paragraphs[t_para].controls[t_ctrl] {
+        Control::Table(t) => t.cells[0].paragraphs.push(pic_para),
+        other => panic!("표가 아님: {other:?}"),
+    }
+
+    doc.merge_paragraph_in_cell_native(0, t_para, t_ctrl, 0, 1)
+        .expect("셀 문단 병합");
+
+    let table = match &doc.document.sections[0].paragraphs[t_para].controls[t_ctrl] {
+        Control::Table(t) => t,
+        other => panic!("표가 아님: {other:?}"),
+    };
+    assert_eq!(
+        table.cells[0].paragraphs.len(),
+        1,
+        "셀 문단이 병합되어야 한다"
+    );
+    assert_eq!(
+        table.cells[0].paragraphs[0]
+            .controls
+            .iter()
+            .filter(|c| matches!(c, Control::Picture(_)))
+            .count(),
+        1,
+        "셀 백스페이스 병합 시 그림 컨트롤이 보존되어야 한다 (#1323)"
+    );
+}
+
+/// #1323: 셀에 그림을 붙여넣은 문서가 HWP5 직렬화 → 재파싱 후에도 그림을 보존한다.
+/// (char_count 역산·char_offsets 갭 인코딩이 직렬화 계약과 정합함을 검증)
+#[test]
+fn test_paste_picture_into_table_cell_hwp5_roundtrip() {
+    use crate::model::control::Control;
+
+    let mut doc = create_doc_with_floating_picture(true, 0, 0);
+    doc.copy_control_native(0, 0, &[], 0).expect("그림 복사");
+    doc.create_table_ex_native(0, 1, 0, 2, 2, true, None, None)
+        .expect("표 생성");
+    let (t_para, t_ctrl) = find_table_pos(&doc);
+    doc.paste_internal_in_cell_native(0, t_para, t_ctrl, 0, 0, 0)
+        .expect("셀에 그림 붙여넣기");
+
+    let bytes = doc.export_hwp_native().expect("HWP5 직렬화");
+    let doc2 = HwpDocument::from_bytes(&bytes).expect("재파싱");
+
+    let mut found = false;
+    for p in &doc2.document.sections[0].paragraphs {
+        for c in &p.controls {
+            if let Control::Table(t) = c {
+                for cell_para in t.cells.iter().flat_map(|cl| cl.paragraphs.iter()) {
+                    if cell_para
+                        .controls
+                        .iter()
+                        .any(|cc| matches!(cc, Control::Picture(_)))
+                    {
+                        found = true;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        found,
+        "HWP5 round-trip 후에도 셀 안 그림 컨트롤이 보존되어야 한다 (#1323)"
+    );
+}
+
+/// #1323 시각 검증 보조: 표 셀/글상자에 붙여넣은 그림이 SVG 렌더링에 실제
+/// `<image>` 요소로 나타나는지 검증한다. BinData를 실제 등록(insert_picture)하여
+/// 렌더러가 data URI 이미지를 방출하는 경로를 그대로 사용한다.
+#[test]
+fn test_paste_picture_into_cell_and_textbox_renders_in_svg() {
+    fn minimal_png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x00, 0x00, 0x00,
+            0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+    fn parse_idx(res: &str, key: &str) -> usize {
+        res.split(&format!("\"{}\":", key))
+            .nth(1)
+            .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("missing {key} in {res}"))
+    }
+    fn count_images(svg: &str) -> usize {
+        svg.matches("<image").count()
+    }
+
+    let mut doc = create_doc_with_floating_picture(true, 0, 0);
+    // 헬퍼의 기본 그림은 BinData가 없으므로 실제 그림을 별도 삽입해 사용한다
+    let res = doc
+        .insert_picture_native(
+            0,
+            1,
+            0,
+            &[],
+            &minimal_png(),
+            5000,
+            5000,
+            1,
+            1,
+            "png",
+            "",
+            None,
+            None,
+        )
+        .expect("본문 그림 삽입");
+    let pic_para = parse_idx(&res, "paraIdx");
+    let pic_ctrl = parse_idx(&res, "controlIdx");
+
+    let svg_before = doc.render_page_svg_native(0).expect("기준 SVG 렌더");
+    let base = count_images(&svg_before);
+    assert!(base >= 1, "본문 그림이 SVG에 렌더되어야 한다: {base}");
+
+    doc.copy_control_native(0, pic_para, &[], pic_ctrl)
+        .expect("그림 복사");
+
+    // 표 셀에 붙여넣기 → <image> 1개 증가
+    // (기존 문단은 모두 그림 컨트롤을 보유하므로 표 전용 빈 문단을 추가)
+    doc.document.sections[0]
+        .paragraphs
+        .push(Paragraph::default());
+    let empty_para = doc.document.sections[0].paragraphs.len() - 1;
+    doc.create_table_ex_native(0, empty_para, 0, 2, 2, true, None, None)
+        .expect("표 생성");
+    let (t_para, t_ctrl) = find_table_pos(&doc);
+    doc.paste_internal_in_cell_native(0, t_para, t_ctrl, 0, 0, 0)
+        .expect("셀에 그림 붙여넣기");
+
+    let svg_cell = doc.render_page_svg_native(0).expect("셀 paste 후 SVG 렌더");
+    assert_eq!(
+        count_images(&svg_cell),
+        base + 1,
+        "셀에 붙여넣은 그림이 SVG에 렌더되어야 한다 (#1323)"
+    );
+
+    // 글상자에 붙여넣기 → <image> 1개 더 증가
+    let tb_res = doc
+        .create_shape_control_native(
+            0,
+            t_para,
+            0,
+            21600,
+            7200,
+            0,
+            0,
+            true,
+            "TopAndBottom",
+            "textbox",
+            false,
+            false,
+            &[],
+        )
+        .expect("글상자 생성");
+    let tb_para = parse_idx(&tb_res, "paraIdx");
+    let tb_ctrl = parse_idx(&tb_res, "controlIdx");
+    doc.paste_internal_in_cell_native(0, tb_para, tb_ctrl, 0, 0, 0)
+        .expect("글상자에 그림 붙여넣기");
+
+    let svg_tb = doc
+        .render_page_svg_native(0)
+        .expect("글상자 paste 후 SVG 렌더");
+    assert_eq!(
+        count_images(&svg_tb),
+        base + 2,
+        "글상자에 붙여넣은 그림이 SVG에 렌더되어야 한다 (#1323)"
     );
 }
 
@@ -13303,7 +14901,9 @@ fn test_save_picture() {
         border_opacity: ref_pic.border_opacity,
         instance_id: ref_pic.instance_id,
         raw_picture_extra: ref_pic.raw_picture_extra.clone(),
+        effects: ref_pic.effects.clone(),
         caption: None,
+        img_dim: (0, 0),
     };
 
     // 5. 문단 구성 (참조 파일: 단일 문단에 SectionDef + ColumnDef + Picture)
@@ -14489,7 +16089,9 @@ fn test_save_pic_in_table() {
         border_opacity: ref_pic.border_opacity,
         instance_id: ref_pic.instance_id,
         raw_picture_extra: ref_pic.raw_picture_extra.clone(),
+        effects: ref_pic.effects.clone(),
         caption: None,
+        img_dim: (0, 0),
     };
 
     // 6. 셀 내부 문단 구성 (cc=9: gso(8)+CR(1), mask=0x00000800)
@@ -16962,6 +18564,11 @@ fn test_delete_table_control() {
 
     // 삭제 전 char_count
     let before_char_count = doc.document.sections[0].paragraphs[3].char_count;
+    let before_next_vpos = doc.document.sections[0]
+        .paragraphs
+        .get(4)
+        .and_then(|p| p.line_segs.first())
+        .map(|ls| ls.vertical_pos);
 
     // 표 bbox 조회 성공 확인
     let bbox_result = doc.get_table_bbox_native(0, 3, 0);
@@ -16982,6 +18589,22 @@ fn test_delete_table_control() {
         before_char_count - 8,
         "char_count 8 감소 확인"
     );
+
+    if let (Some(before), Some(after)) = (
+        before_next_vpos,
+        doc.document.sections[0]
+            .paragraphs
+            .get(4)
+            .and_then(|p| p.line_segs.first())
+            .map(|ls| ls.vertical_pos),
+    ) {
+        assert!(
+            after < before,
+            "표 삭제 후 다음 문단 vpos가 위로 당겨져야 함: before={}, after={}",
+            before,
+            after
+        );
+    }
 
     eprintln!(
         "표 삭제: 컨트롤 {}→{}, char_count {}→{}",
@@ -21394,7 +23017,7 @@ fn test_logical_offset_insert_after_inline_table() {
 
     // offset=3 위치에 인라인 TAC 2×2 표 삽입
     let result = doc
-        .create_table_ex_native(0, 1, 3, 2, 2, true, Some(&[6777, 6777]))
+        .create_table_ex_native(0, 1, 3, 2, 2, true, Some(&[6777, 6777]), None)
         .unwrap();
     eprintln!("  createTableEx result: {}", result);
     // logicalOffset: "abc"(3) + [표](1) = 4
@@ -21461,7 +23084,7 @@ fn test_logical_offset_insert_after_inline_table() {
     // 새 문서에서 "가나다" + [표] 구조 생성, charOffset=4로 삽입
     doc.split_paragraph_native(0, 1, 6).unwrap(); // pi=2 생성
     doc.insert_text_native(0, 2, 0, "가나다").unwrap();
-    doc.create_table_ex_native(0, 2, 3, 1, 1, true, Some(&[5000]))
+    doc.create_table_ex_native(0, 2, 3, 1, 1, true, Some(&[5000]), None)
         .unwrap();
     let para2 = &doc.document.sections[0].paragraphs[2];
     let tl = para2.text.chars().count();
@@ -21509,7 +23132,7 @@ fn test_create_inline_tac_table() {
     // 4. pi=1, char_offset=text_len 위치에 인라인 TAC 2×2 표 생성
     // 열 폭: 6777 HU × 2 = 13554 HU (tac-case-001.hwp과 동일)
     let result = doc
-        .create_table_ex_native(0, 1, text_len, 2, 2, true, Some(&[6777, 6777]))
+        .create_table_ex_native(0, 1, text_len, 2, 2, true, Some(&[6777, 6777]), None)
         .unwrap();
     eprintln!("  createTableEx result: {}", result);
     assert!(
@@ -21557,7 +23180,9 @@ fn test_create_inline_tac_table() {
         .unwrap();
 
     // Enter → pi=2
-    let pi1_len = doc.document.sections[0].paragraphs[1].text.chars().count();
+    let pi1_len = crate::document_core::helpers::logical_paragraph_length(
+        &doc.document.sections[0].paragraphs[1],
+    );
     doc.split_paragraph_native(0, 1, pi1_len).unwrap();
     // pi=2에 텍스트
     doc.insert_text_native(0, 2, 0, "tacglkj 가나 옮").unwrap();
@@ -21656,4 +23281,406 @@ fn test_reflow_linesegs_empty_document_returns_zero() {
     let mut doc = HwpDocument::create_empty();
     let count = doc.reflow_linesegs();
     assert_eq!(count, 0);
+}
+
+// ---------- #1413: insertPictureEx(options object) 동치 ----------
+
+/// `insertPictureEx`(options JSON + image_data)가 positional `insertPicture` 와
+/// 동일하게 동작해야 한다. 같은 입력으로 두 문서에 각각 삽입 → 렌더 SVG 의 이미지
+/// 수와 반환 JSON 의 paraIdx/controlIdx 가 일치.
+#[test]
+fn task1413_insert_picture_ex_equivalent_to_positional() {
+    fn png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x00, 0x00, 0x00,
+            0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+    fn count_images(svg: &str) -> usize {
+        svg.matches("<image").count()
+    }
+
+    // positional 경로
+    let mut doc_pos = HwpDocument::create_empty();
+    let res_pos = doc_pos
+        .insert_picture(
+            0,
+            0,
+            0,
+            "",
+            &png(),
+            4000,
+            3000,
+            100,
+            80,
+            "png",
+            "",
+            None,
+            None,
+        )
+        .expect("positional insertPicture");
+
+    // *Ex 경로 — 동일 입력을 options JSON 으로
+    let mut doc_ex = HwpDocument::create_empty();
+    let options = r#"{"sectionIdx":0,"paraIdx":0,"charOffset":0,"cellPath":"",
+        "width":4000,"height":3000,"naturalWidthPx":100,"naturalHeightPx":80,
+        "extension":"png","description":""}"#;
+    let res_ex = doc_ex
+        .insert_picture_ex(options, &png())
+        .expect("insertPictureEx");
+
+    // 반환 JSON 동치 (paraIdx/controlIdx)
+    assert_eq!(res_pos, res_ex, "*Ex 반환이 positional 과 동일해야 함");
+
+    // 렌더 결과 동치 (이미지 수)
+    let svg_pos = doc_pos.render_page_svg_native(0).expect("svg pos");
+    let svg_ex = doc_ex.render_page_svg_native(0).expect("svg ex");
+    assert_eq!(
+        count_images(&svg_pos),
+        count_images(&svg_ex),
+        "*Ex 렌더 이미지 수가 positional 과 동일해야 함"
+    );
+    assert_eq!(count_images(&svg_ex), 1, "그림 1개 삽입");
+}
+
+/// options JSON 의 키 누락 시 positional default 와 동일 처리 (description/extension/
+/// paperOffset 부재).
+#[test]
+fn task1413_insert_picture_ex_optional_keys_default() {
+    fn png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x00, 0x00, 0x00,
+            0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+    // optional 키(extension/description/paperOffset/cellPath) 생략 — 본문 inline 삽입.
+    let mut doc = HwpDocument::create_empty();
+    let res = doc
+        .insert_picture_ex(
+            r#"{"sectionIdx":0,"paraIdx":0,"width":4000,"height":3000,"naturalWidthPx":100,"naturalHeightPx":80}"#,
+            &png(),
+        )
+        .expect("insertPictureEx with optional keys omitted");
+    assert!(
+        res.contains("\"ok\":true") || res.contains("paraIdx"),
+        "삽입 성공: {res}"
+    );
+}
+
+// ---------- #1413 2단계: 고인자(9~11) *Ex 동치 ----------
+
+/// splitTableCellInto vs splitTableCellIntoEx 동치.
+#[test]
+fn task1413_split_table_cell_into_ex_equivalent() {
+    let mut doc_pos = create_doc_with_table();
+    let res_pos = doc_pos
+        .split_table_cell_into(0, 0, 0, 0, 0, 2, 2, true, false)
+        .expect("positional splitTableCellInto");
+
+    let mut doc_ex = create_doc_with_table();
+    let res_ex = doc_ex
+        .split_table_cell_into_ex(
+            r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"row":0,"col":0,
+                "nRows":2,"mCols":2,"equalRowHeight":true,"mergeFirst":false}"#,
+        )
+        .expect("splitTableCellIntoEx");
+    assert_eq!(res_pos, res_ex, "*Ex 가 positional 과 동일 반환");
+}
+
+/// splitTableCellsInRange vs splitTableCellsInRangeEx 동치.
+#[test]
+fn task1413_split_table_cells_in_range_ex_equivalent() {
+    let mut doc_pos = create_doc_with_table();
+    let res_pos = doc_pos
+        .split_table_cells_in_range(0, 0, 0, 0, 0, 0, 0, 2, 2, true)
+        .expect("positional splitTableCellsInRange");
+
+    let mut doc_ex = create_doc_with_table();
+    let res_ex = doc_ex
+        .split_table_cells_in_range_ex(
+            r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"startRow":0,"startCol":0,
+                "endRow":0,"endCol":0,"nRows":2,"mCols":2,"equalRowHeight":true}"#,
+        )
+        .expect("splitTableCellsInRangeEx");
+    assert_eq!(res_pos, res_ex, "*Ex 가 positional 과 동일 반환");
+}
+
+/// insertClickHereFieldInCell vs insertClickHereFieldInCellEx 동치.
+#[test]
+fn task1413_insert_click_here_field_in_cell_ex_equivalent() {
+    let mut doc_pos = create_doc_with_table();
+    let res_pos = doc_pos
+        .insert_click_here_field_in_cell_api(0, 0, 0, 0, 0, 0, false, "안내", "메모", "이름", true)
+        .expect("positional insertClickHereFieldInCell");
+
+    let mut doc_ex = create_doc_with_table();
+    let res_ex = doc_ex
+        .insert_click_here_field_in_cell_ex(
+            r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"cellIdx":0,"cellParaIdx":0,
+                "charOffset":0,"isTextbox":false,"guide":"안내","memo":"메모","name":"이름","editable":true}"#,
+        )
+        .expect("insertClickHereFieldInCellEx");
+    assert_eq!(res_pos, res_ex, "*Ex 가 positional 과 동일 반환");
+}
+
+/// moveVertical vs moveVerticalEx 동치 (본문 — parentParaIdx 생략 = MAX).
+#[test]
+fn task1413_move_vertical_ex_equivalent() {
+    let mut doc_pos = HwpDocument::create_empty();
+    doc_pos
+        .insert_text_native(0, 0, 0, "첫째 줄\n둘째 줄\n셋째 줄")
+        .expect("텍스트 삽입");
+    let res_pos = doc_pos
+        .move_vertical(0, 0, 2, 1, 10.0, u32::MAX, 0, 0, 0)
+        .expect("positional moveVertical");
+
+    let mut doc_ex = HwpDocument::create_empty();
+    doc_ex
+        .insert_text_native(0, 0, 0, "첫째 줄\n둘째 줄\n셋째 줄")
+        .expect("텍스트 삽입");
+    let res_ex = doc_ex
+        .move_vertical_ex(
+            r#"{"sectionIdx":0,"paraIdx":0,"charOffset":2,"delta":1,"preferredX":10.0}"#,
+        )
+        .expect("moveVerticalEx");
+    assert_eq!(
+        res_pos, res_ex,
+        "*Ex 가 positional 과 동일 반환 (본문 이동)"
+    );
+}
+
+// ---------- #1413 3단계: 8인자 군 *Ex 동치 ----------
+
+#[test]
+fn task1413_set_page_hide_ex_equivalent() {
+    let mut doc_pos = HwpDocument::create_empty();
+    let res_pos = doc_pos
+        .set_page_hide(0, 0, true, false, true, false, true, false)
+        .expect("positional setPageHide");
+    let mut doc_ex = HwpDocument::create_empty();
+    let res_ex = doc_ex
+        .set_page_hide_ex(
+            r#"{"sec":0,"para":0,"hideHeader":true,"hideFooter":false,"hideMaster":true,
+                "hideBorder":false,"hideFill":true,"hidePageNum":false}"#,
+        )
+        .expect("setPageHideEx");
+    assert_eq!(res_pos, res_ex);
+}
+
+#[test]
+fn task1413_set_char_shape_id_in_cell_ex_equivalent() {
+    // char_shape_id=0 이 유효하려면 char_shapes 가 최소 1개 등록돼 있어야 한다
+    // (없으면 native 가 "범위 초과" Err → wasm JsValue 변환 패닉). 정상 입력으로 비교.
+    let mut doc_pos = create_doc_with_table();
+    doc_pos
+        .document
+        .doc_info
+        .char_shapes
+        .push(crate::model::style::CharShape::default());
+    let res_pos = doc_pos.set_char_shape_id_in_cell(0, 0, 0, 0, 0, 0, 0, 0);
+    let mut doc_ex = create_doc_with_table();
+    doc_ex
+        .document
+        .doc_info
+        .char_shapes
+        .push(crate::model::style::CharShape::default());
+    let res_ex = doc_ex.set_char_shape_id_in_cell_ex(
+        r#"{"secIdx":0,"parentParaIdx":0,"controlIdx":0,"cellIdx":0,"cellParaIdx":0,
+            "startOffset":0,"endOffset":0,"charShapeId":0}"#,
+    );
+    assert_eq!(format!("{res_pos:?}"), format!("{res_ex:?}"));
+}
+
+#[test]
+fn task1413_get_selection_rects_in_cell_ex_equivalent() {
+    let doc = create_doc_with_table();
+    let res_pos = doc.get_selection_rects_in_cell(0, 0, 0, 0, 0, 0, 0, 0);
+    let res_ex = doc.get_selection_rects_in_cell_ex(
+        r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"cellIdx":0,"startCellParaIdx":0,
+            "startCharOffset":0,"endCellParaIdx":0,"endCharOffset":0}"#,
+    );
+    assert_eq!(format!("{res_pos:?}"), format!("{res_ex:?}"));
+}
+
+#[test]
+fn task1413_export_selection_in_cell_html_ex_equivalent() {
+    let doc = create_doc_with_table();
+    let res_pos = doc.export_selection_in_cell_html(0, 0, 0, 0, 0, 0, 0, 0);
+    let res_ex = doc.export_selection_in_cell_html_ex(
+        r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"cellIdx":0,"startCellParaIdx":0,
+            "startCharOffset":0,"endCellParaIdx":0,"endCharOffset":0}"#,
+    );
+    assert_eq!(format!("{res_pos:?}"), format!("{res_ex:?}"));
+}
+
+#[test]
+fn task1413_delete_range_in_cell_ex_equivalent() {
+    let mut doc_pos = create_doc_with_table();
+    let res_pos = doc_pos.delete_range_in_cell(0, 0, 0, 0, 0, 0, 0, 0);
+    let mut doc_ex = create_doc_with_table();
+    let res_ex = doc_ex.delete_range_in_cell_ex(
+        r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"cellIdx":0,"startCellParaIdx":0,
+            "startCharOffset":0,"endCellParaIdx":0,"endCharOffset":0}"#,
+    );
+    assert_eq!(format!("{res_pos:?}"), format!("{res_ex:?}"));
+}
+
+#[test]
+fn task1413_copy_selection_in_cell_ex_equivalent() {
+    let mut doc_pos = create_doc_with_table();
+    let res_pos = doc_pos.copy_selection_in_cell(0, 0, 0, 0, 0, 0, 0, 0);
+    let mut doc_ex = create_doc_with_table();
+    let res_ex = doc_ex.copy_selection_in_cell_ex(
+        r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"cellIdx":0,"startCellParaIdx":0,
+            "startCharOffset":0,"endCellParaIdx":0,"endCharOffset":0}"#,
+    );
+    assert_eq!(format!("{res_pos:?}"), format!("{res_ex:?}"));
+}
+
+#[test]
+fn task1413_apply_char_format_in_cell_ex_equivalent() {
+    let props = r#"{"bold":true}"#;
+    let mut doc_pos = create_doc_with_table();
+    let res_pos = doc_pos.apply_char_format_in_cell(0, 0, 0, 0, 0, 0, 0, props);
+    let mut doc_ex = create_doc_with_table();
+    let res_ex = doc_ex.apply_char_format_in_cell_ex(
+        r#"{"secIdx":0,"parentParaIdx":0,"controlIdx":0,"cellIdx":0,"cellParaIdx":0,
+            "startOffset":0,"endOffset":0,"props":{"bold":true}}"#,
+    );
+    assert_eq!(format!("{res_pos:?}"), format!("{res_ex:?}"));
+}
+
+#[test]
+fn task1413_insert_click_here_field_by_path_ex_equivalent() {
+    // 유효 cell path(표 para 0, control 0, cell 0)로 셀 안에 삽입. positional 과 *Ex 동치.
+    // (빈 path 는 native 에서 에러 → wasm JsValue 변환 패닉이라 정상 path 를 쓴다.)
+    let path = r#"[{"controlIndex":0,"cellIndex":0,"cellParaIndex":0}]"#;
+    let mut doc_pos = create_doc_with_table();
+    let res_pos =
+        doc_pos.insert_click_here_field_by_path_api(0, 0, path, 0, "안내", "메모", "이름", true);
+    let mut doc_ex = create_doc_with_table();
+    let res_ex = doc_ex.insert_click_here_field_by_path_ex(
+        r#"{"sectionIdx":0,"parentParaIdx":0,"path":"[{\"controlIndex\":0,\"cellIndex\":0,\"cellParaIndex\":0}]","charOffset":0,"guide":"안내","memo":"메모","name":"이름","editable":true}"#,
+    );
+    assert_eq!(format!("{res_pos:?}"), format!("{res_ex:?}"));
+}
+
+// ---------- #1413 4단계: 7인자 군 *Ex 동치 (13개) ----------
+
+// 표 셀(para0/control0/cell0)에 정상 동작하는 *InCell 류. 반환 동일성 비교.
+#[test]
+fn task1413_insert_text_in_cell_ex_equivalent() {
+    let mut a = create_doc_with_table();
+    let rp = a.insert_text_in_cell(0, 0, 0, 0, 0, 0, "텍스트");
+    let mut b = create_doc_with_table();
+    let re = b.insert_text_in_cell_ex(
+        r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"cellIdx":0,"cellParaIdx":0,"charOffset":0,"text":"텍스트"}"#,
+    );
+    assert_eq!(format!("{rp:?}"), format!("{re:?}"));
+}
+
+#[test]
+fn task1413_get_text_in_cell_ex_equivalent() {
+    let a = create_doc_with_table();
+    let rp = a.get_text_in_cell(0, 0, 0, 0, 0, 0, 1);
+    let re = a.get_text_in_cell_ex(
+        r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"cellIdx":0,"cellParaIdx":0,"charOffset":0,"count":1}"#,
+    );
+    assert_eq!(format!("{rp:?}"), format!("{re:?}"));
+}
+
+#[test]
+fn task1413_delete_text_in_cell_ex_equivalent() {
+    let mut a = create_doc_with_table();
+    let rp = a.delete_text_in_cell(0, 0, 0, 0, 0, 0, 1);
+    let mut b = create_doc_with_table();
+    let re = b.delete_text_in_cell_ex(
+        r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"cellIdx":0,"cellParaIdx":0,"charOffset":0,"count":1}"#,
+    );
+    assert_eq!(format!("{rp:?}"), format!("{re:?}"));
+}
+
+#[test]
+fn task1413_paste_html_in_cell_ex_equivalent() {
+    let mut a = create_doc_with_table();
+    let rp = a.paste_html_in_cell(0, 0, 0, 0, 0, 0, "<p>x</p>");
+    let mut b = create_doc_with_table();
+    let re = b.paste_html_in_cell_ex(
+        r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"cellIdx":0,"cellParaIdx":0,"charOffset":0,"html":"<p>x</p>"}"#,
+    );
+    assert_eq!(format!("{rp:?}"), format!("{re:?}"));
+}
+
+#[test]
+fn task1413_merge_table_cells_ex_equivalent() {
+    let mut a = create_doc_with_table();
+    let rp = a.merge_table_cells(0, 0, 0, 0, 0, 0, 1);
+    let mut b = create_doc_with_table();
+    let re = b.merge_table_cells_ex(
+        r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"startRow":0,"startCol":0,"endRow":0,"endCol":1}"#,
+    );
+    assert_eq!(format!("{rp:?}"), format!("{re:?}"));
+}
+
+#[test]
+fn task1413_insert_click_here_field_ex_equivalent() {
+    let mut a = HwpDocument::create_empty();
+    a.insert_text_native(0, 0, 0, "abc").unwrap();
+    let rp = a.insert_click_here_field_api(0, 0, 0, "안내", "메모", "이름", true);
+    let mut b = HwpDocument::create_empty();
+    b.insert_text_native(0, 0, 0, "abc").unwrap();
+    let re = b.insert_click_here_field_ex(
+        r#"{"sectionIdx":0,"paraIdx":0,"charOffset":0,"guide":"안내","memo":"메모","name":"이름","editable":true}"#,
+    );
+    assert_eq!(format!("{rp:?}"), format!("{re:?}"));
+}
+
+// bool/String 반환 (JsValue 변환 없음 — 패닉 무관).
+#[test]
+fn task1413_set_active_field_in_cell_ex_equivalent() {
+    let mut a = create_doc_with_table();
+    let rp = a.set_active_field_in_cell_api(0, 0, 0, 0, 0, 0, false);
+    let mut b = create_doc_with_table();
+    let re = b.set_active_field_in_cell_ex(
+        r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"cellIdx":0,"cellParaIdx":0,"charOffset":0,"isTextbox":false}"#,
+    );
+    assert_eq!(rp, re);
+}
+
+#[test]
+fn task1413_get_field_info_at_in_cell_ex_equivalent() {
+    let a = create_doc_with_table();
+    let rp = a.get_field_info_at_in_cell_api(0, 0, 0, 0, 0, 0, false);
+    let re = a.get_field_info_at_in_cell_ex(
+        r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"cellIdx":0,"cellParaIdx":0,"charOffset":0,"isTextbox":false}"#,
+    );
+    assert_eq!(rp, re);
+}
+
+#[test]
+fn task1413_remove_field_at_in_cell_ex_equivalent() {
+    let mut a = create_doc_with_table();
+    let rp = a.remove_field_at_in_cell_api(0, 0, 0, 0, 0, 0, false);
+    let mut b = create_doc_with_table();
+    let re = b.remove_field_at_in_cell_ex(
+        r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"cellIdx":0,"cellParaIdx":0,"charOffset":0,"isTextbox":false}"#,
+    );
+    assert_eq!(rp, re);
+}
+
+#[test]
+fn task1413_evaluate_table_formula_ex_equivalent() {
+    let mut a = create_doc_with_table();
+    let rp = a.evaluate_table_formula(0, 0, 0, 0, 0, "=1+1", false);
+    let mut b = create_doc_with_table();
+    let re = b.evaluate_table_formula_ex(
+        r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"targetRow":0,"targetCol":0,"formula":"=1+1","writeResult":false}"#,
+    );
+    assert_eq!(format!("{rp:?}"), format!("{re:?}"));
 }

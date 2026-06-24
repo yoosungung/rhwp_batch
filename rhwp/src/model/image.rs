@@ -38,8 +38,15 @@ pub struct Picture {
     pub instance_id: u32,
     /// SHAPE_PICTURE 레코드의 파싱된 필드 이후 추가 바이트 (라운드트립 보존용)
     pub raw_picture_extra: Vec<u8>,
+    /// HWPX `<hp:effects>` 그림 효과 정보.
+    pub effects: PictureEffects,
     /// 캡션
     pub caption: Option<super::shape::Caption>,
+    /// HWPX `<hp:imgDim>` 원본 이미지 픽셀 크기 (#1389).
+    ///
+    /// imgClip extent 와 독립(전수 측정: 불일치 24/170) — 원본 이미지 픽셀 크기를
+    /// verbatim 보존한다. (dimwidth, dimheight). HWPX 파서만 적재.
+    pub img_dim: (u32, u32),
 }
 
 /// 자르기 정보
@@ -62,6 +69,8 @@ pub struct ImageAttr {
     pub effect: ImageEffect,
     /// BinData ID 참조
     pub bin_data_id: u16,
+    /// 그림 개체 전체 투명도. 한컴 UI 기준으로 0=불투명, 100=완전 투명.
+    pub transparency: u8,
     /// [Task #741] 외부 file path 그림 (HWP3 spec offset 74 그림 종류 0=외부 파일,
     /// 1=OLE, 2=Embedded Image / offset 83~339 그림 파일 이름).
     /// HWP3 외부 link 그림이고 binary 데이터 부재 시 placeholder 표시용.
@@ -69,7 +78,65 @@ pub struct ImageAttr {
     pub external_path: Option<String>,
 }
 
+/// HWPX 그림 효과 (`hp:effects`).
+#[derive(Debug, Clone, Default)]
+pub struct PictureEffects {
+    pub shadow: Option<PictureShadow>,
+}
+
+/// HWPX 그림 그림자 효과 (`hp:shadow`).
+#[derive(Debug, Clone, Default)]
+pub struct PictureShadow {
+    pub style: Option<String>,
+    pub alpha: Option<String>,
+    pub radius: Option<String>,
+    pub direction: Option<String>,
+    pub distance: Option<String>,
+    pub align_style: Option<String>,
+    pub rotation_style: Option<String>,
+    pub skew: Option<EffectPoint>,
+    pub scale: Option<EffectPoint>,
+    pub color: Option<EffectColor>,
+}
+
+/// HWPX 효과의 x/y 좌표성 값 (`hp:skew`, `hp:scale`).
+#[derive(Debug, Clone, Default)]
+pub struct EffectPoint {
+    pub x: Option<String>,
+    pub y: Option<String>,
+}
+
+/// HWPX 효과 색상 (`hp:effectsColor`).
+#[derive(Debug, Clone, Default)]
+pub struct EffectColor {
+    pub color_type: Option<String>,
+    pub scheme_idx: Option<String>,
+    pub system_idx: Option<String>,
+    pub preset_idx: Option<String>,
+    pub rgb: Option<EffectRgb>,
+}
+
+/// HWPX 효과 RGB 색상 (`hp:rgb`).
+#[derive(Debug, Clone, Default)]
+pub struct EffectRgb {
+    pub r: Option<String>,
+    pub g: Option<String>,
+    pub b: Option<String>,
+}
+
 impl ImageAttr {
+    pub fn clamped_transparency(&self) -> u8 {
+        self.transparency.min(100)
+    }
+
+    pub fn transparency_alpha_byte(&self) -> u8 {
+        transparency_percent_to_alpha_byte(self.clamped_transparency())
+    }
+
+    pub fn opacity(&self) -> f64 {
+        1.0 - (self.clamped_transparency() as f64 / 100.0)
+    }
+
     /// 워터마크 효과가 적용되어 있는지 식별 (Task #516, Issue #1156 정정).
     ///
     /// HWP/HWPX 에는 워터마크 적용을 나타내는 별도 비트/속성이 **존재하지 않는다**
@@ -90,6 +157,16 @@ impl ImageAttr {
             None
         }
     }
+}
+
+/// 한컴 UI 투명도(0~100%)를 HWP/HWPX 저장용 alpha byte(0~255)로 변환한다.
+pub fn transparency_percent_to_alpha_byte(transparency: u8) -> u8 {
+    ((transparency.min(100) as u16 * 255) / 100) as u8
+}
+
+/// HWP/HWPX 저장용 alpha byte(0~255)를 한컴 UI 투명도(0~100%)로 변환한다.
+pub fn alpha_byte_to_transparency_percent(alpha: u8) -> u8 {
+    ((alpha as f64 * 100.0) / 255.0).round().clamp(0.0, 100.0) as u8
 }
 
 /// 이미지 효과

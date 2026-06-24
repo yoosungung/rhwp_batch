@@ -133,6 +133,7 @@ fn parse_field_control(ctrl_id: u32, ctrl_data: &[u8]) -> Control {
         ctrl_data_name: None,
         memo_index,
         memo_paragraphs: Vec::new(),
+        raw_parameters_xml: None,
     })
 }
 
@@ -344,7 +345,7 @@ fn parse_cell(records: &[Record]) -> Cell {
     //   bit 2 (=property bit 18): 제목 셀
     //   bit 3 (=property bit 19): 양식모드 편집 가능
     // 현재 IR은 미해석 확장 bit를 분해하지 않고 list_header_width_ref 원값으로 보존한다.
-    cell.is_header = (cell.list_header_width_ref & 0x04) != 0;
+    cell.is_header = cell.list_header_width_ref & crate::model::table::CELL_FLAG_HEADER != 0;
 
     // 셀 속성 (표 82: 26바이트)
     cell.col = r.read_u16().unwrap_or(0);
@@ -370,7 +371,8 @@ fn parse_cell(records: &[Record]) -> Cell {
     // bit 0=1: 셀 고유 여백 사용 (파싱한 패딩값 그대로)
     // bit 0=0: 표 기본 여백 사용 — 단, 레이아웃 시 표 기본 패딩으로 대체
     // → 파싱 단계에서는 원본값을 보존하고, 레이아웃에서 처리
-    cell.apply_inner_margin = (cell.list_header_width_ref & 0x0001) != 0;
+    cell.apply_inner_margin =
+        cell.list_header_width_ref & crate::model::table::CELL_FLAG_HAS_MARGIN != 0;
 
     // 34바이트 이후 추가 데이터 보존 (라운드트립용)
     if r.remaining() > 0 {

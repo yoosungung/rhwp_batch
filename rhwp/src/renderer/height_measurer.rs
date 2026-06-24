@@ -9,7 +9,7 @@ use super::{hwpunit_to_px, DEFAULT_DPI};
 use crate::model::control::Control;
 use crate::model::footnote::{Footnote, FootnoteShape};
 use crate::model::paragraph::Paragraph;
-use crate::model::shape::Caption;
+use crate::model::shape::{Caption, CommonObjAttr, TextWrap, VertRelTo};
 use crate::model::table::{Table, TablePageBreak};
 
 /// treat_as_char 표가 인라인(텍스트와 나란히)인지 판별
@@ -189,6 +189,23 @@ impl HeightMeasurer {
 
     pub fn with_default_dpi() -> Self {
         Self::new(DEFAULT_DPI)
+    }
+
+    /// 셀 안 비-TAC 자리차지 개체가 표 흐름에 요구하는 세로 범위.
+    fn non_inline_control_flow_height(&self, common: &CommonObjAttr) -> f64 {
+        if common.treat_as_char || !matches!(common.text_wrap, TextWrap::TopAndBottom) {
+            return 0.0;
+        }
+        let object_height = hwpunit_to_px(common.height as i32, self.dpi);
+        if matches!(common.vert_rel_to, VertRelTo::Para) {
+            if common.flow_with_text {
+                hwpunit_to_px((common.vertical_offset as i32).max(0), self.dpi) + object_height
+            } else {
+                0.0
+            }
+        } else {
+            object_height
+        }
     }
 
     /// 구역의 모든 콘텐츠 높이를 측정한다.
@@ -514,22 +531,15 @@ impl HeightMeasurer {
     /// 문단들 내 비-인라인(treat_as_char가 아닌) 그림/도형의 높이 합계를 측정한다.
     /// LINE_SEG에는 비-인라인 컨트롤 높이가 포함되지 않으므로 별도 합산이 필요하다.
     fn measure_non_inline_controls_height(&self, paragraphs: &[Paragraph]) -> f64 {
-        use crate::model::shape::TextWrap;
         let mut total = 0.0;
         for para in paragraphs {
             for ctrl in &para.controls {
                 match ctrl {
-                    Control::Picture(pic)
-                        if !pic.common.treat_as_char
-                            && matches!(pic.common.text_wrap, TextWrap::TopAndBottom) =>
-                    {
-                        total += hwpunit_to_px(pic.common.height as i32, self.dpi);
+                    Control::Picture(pic) => {
+                        total += self.non_inline_control_flow_height(&pic.common);
                     }
-                    Control::Shape(shape)
-                        if !shape.common().treat_as_char
-                            && matches!(shape.common().text_wrap, TextWrap::TopAndBottom) =>
-                    {
-                        total += hwpunit_to_px(shape.common().height as i32, self.dpi);
+                    Control::Shape(shape) => {
+                        total += self.non_inline_control_flow_height(shape.common());
                     }
                     _ => {}
                 }
@@ -596,6 +606,51 @@ impl HeightMeasurer {
                     .sum::<f64>()
             })
             .sum()
+    }
+
+    /// 셀 내 중첩 표가 실제로 차지하는 하단 위치를 계산한다.
+    ///
+    /// 중첩 표가 있는 문단의 LINE_SEG.line_height는 표의 실제 높이를 담지 못하는
+    /// 문서가 있다. 이 경우 문단의 vertical_pos를 기준으로 중첩 표의 재귀 측정
+    /// 높이를 더해 셀 콘텐츠의 실제 끝점을 구한다.
+    fn cell_nested_controls_bottom(
+        &self,
+        paragraphs: &[Paragraph],
+        styles: &ResolvedStyleSet,
+        depth: usize,
+    ) -> f64 {
+        if depth >= Self::MAX_NESTED_DEPTH {
+            return 0.0;
+        }
+        paragraphs
+            .iter()
+            .map(|p| {
+                let nested_h: f64 = p
+                    .controls
+                    .iter()
+                    .filter_map(|ctrl| {
+                        if let Control::Table(nested) = ctrl {
+                            Some(
+                                self.measure_table_impl(nested, 0, 0, styles, depth + 1)
+                                    .total_height,
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                    .sum();
+                if nested_h <= 0.0 {
+                    0.0
+                } else {
+                    let para_top = p
+                        .line_segs
+                        .first()
+                        .map(|s| hwpunit_to_px(s.vertical_pos, self.dpi))
+                        .unwrap_or(0.0);
+                    para_top + nested_h
+                }
+            })
+            .fold(0.0f64, f64::max)
     }
 
     /// 표의 높이를 측정한다 (depth 기반 재귀).
@@ -682,31 +737,24 @@ impl HeightMeasurer {
                 let r = cell.row as usize;
                 // 셀 패딩 — layout 의 resolve_cell_padding 과 일관성:
                 //   aim=true  → cell.padding (0 도 명시값으로 존중)
-                //   aim=false → 기본은 table.padding, 단 cell > table 인 비대칭 축만 cell 우선
-                let prefer_cell_axis = |c: i16, t: i16| -> bool {
-                    if cell.apply_inner_margin {
-                        c != 0
-                    } else {
-                        (c as i32) > (t as i32)
-                    }
-                };
-                let pad_top = if prefer_cell_axis(cell.padding.top, table.padding.top) {
+                //   aim=false → table.padding
+                let pad_top = if cell.apply_inner_margin {
                     hwpunit_to_px(cell.padding.top as i32, self.dpi)
                 } else {
                     hwpunit_to_px(table.padding.top as i32, self.dpi)
                 };
-                let pad_bottom = if prefer_cell_axis(cell.padding.bottom, table.padding.bottom) {
+                let pad_bottom = if cell.apply_inner_margin {
                     hwpunit_to_px(cell.padding.bottom as i32, self.dpi)
                 } else {
                     hwpunit_to_px(table.padding.bottom as i32, self.dpi)
                 };
                 // [Task #671] 좌우 패딩 — recompose_for_cell_width 의 inner_width 계산용
-                let pad_left = if prefer_cell_axis(cell.padding.left, table.padding.left) {
+                let pad_left = if cell.apply_inner_margin {
                     hwpunit_to_px(cell.padding.left as i32, self.dpi)
                 } else {
                     hwpunit_to_px(table.padding.left as i32, self.dpi)
                 };
-                let pad_right = if prefer_cell_axis(cell.padding.right, table.padding.right) {
+                let pad_right = if cell.apply_inner_margin {
                     hwpunit_to_px(cell.padding.right as i32, self.dpi)
                 } else {
                     hwpunit_to_px(table.padding.right as i32, self.dpi)
@@ -836,7 +884,11 @@ impl HeightMeasurer {
                         .map(|s| s.vertical_pos + s.line_height)
                         .max()
                         .unwrap_or(0);
-                    hwpunit_to_px(last_seg_end, self.dpi).max(text_height)
+                    let nested_bottom =
+                        self.cell_nested_controls_bottom(&cell.paragraphs, styles, depth);
+                    hwpunit_to_px(last_seg_end, self.dpi)
+                        .max(text_height)
+                        .max(nested_bottom)
                 } else {
                     // 단, 비-인라인 이미지/도형은 LINE_SEG에 미포함이므로 별도 합산
                     let non_inline_h = self.measure_non_inline_controls_height(&cell.paragraphs);
@@ -923,43 +975,27 @@ impl HeightMeasurer {
             let r = cell.row as usize;
             let span = cell.row_span as usize;
             if span > 1 && r + span <= row_count {
-                let (pad_top, pad_bottom) = if !cell.apply_inner_margin {
+                let (pad_top, pad_bottom) = if cell.apply_inner_margin {
+                    (
+                        hwpunit_to_px(cell.padding.top as i32, self.dpi),
+                        hwpunit_to_px(cell.padding.bottom as i32, self.dpi),
+                    )
+                } else {
                     (
                         hwpunit_to_px(table.padding.top as i32, self.dpi),
                         hwpunit_to_px(table.padding.bottom as i32, self.dpi),
                     )
-                } else {
-                    (
-                        if cell.padding.top != 0 {
-                            hwpunit_to_px(cell.padding.top as i32, self.dpi)
-                        } else {
-                            hwpunit_to_px(table.padding.top as i32, self.dpi)
-                        },
-                        if cell.padding.bottom != 0 {
-                            hwpunit_to_px(cell.padding.bottom as i32, self.dpi)
-                        } else {
-                            hwpunit_to_px(table.padding.bottom as i32, self.dpi)
-                        },
-                    )
                 };
                 // [Task #671] 좌우 패딩 (recompose_for_cell_width inner_width 계산용)
-                let (pad_left, pad_right) = if !cell.apply_inner_margin {
+                let (pad_left, pad_right) = if cell.apply_inner_margin {
+                    (
+                        hwpunit_to_px(cell.padding.left as i32, self.dpi),
+                        hwpunit_to_px(cell.padding.right as i32, self.dpi),
+                    )
+                } else {
                     (
                         hwpunit_to_px(table.padding.left as i32, self.dpi),
                         hwpunit_to_px(table.padding.right as i32, self.dpi),
-                    )
-                } else {
-                    (
-                        if cell.padding.left != 0 {
-                            hwpunit_to_px(cell.padding.left as i32, self.dpi)
-                        } else {
-                            hwpunit_to_px(table.padding.left as i32, self.dpi)
-                        },
-                        if cell.padding.right != 0 {
-                            hwpunit_to_px(cell.padding.right as i32, self.dpi)
-                        } else {
-                            hwpunit_to_px(table.padding.right as i32, self.dpi)
-                        },
                     )
                 };
                 let cell_w_px = if cell.width < 0x80000000 {
@@ -1071,7 +1107,9 @@ impl HeightMeasurer {
                 // controls_height를 별도로 더하면 이중 계산됨
                 // 단, 비-인라인 이미지/도형은 LINE_SEG에 미포함이므로 별도 합산
                 let non_inline_h = self.measure_non_inline_controls_height(&cell.paragraphs);
-                let content_height = text_height + non_inline_h;
+                let nested_bottom =
+                    self.cell_nested_controls_bottom(&cell.paragraphs, styles, depth);
+                let content_height = (text_height + non_inline_h).max(nested_bottom);
                 let required_height = content_height + pad_top + pad_bottom;
                 let combined: f64 = (r..r + span).map(|i| row_heights[i]).sum();
                 if required_height > combined {
@@ -1166,12 +1204,12 @@ impl HeightMeasurer {
                 .iter()
                 .filter(|cell| (cell.row as usize) < row_count)
                 .map(|cell| {
-                    let pad_top = if cell.padding.top != 0 {
+                    let pad_top = if cell.apply_inner_margin {
                         hwpunit_to_px(cell.padding.top as i32, self.dpi)
                     } else {
                         hwpunit_to_px(table.padding.top as i32, self.dpi)
                     };
-                    let pad_bottom = if cell.padding.bottom != 0 {
+                    let pad_bottom = if cell.apply_inner_margin {
                         hwpunit_to_px(cell.padding.bottom as i32, self.dpi)
                     } else {
                         hwpunit_to_px(table.padding.bottom as i32, self.dpi)
@@ -1304,23 +1342,9 @@ impl HeightMeasurer {
                     .iter()
                     .find(|c| c.row as usize == mc.row && c.col as usize == mc.col)
                     .unwrap();
-                let nested_h: f64 = cell
-                    .paragraphs
-                    .iter()
-                    .flat_map(|p| p.controls.iter())
-                    .filter_map(|c| {
-                        if let Control::Table(t) = c {
-                            Some(t.as_ref())
-                        } else {
-                            None
-                        }
-                    })
-                    .map(|t| {
-                        self.measure_table_impl(t, 0, 0, styles, depth + 1)
-                            .total_height
-                    })
-                    .sum();
-                mc.total_content_height = nested_h.max(mc.total_content_height);
+                let nested_bottom =
+                    self.cell_nested_controls_bottom(&cell.paragraphs, styles, depth);
+                mc.total_content_height = nested_bottom.max(mc.total_content_height);
             }
         }
 
@@ -1963,13 +1987,13 @@ impl HeightMeasurer {
 
         // 기본값: FootnoteShape이 없으면 기본 여백 사용
         let separator_margin_top = footnote_shape
-            .map(|s| hwpunit_to_px(s.separator_margin_top as i32, self.dpi))
+            .map(|s| hwpunit_to_px(s.separator_above_margin_hu() as i32, self.dpi))
             .unwrap_or(8.0); // 약 0.6mm
         let separator_margin_bottom = footnote_shape
-            .map(|s| hwpunit_to_px(s.separator_margin_bottom as i32, self.dpi))
+            .map(|s| hwpunit_to_px(s.separator_below_margin_hu() as i32, self.dpi))
             .unwrap_or(4.0); // 약 0.3mm
         let note_spacing = footnote_shape
-            .map(|s| hwpunit_to_px(s.note_spacing as i32, self.dpi))
+            .map(|s| hwpunit_to_px(s.between_notes_margin_hu() as i32, self.dpi))
             .unwrap_or(2.0); // 약 0.15mm
         let separator_height = 1.0; // 구분선 두께 (1px)
 

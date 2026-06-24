@@ -535,6 +535,41 @@ mod tests {
     }
 
     #[test]
+    fn font_resolution_without_shaping_proof_never_emits_public_glyph_runs() {
+        let mut root = LayerNode::leaf(
+            BoundingBox::new(0.0, 0.0, 100.0, 100.0),
+            None,
+            vec![PaintOp::TextRun {
+                bbox: BoundingBox::new(0.0, 0.0, 20.0, 20.0),
+                run: text_run("A"),
+            }],
+        );
+        let lowerer = TextShapeLowerer::new(&PortableResolver);
+        let report = lowerer.lower_root(&mut root);
+
+        assert_eq!(report.public_glyph_run_count(), 0);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert!(report.diagnostics[0].attempted);
+        assert_eq!(
+            report.diagnostics[0].replay_eligibility,
+            GlyphRunReplayEligibility::Portable
+        );
+        assert_eq!(
+            report.diagnostics[0].quality,
+            GlyphRunQuality::DiagnosticOnly
+        );
+        assert_eq!(
+            report.diagnostics[0].reason.as_deref(),
+            Some("diagnosticsOnlySkeleton")
+        );
+        let LayerNodeKind::Leaf { ops } = &root.kind else {
+            panic!("expected leaf root");
+        };
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], PaintOp::TextRun { .. }));
+    }
+
+    #[test]
     fn lowerer_emits_public_glyph_run_only_from_exportable_shaped_data() {
         let mut root = LayerNode::leaf(
             BoundingBox::new(0.0, 0.0, 100.0, 100.0),

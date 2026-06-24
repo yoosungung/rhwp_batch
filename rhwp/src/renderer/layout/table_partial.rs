@@ -548,6 +548,7 @@ impl LayoutEngine {
                 &composed_paras,
                 &cell.paragraphs,
                 styles,
+                cell.apply_inner_margin,
             );
             pad_left = new_pl;
             pad_right = new_pr;
@@ -683,13 +684,19 @@ impl LayoutEngine {
                         &cell.paragraphs,
                         styles,
                     );
-                    vpos_h.max(line_h)
+                    let nested_bottom =
+                        self.calc_nested_controls_bottom_height(&cell.paragraphs, styles);
+                    vpos_h
+                        .max(line_h)
+                        .max(nested_bottom)
+                        .max(self.calc_non_inline_controls_flow_height(&cell.paragraphs))
                 } else {
                     self.calc_composed_paras_content_height(
                         &composed_paras,
                         &cell.paragraphs,
                         styles,
                     )
+                    .max(self.calc_non_inline_controls_flow_height(&cell.paragraphs))
                 }
             };
 
@@ -879,7 +886,7 @@ impl LayoutEngine {
                         section_index,
                         cp_idx,
                         Some(cell_context.clone()),
-                        false,
+                        !matches!(effective_align, VerticalAlign::Top),
                         is_last_para,
                         0.0,
                         None,
@@ -976,28 +983,109 @@ impl LayoutEngine {
                                     }
                                     inline_x += pic_w;
                                 } else {
-                                    // 비인라인 이미지: 기존 동작
-                                    let pic_area = LayoutRect {
-                                        y: para_y,
-                                        height: (inner_area.height - (para_y - inner_area.y))
+                                    // 비인라인 이미지: TopAndBottom+Para 는 row height 증가와
+                                    // 무관하게 LINE_SEG 기준 anchor 를 유지한다.
+                                    let anchor_y = if matches!(
+                                        pic.common.text_wrap,
+                                        crate::model::shape::TextWrap::TopAndBottom
+                                    ) && matches!(
+                                        pic.common.vert_rel_to,
+                                        crate::model::shape::VertRelTo::Para
+                                    ) {
+                                        para.line_segs
+                                            .first()
+                                            .filter(|seg| seg.vertical_pos >= 0)
+                                            .map(|seg| {
+                                                cell_y
+                                                    + pad_top
+                                                    + hwpunit_to_px(seg.vertical_pos, self.dpi)
+                                            })
+                                            .unwrap_or(para_y_before_compose)
+                                    } else {
+                                        para_y
+                                    };
+                                    let pic_w = hwpunit_to_px(pic.common.width as i32, self.dpi);
+                                    let pic_h = hwpunit_to_px(pic.common.height as i32, self.dpi);
+                                    let unrestricted_take_place_cell_float =
+                                        !pic.common.flow_with_text
+                                            && matches!(
+                                                pic.common.text_wrap,
+                                                crate::model::shape::TextWrap::TopAndBottom
+                                            )
+                                            && matches!(
+                                                pic.common.vert_rel_to,
+                                                crate::model::shape::VertRelTo::Para
+                                            );
+                                    let picture_anchor_y = if unrestricted_take_place_cell_float {
+                                        anchor_y
+                                            - pic_h
+                                            - hwpunit_to_px(
+                                                pic.common.vertical_offset as i32,
+                                                self.dpi,
+                                            )
+                                    } else {
+                                        anchor_y
+                                    };
+                                    let cell_area = LayoutRect {
+                                        y: picture_anchor_y,
+                                        height: (inner_area.height
+                                            - (picture_anchor_y - inner_area.y))
                                             .max(0.0),
                                         ..inner_area
                                     };
-                                    // [Task #1151 v4] 셀 안 non-inline picture (partial 표 path).
-                                    self.layout_picture(
-                                        tree,
-                                        &mut cell_node,
-                                        pic,
-                                        &pic_area,
-                                        bin_data_content,
+                                    let (pic_x, pic_y) = self.compute_object_position(
+                                        &pic.common,
+                                        pic_w,
+                                        pic_h,
+                                        &cell_area,
+                                        &inner_area,
+                                        &inner_area,
+                                        &inner_area,
+                                        picture_anchor_y,
                                         para_alignment,
-                                        Some(section_index),
-                                        Some(cell_context.parent_para_index),
-                                        Some(ctrl_idx),
-                                        Some(&cell_context),
                                     );
-                                    let pic_h = hwpunit_to_px(pic.common.height as i32, self.dpi);
-                                    para_y += pic_h;
+                                    let pic_area = LayoutRect {
+                                        x: pic_x,
+                                        y: pic_y,
+                                        width: pic_w,
+                                        height: pic_h,
+                                    };
+                                    let mut pic_for_layout = pic.clone();
+                                    pic_for_layout.common.horizontal_offset = 0;
+                                    pic_for_layout.common.vertical_offset = 0;
+                                    pic_for_layout.common.horz_align =
+                                        crate::model::shape::HorzAlign::Left;
+                                    pic_for_layout.common.vert_align =
+                                        crate::model::shape::VertAlign::Top;
+                                    // [Task #1151 v4] 셀 안 non-inline picture (partial 표 path).
+                                    if unrestricted_take_place_cell_float {
+                                        self.layout_picture(
+                                            tree,
+                                            &mut table_node,
+                                            &pic_for_layout,
+                                            &pic_area,
+                                            bin_data_content,
+                                            Alignment::Left,
+                                            Some(section_index),
+                                            Some(cell_context.parent_para_index),
+                                            Some(ctrl_idx),
+                                            Some(&cell_context),
+                                        );
+                                    } else {
+                                        self.layout_picture(
+                                            tree,
+                                            &mut cell_node,
+                                            &pic_for_layout,
+                                            &pic_area,
+                                            bin_data_content,
+                                            Alignment::Left,
+                                            Some(section_index),
+                                            Some(cell_context.parent_para_index),
+                                            Some(ctrl_idx),
+                                            Some(&cell_context),
+                                        );
+                                    }
+                                    para_y += self.non_inline_control_flow_height(&pic.common);
                                 }
                                 has_preceding_text = true;
                             }

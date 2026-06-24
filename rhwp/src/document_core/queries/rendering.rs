@@ -295,6 +295,40 @@ impl DocumentCore {
         Ok(renderer.output().to_string())
     }
 
+    /// PDF export for one page, implemented as the current compatibility path:
+    /// SVG render output -> svg2pdf.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn render_page_pdf_native(&self, page_num: u32) -> Result<Vec<u8>, HwpError> {
+        self.render_pages_pdf_native(&[page_num])
+    }
+
+    /// PDF export for an explicit 0-based page selection.
+    ///
+    /// This keeps PDF as a native/export API surface rather than a WASM render path.
+    /// The implementation intentionally reuses the SVG compatibility output until a
+    /// direct/vector PDF backend is introduced.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn render_pages_pdf_native(&self, page_nums: &[u32]) -> Result<Vec<u8>, HwpError> {
+        if page_nums.is_empty() {
+            return Err(HwpError::RenderError(
+                "PDF export requires at least one page".to_string(),
+            ));
+        }
+
+        let mut svg_pages = Vec::with_capacity(page_nums.len());
+        for &page_num in page_nums {
+            svg_pages.push(self.render_page_svg_native(page_num)?);
+        }
+        crate::renderer::pdf::svgs_to_pdf(&svg_pages).map_err(HwpError::RenderError)
+    }
+
+    /// PDF export for the full document.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn render_document_pdf_native(&self) -> Result<Vec<u8>, HwpError> {
+        let pages: Vec<u32> = (0..self.page_count()).collect();
+        self.render_pages_pdf_native(&pages)
+    }
+
     /// SVG 렌더링 (폰트 임베딩 옵션 포함)
     #[cfg(not(target_arch = "wasm32"))]
     pub fn render_page_svg_with_fonts(
@@ -725,6 +759,10 @@ impl DocumentCore {
                 image.brightness, image.contrast
             );
             write_json_str(buf, wrap_str(wrap));
+            let opacity = image.opacity.clamp(0.0, 1.0);
+            if opacity < 1.0 {
+                let _ = write!(buf, ",\"opacity\":{:.6}", opacity);
+            }
 
             if let Some((left, top, right, bottom)) = image.crop {
                 let _ = write!(
@@ -739,6 +777,7 @@ impl DocumentCore {
                 contrast: image.contrast,
                 effect: image.effect,
                 bin_data_id: image.bin_data_id,
+                transparency: 0,
                 external_path: None,
             };
             if let Some(preset) = attr.watermark_preset() {
@@ -1508,6 +1547,35 @@ impl DocumentCore {
 
         // 렌더 트리에서 Table, Image 노드를 재귀적으로 수집
         fn collect_controls(node: &RenderNode, controls: &mut Vec<String>) {
+            // [Task #1280 v2] 컨트롤별 plane/zOrder/stableIndex 노출 — 렌더 정렬키
+            // `paper_node_sort_key`(layout.rs)를 그대로 재사용해 프런트 히트테스트가
+            // 겹침 시 "최상단 개체"를 선택할 수 있게 한다. inline(layer=None) 노드는
+            // (plane=2, z=0, stable=node.id) 폴백으로 렌더 정렬과 동일.
+            let (plane, z_order, stable_index) =
+                crate::renderer::layout::LayoutEngine::paper_node_sort_key(node);
+            // wrap 은 이미지뿐 아니라 shape/line/group/path 에도 노출(히트테스트 plane/wrap 일관성).
+            // 이미지는 자체 wrap_str(image_node.text_wrap)을 방출하므로 중복 방지로 제외한다.
+            let wrap_extra = if matches!(node.node_type, RenderNodeType::Image(_)) {
+                ""
+            } else {
+                match node.layer.and_then(|l| l.text_wrap) {
+                    Some(crate::model::shape::TextWrap::BehindText) => ",\"wrap\":\"behindText\"",
+                    Some(crate::model::shape::TextWrap::InFrontOfText) => {
+                        ",\"wrap\":\"inFrontOfText\""
+                    }
+                    Some(crate::model::shape::TextWrap::Square) => ",\"wrap\":\"square\"",
+                    Some(crate::model::shape::TextWrap::Tight) => ",\"wrap\":\"tight\"",
+                    Some(crate::model::shape::TextWrap::Through) => ",\"wrap\":\"through\"",
+                    Some(crate::model::shape::TextWrap::TopAndBottom) => {
+                        ",\"wrap\":\"topAndBottom\""
+                    }
+                    None => "",
+                }
+            };
+            let layer_str = format!(
+                ",\"plane\":{},\"zOrder\":{},\"stableIndex\":{}{}",
+                plane, z_order, stable_index, wrap_extra
+            );
             match &node.node_type {
                 RenderNodeType::Table(table_node) => {
                     // 문서 좌표
@@ -1539,10 +1607,10 @@ impl DocumentCore {
                     }
 
                     controls.push(format!(
-                        "{{\"type\":\"table\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"rowCount\":{},\"colCount\":{}{},\"cells\":[{}]}}",
+                        "{{\"type\":\"table\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"rowCount\":{},\"colCount\":{}{}{},\"cells\":[{}]}}",
                         node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
                         table_node.row_count, table_node.col_count,
-                        doc_coords,
+                        doc_coords, layer_str,
                         cells.join(",")
                     ));
                     // Table 내부도 탐색 (셀 내 수식 등 수집)
@@ -1580,9 +1648,9 @@ impl DocumentCore {
                     });
 
                     controls.push(format!(
-                        "{{\"type\":\"equation\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1}{}{}{}}}",
+                        "{{\"type\":\"equation\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1}{}{}{}{}}}",
                         node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
-                        doc_coords, cell_coords, note_ref
+                        doc_coords, cell_coords, note_ref, layer_str
                     ));
                     return;
                 }
@@ -1670,9 +1738,9 @@ impl DocumentCore {
                         None => String::new(),
                     };
                     controls.push(format!(
-                        "{{\"type\":\"image\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1}{}{}{}{}{}{}}}",
+                        "{{\"type\":\"image\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1}{}{}{}{}{}{}{}}}",
                         node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
-                        doc_coords, wrap_str, hf_str, cell_str, outer_table_str, cell_path_str
+                        doc_coords, wrap_str, hf_str, cell_str, outer_table_str, cell_path_str, layer_str
                     ));
                     return;
                 }
@@ -1683,9 +1751,9 @@ impl DocumentCore {
                         group_node.control_index,
                     ) {
                         controls.push(format!(
-                            "{{\"type\":\"group\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}}}",
+                            "{{\"type\":\"group\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}{}}}",
                             node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
-                            si, pi, ci
+                            si, pi, ci, layer_str
                         ));
                         return; // 자식 개별 수집하지 않음 — 묶음 전체가 하나의 컨트롤
                     }
@@ -1709,9 +1777,9 @@ impl DocumentCore {
                             None => String::new(),
                         };
                         controls.push(format!(
-                            "{{\"type\":\"shape\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}{}{}}}",
+                            "{{\"type\":\"shape\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}{}{}{}}}",
                             node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
-                            si, pi, ci, cell_str, outer_table_str
+                            si, pi, ci, cell_str, outer_table_str, layer_str
                         ));
                         // [Task #1171] return 하지 않고 자식으로 재귀 — 사각형 글상자(text_box)
                         // 안 중첩 picture/도형이 cellPath(cell_index=0 sentinel)로 수집되도록 한다.
@@ -1737,10 +1805,10 @@ impl DocumentCore {
                             None => String::new(),
                         };
                         controls.push(format!(
-                            "{{\"type\":\"line\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"x1\":{:.1},\"y1\":{:.1},\"x2\":{:.1},\"y2\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}{}{}}}",
+                            "{{\"type\":\"line\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"x1\":{:.1},\"y1\":{:.1},\"x2\":{:.1},\"y2\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}{}{}{}}}",
                             node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
                             line_node.x1, line_node.y1, line_node.x2, line_node.y2,
-                            si, pi, ci, cell_str, outer_table_str
+                            si, pi, ci, cell_str, outer_table_str, layer_str
                         ));
                         return;
                     }
@@ -1763,9 +1831,9 @@ impl DocumentCore {
                             None => String::new(),
                         };
                         controls.push(format!(
-                            "{{\"type\":\"shape\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}{}{}}}",
+                            "{{\"type\":\"shape\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}{}{}{}}}",
                             node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
-                            si, pi, ci, cell_str, outer_table_str
+                            si, pi, ci, cell_str, outer_table_str, layer_str
                         ));
                         return;
                     }
@@ -1790,16 +1858,16 @@ impl DocumentCore {
                         if let Some((x1, y1, x2, y2)) = path_node.connector_endpoints {
                             // 연결선: 선 선택 방식 (시작/끝 좌표 포함)
                             controls.push(format!(
-                                "{{\"type\":\"line\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"x1\":{:.1},\"y1\":{:.1},\"x2\":{:.1},\"y2\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}{}{}}}",
+                                "{{\"type\":\"line\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"x1\":{:.1},\"y1\":{:.1},\"x2\":{:.1},\"y2\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}{}{}{}}}",
                                 node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
                                 x1, y1, x2, y2,
-                                si, pi, ci, cell_str, outer_table_str
+                                si, pi, ci, cell_str, outer_table_str, layer_str
                             ));
                         } else {
                             controls.push(format!(
-                                "{{\"type\":\"shape\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}{}{}}}",
+                                "{{\"type\":\"shape\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}{}{}{}}}",
                                 node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
-                                si, pi, ci, cell_str, outer_table_str
+                                si, pi, ci, cell_str, outer_table_str, layer_str
                             ));
                         }
                         return;
@@ -2046,6 +2114,8 @@ impl DocumentCore {
                 endnote_paragraphs: Vec::new(),
                 endnote_para_sources: Vec::new(),
                 endnote_between_notes_hu: 0,
+                endnote_separator_above_hu: 0,
+                endnote_separator_below_hu: 0,
             });
         }
         self.pagination.truncate(sec_count);
@@ -2755,6 +2825,25 @@ impl DocumentCore {
                     ));
 
                     for item in &cc.items {
+                        let endnote_source_info = |para_index: usize| -> String {
+                            if para_index < body_len {
+                                return String::new();
+                            }
+                            let local = para_index - body_len;
+                            pr.endnote_para_sources
+                                .get(local)
+                                .map(|src| {
+                                    format!(
+                                        " src=s{}:p{}:ci{}:note{}",
+                                        src.section_index,
+                                        src.para_index,
+                                        src.control_index,
+                                        src.note_para_index
+                                    )
+                                })
+                                .unwrap_or_default()
+                        };
+
                         match item {
                             PageItem::FullParagraph { para_index } => {
                                 let text_preview = paragraphs
@@ -2794,14 +2883,23 @@ impl DocumentCore {
                                     .unwrap_or_default();
                                 let vpos_info =
                                     format_vpos_range(paragraphs.get(*para_index), None, None);
+                                let line_seg_info =
+                                    format_line_seg_brief(paragraphs.get(*para_index));
+                                let source_info = endnote_source_info(*para_index);
                                 let kind = if *para_index >= body_len {
                                     "FullParagraph[미주]"
                                 } else {
                                     "FullParagraph"
                                 };
                                 out.push_str(&format!(
-                                    "    {}  pi={}  {}  {}  \"{}\"\n",
-                                    kind, para_index, height, vpos_info, text_preview
+                                    "    {}  pi={}  {}  {}{}  {}  \"{}\"\n",
+                                    kind,
+                                    para_index,
+                                    height,
+                                    vpos_info,
+                                    source_info,
+                                    line_seg_info,
+                                    text_preview
                                 ));
                             }
                             PageItem::PartialParagraph {
@@ -2814,9 +2912,17 @@ impl DocumentCore {
                                     Some(*start_line),
                                     Some(*end_line),
                                 );
+                                let line_seg_info =
+                                    format_line_seg_brief(paragraphs.get(*para_index));
+                                let source_info = endnote_source_info(*para_index);
                                 out.push_str(&format!(
-                                    "    PartialParagraph  pi={}  lines={}..{}  {}\n",
-                                    para_index, start_line, end_line, vpos_info
+                                    "    PartialParagraph  pi={}  lines={}..{}  {}{}  {}\n",
+                                    para_index,
+                                    start_line,
+                                    end_line,
+                                    vpos_info,
+                                    source_info,
+                                    line_seg_info
                                 ));
                             }
                             PageItem::Table {
@@ -2846,9 +2952,17 @@ impl DocumentCore {
                                     .unwrap_or_default();
                                 let vpos_info =
                                     format_vpos_range(paragraphs.get(*para_index), None, None);
+                                let line_seg_info =
+                                    format_line_seg_brief(paragraphs.get(*para_index));
+                                let source_info = endnote_source_info(*para_index);
                                 out.push_str(&format!(
-                                    "    Table          pi={} ci={}  {}  {}\n",
-                                    para_index, control_index, table_info, vpos_info
+                                    "    Table          pi={} ci={}  {}  {}{}  {}\n",
+                                    para_index,
+                                    control_index,
+                                    table_info,
+                                    vpos_info,
+                                    source_info,
+                                    line_seg_info
                                 ));
                             }
                             PageItem::PartialTable {
@@ -2874,6 +2988,9 @@ impl DocumentCore {
                                     .unwrap_or_default();
                                 let vpos_info =
                                     format_vpos_range(paragraphs.get(*para_index), None, None);
+                                let line_seg_info =
+                                    format_line_seg_brief(paragraphs.get(*para_index));
+                                let source_info = endnote_source_info(*para_index);
                                 // [Task #993] 분할 표 진단 정보 — 행 컷이 비어 있지
                                 // 않으면 셀 내 분할(컷 = 셀별 소비 유닛 수).
                                 let split_info = if !start_cut.is_empty() || !end_cut.is_empty() {
@@ -2881,8 +2998,8 @@ impl DocumentCore {
                                 } else {
                                     String::new()
                                 };
-                                out.push_str(&format!("    PartialTable   pi={} ci={}  rows={}..{}  cont={}  {}  {}{}\n",
-                                    para_index, control_index, start_row, end_row, is_continuation, table_info, vpos_info, split_info));
+                                out.push_str(&format!("    PartialTable   pi={} ci={}  rows={}..{}  cont={}  {}  {}{}  {}{}\n",
+                                    para_index, control_index, start_row, end_row, is_continuation, table_info, vpos_info, source_info, line_seg_info, split_info));
                             }
                             PageItem::Shape {
                                 para_index,
@@ -2906,9 +3023,17 @@ impl DocumentCore {
                                     .unwrap_or_default();
                                 let vpos_info =
                                     format_vpos_range(paragraphs.get(*para_index), None, None);
+                                let line_seg_info =
+                                    format_line_seg_brief(paragraphs.get(*para_index));
+                                let source_info = endnote_source_info(*para_index);
                                 out.push_str(&format!(
-                                    "    Shape          pi={} ci={}  {}  {}\n",
-                                    para_index, control_index, shape_info, vpos_info
+                                    "    Shape          pi={} ci={}  {}  {}{}  {}\n",
+                                    para_index,
+                                    control_index,
+                                    shape_info,
+                                    vpos_info,
+                                    source_info,
+                                    line_seg_info
                                 ));
                             }
                             PageItem::EndnoteSeparator {
@@ -3137,9 +3262,12 @@ impl DocumentCore {
                 .set_hidden_empty_paras(&pr.hidden_empty_paras);
             self.layout_engine
                 .set_endnote_para_sources(paragraphs.len(), &pr.endnote_para_sources);
-            // [Task #1246] 섹션 미주 between-notes 마진(HU) 전달 → HeightCursor min-gap 보정.
-            self.layout_engine
-                .set_endnote_between_notes_hu(pr.endnote_between_notes_hu);
+            // 섹션 미주 모양의 정규화 여백 전달 → HeightCursor min-gap 및 renderer overflow 판정.
+            self.layout_engine.set_endnote_shape_margins_hu(
+                pr.endnote_separator_above_hu,
+                pr.endnote_between_notes_hu,
+                pr.endnote_separator_below_hu,
+            );
         }
 
         // [Task #836] 미주 paragraphs를 본문 paragraphs 뒤에 합쳐서 전달
@@ -3663,18 +3791,23 @@ fn format_vpos_range(
     };
     let total = p.line_segs.len();
     let s = start_line.unwrap_or(0).min(total.saturating_sub(1));
-    let e = end_line.unwrap_or(total - 1).min(total - 1);
-    if s > e {
+    let end_exclusive = end_line.unwrap_or(total).min(total);
+    if s >= end_exclusive {
         return String::new();
     };
+    let e = end_exclusive - 1;
 
     let first = p.line_segs[s].vertical_pos;
     let last = p.line_segs[e].vertical_pos;
     let mut resets: Vec<usize> = Vec::new();
+    let mut rewinds: Vec<usize> = Vec::new();
     for i in s..=e {
         // 문단 첫 줄(line 0)의 vpos는 자연 시작점이므로 제외
         if i > 0 && p.line_segs[i].vertical_pos == 0 {
             resets.push(i);
+        }
+        if i > s && p.line_segs[i].vertical_pos < p.line_segs[i - 1].vertical_pos {
+            rewinds.push(i);
         }
     }
     let mut s_out = if s == e {
@@ -3685,7 +3818,53 @@ fn format_vpos_range(
     for r in resets {
         s_out.push_str(&format!(" [vpos-reset@line{}]", r));
     }
+    for r in rewinds {
+        s_out.push_str(&format!(" [vpos-rewind@line{}]", r));
+    }
     s_out
+}
+
+/// dump-pages에서 line_seg 계약을 빠르게 대조하기 위한 한 줄 요약.
+fn format_line_seg_brief(para: Option<&Paragraph>) -> String {
+    let Some(p) = para else {
+        return String::new();
+    };
+    if p.line_segs.is_empty() {
+        return "ls=0".to_string();
+    }
+    let first = &p.line_segs[0];
+    let last = p.line_segs.last().unwrap_or(first);
+    if p.line_segs.len() == 1 {
+        format!(
+            "ls=1[ts={} lh={} th={} bl={} gap={} cs={} sw={}]",
+            first.text_start,
+            first.line_height,
+            first.text_height,
+            first.baseline_distance,
+            first.line_spacing,
+            first.column_start,
+            first.segment_width
+        )
+    } else {
+        format!(
+            "ls={}[first ts={} lh={} th={} bl={} gap={} cs={} sw={}; last ts={} lh={} th={} bl={} gap={} cs={} sw={}]",
+            p.line_segs.len(),
+            first.text_start,
+            first.line_height,
+            first.text_height,
+            first.baseline_distance,
+            first.line_spacing,
+            first.column_start,
+            first.segment_width,
+            last.text_start,
+            last.line_height,
+            last.text_height,
+            last.baseline_distance,
+            last.line_spacing,
+            last.column_start,
+            last.segment_width
+        )
+    }
 }
 
 #[cfg(test)]
@@ -3709,6 +3888,52 @@ mod tests {
             }
             other => panic!("root should be Page node, got {:?}", other),
         }
+    }
+
+    /// [Task #1280 v2] 레이아웃 쿼리가 컨트롤별 plane/zOrder/stableIndex 를 노출하고,
+    /// 렌더 정렬키(`paper_node_sort_key`)와 동일하게 한컴 권위 샘플
+    /// (글상자=InFrontOfText plane 3, 이미지=Square plane 2)을 산출하는지 검증.
+    /// 이미지가 글상자 뒤(plane 2 < 3)로 가는 한컴 정합의 근거.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn task1280_v2_control_layout_exposes_plane_z_order_stable_index() {
+        // "type":"<name>" 다음 처음 나오는 "<key>": 정수값 추출(plane 은 컨트롤 객체 끝에 부착).
+        fn field_after_type(json: &str, type_name: &str, key: &str) -> Option<i64> {
+            let tstart = json.find(&format!("\"type\":\"{}\"", type_name))?;
+            let needle = format!("\"{}\":", key);
+            let kstart = json[tstart..].find(&needle)? + tstart + needle.len();
+            let kend = json[kstart..].find(|c| c == ',' || c == '}')? + kstart;
+            json[kstart..kend].trim().parse().ok()
+        }
+
+        let data = std::fs::read("samples/textbox-under-image.hwp")
+            .expect("read samples/textbox-under-image.hwp");
+        let mut core = DocumentCore::from_bytes(&data).expect("load textbox-under-image.hwp");
+        core.paginate();
+        let json = core
+            .get_page_control_layout_native(0)
+            .expect("control layout for page 0");
+
+        // 신규 필드가 노출됨
+        assert!(json.contains("\"plane\":"), "plane 필드 누락: {json}");
+        assert!(json.contains("\"zOrder\":"), "zOrder 필드 누락: {json}");
+        assert!(
+            json.contains("\"stableIndex\":"),
+            "stableIndex 필드 누락: {json}"
+        );
+
+        // 권위 샘플: 글상자(shape)=InFrontOfText plane 3, 이미지=Square plane 2.
+        let shape_plane = field_after_type(&json, "shape", "plane")
+            .unwrap_or_else(|| panic!("shape plane 추출 실패: {json}"));
+        let image_plane = field_after_type(&json, "image", "plane")
+            .unwrap_or_else(|| panic!("image plane 추출 실패: {json}"));
+        assert_eq!(shape_plane, 3, "글상자는 InFrontOfText(plane 3): {json}");
+        assert_eq!(image_plane, 2, "이미지는 Square(plane 2): {json}");
+        // 핵심 불변식: 이미지가 글상자 뒤(plane 작음) — 한컴 동일.
+        assert!(
+            image_plane < shape_plane,
+            "이미지가 글상자 뒤여야 함(plane {image_plane} < {shape_plane}): {json}"
+        );
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]

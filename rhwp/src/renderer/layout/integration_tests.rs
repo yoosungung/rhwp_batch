@@ -2128,4 +2128,65 @@ mod tests {
             count
         );
     }
+
+    /// treat_as_char(TAC) table host-line trailing spacing must be applied
+    /// even when the table's control index differs from its line-seg index.
+    ///
+    /// `layout_table_item` looks up the host line via
+    /// `para.line_segs.get(control_index)`, but `control_index` indexes the
+    /// paragraph's CONTROL array. When invisible controls (SectionDef,
+    /// ColumnDef, bookmarks, ...) precede the table, the lookup misses and
+    /// the host line's `line_spacing` is silently dropped, pulling all
+    /// following content up by that amount.
+    ///
+    /// Fixture: synthetic samples/tac-host-spacing.hwpx — host paragraph is
+    /// [secPr, colPr, bookmark, TAC table(h=2994, outMargin 283)] with a
+    /// Hancom-style lineSegArray (host vertsize=3560, spacing=600); the next
+    /// paragraph's authoritative vertical_pos is 4160 HWPUNIT.
+    ///
+    /// Expected: first char of "NEXT PARAGRAPH" baseline at
+    ///   (4251+2834+4160)/75 + 0.85*1000/75 = ~161.3 px.
+    /// Buggy (spacing dropped): ~153.3 px.
+    #[test]
+    fn test_tac_host_line_spacing_with_preceding_invisible_controls() {
+        let Some(core) = load_document("samples/tac-host-spacing.hwpx") else {
+            return;
+        };
+        let svg = core.render_page_svg_native(0).unwrap_or_default();
+        assert!(!svg.is_empty(), "fixture page 1 SVG is empty");
+
+        let find_text_y = |needle: &str| -> Option<f64> {
+            for chunk in svg.split("<text").skip(1) {
+                let Some(gt) = chunk.find('>') else {
+                    continue;
+                };
+                let attrs = &chunk[..gt];
+                let body = &chunk[gt + 1..chunk.find("</text>").unwrap_or(chunk.len())];
+                if body.trim() == needle {
+                    return attrs
+                        .split("y=\"")
+                        .nth(1)
+                        .and_then(|r| r.split('\"').next())
+                        .and_then(|v| v.parse::<f64>().ok());
+                }
+            }
+            None
+        };
+
+        // 한컴 PDF 기준 CELL baseline은 셀 중앙 쪽이다. 회귀 전에는 셀 하단
+        // 근처(~133.5px)에 그려져 세로 가운데 정렬이 적용되지 않았다.
+        let cell_y = find_text_y("C").expect("'C' of CELL not found in SVG");
+        assert!(
+            (cell_y - 122.1).abs() < 2.0,
+            "CELL baseline {} px — expected ~122.1 from Hancom PDF centered cell text",
+            cell_y
+        );
+
+        let y = find_text_y("N").expect("'N' of NEXT PARAGRAPH not found in SVG");
+        assert!(
+            (y - 161.3).abs() < 2.0,
+            "next paragraph baseline {} px — expected ~161.3 (file lineSegArray              vertical_pos=4160); ~153.3 means the TAC host line_spacing was dropped",
+            y
+        );
+    }
 }

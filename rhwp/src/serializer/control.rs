@@ -995,7 +995,8 @@ fn serialize_picture_data(pic: &Picture) -> Vec<u8> {
 
     // 원본 추가 바이트 복원 (라운드트립 보존)
     if !pic.raw_picture_extra.is_empty() {
-        w.write_bytes(&pic.raw_picture_extra).unwrap();
+        w.write_bytes(&picture_raw_extra_with_transparency(pic))
+            .unwrap();
     } else {
         // border_opacity(1) + instance_id(4) + image_effect(4) = 9바이트
         w.write_u8(pic.border_opacity).unwrap();
@@ -1004,10 +1005,36 @@ fn serialize_picture_data(pic: &Picture) -> Vec<u8> {
                                  // 원본 이미지 크기(HWPUNIT) + 플래그(1): 한컴 호환 추가 9바이트
         w.write_u32(pic.crop.right as u32).unwrap(); // original width in HWPUNIT
         w.write_u32(pic.crop.bottom as u32).unwrap(); // original height in HWPUNIT
-        w.write_u8(0).unwrap(); // flag
+        w.write_u8(pic.image_attr.transparency_alpha_byte())
+            .unwrap();
     }
 
     w.into_bytes()
+}
+
+fn picture_raw_extra_with_transparency(pic: &Picture) -> Vec<u8> {
+    let transparency = pic.image_attr.transparency_alpha_byte();
+    let mut extra = pic.raw_picture_extra.clone();
+    if extra.len() >= 18 {
+        if let Some(last) = extra.last_mut() {
+            *last = transparency;
+        }
+    } else if transparency > 0 {
+        let original_width = if pic.shape_attr.original_width > 0 {
+            pic.shape_attr.original_width
+        } else {
+            pic.crop.right.max(0) as u32
+        };
+        let original_height = if pic.shape_attr.original_height > 0 {
+            pic.shape_attr.original_height
+        } else {
+            pic.crop.bottom.max(0) as u32
+        };
+        extra.extend_from_slice(&original_width.to_le_bytes());
+        extra.extend_from_slice(&original_height.to_le_bytes());
+        extra.push(transparency);
+    }
+    extra
 }
 
 // ============================================================

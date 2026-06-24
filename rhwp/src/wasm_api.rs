@@ -257,10 +257,20 @@ impl HwpDocument {
     }
 
     /// 빈 문서 생성 (테스트/미리보기용)
+    ///
+    /// 기본 A4 구역 1개 + 빈 문단 1개를 포함한다. 구역 0개 문서는 모든
+    /// 편집/조회 API가 "구역 인덱스 0 범위 초과"로 실패해 사용 불가하므로
+    /// 생성 직후 바로 편집 가능한 최소 구조를 보장한다 (#1386).
     #[wasm_bindgen(js_name = createEmpty)]
     pub fn create_empty() -> HwpDocument {
         let mut core = DocumentCore::new_empty();
-        core.paginate();
+        let mut section = Section::default();
+        // set_document가 styles/composed 재구성 + paginate까지 수행한다.
+        section.section_def.page_def = crate::model::page::PageDef::a4_default();
+        section.paragraphs.push(Paragraph::new_empty());
+        let mut document = Document::default();
+        document.sections.push(section);
+        core.set_document(document);
         HwpDocument { core }
     }
 
@@ -278,6 +288,12 @@ impl HwpDocument {
     pub fn set_show_paragraph_marks(&mut self, enabled: bool) {
         self.show_paragraph_marks = enabled;
         self.invalidate_page_tree_cache();
+    }
+
+    /// 문단부호(¶) 표시 여부를 반환한다.
+    #[wasm_bindgen(js_name = getShowParagraphMarks)]
+    pub fn get_show_paragraph_marks(&self) -> bool {
+        self.show_paragraph_marks
     }
 
     /// 조판부호 표시 여부를 반환한다.
@@ -806,6 +822,25 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// `insertTextInCell` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, cellIdx, cellParaIdx,
+    /// charOffset?, text: string }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = insertTextInCellEx)]
+    pub fn insert_text_in_cell_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_str, json_u32};
+        self.insert_text_in_cell_native(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "charOffset").unwrap_or(0) as usize,
+            &json_str(options_json, "text").unwrap_or_default(),
+        )
+        .map_err(|e| e.into())
+    }
+
     /// 표 셀 내부 문단에서 텍스트를 삭제한다.
     ///
     /// 반환값: JSON `{"ok":true,"charOffset":<offset_after_delete>}`
@@ -828,6 +863,25 @@ impl HwpDocument {
             cell_para_idx as usize,
             char_offset as usize,
             count as usize,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// `deleteTextInCell` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, cellIdx, cellParaIdx,
+    /// charOffset?, count }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = deleteTextInCellEx)]
+    pub fn delete_text_in_cell_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::json_u32;
+        self.delete_text_in_cell_native(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "charOffset").unwrap_or(0) as usize,
+            json_u32(options_json, "count").unwrap_or(0) as usize,
         )
         .map_err(|e| e.into())
     }
@@ -1220,6 +1274,25 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// `mergeTableCells` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, startRow, startCol,
+    /// endRow, endCol }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = mergeTableCellsEx)]
+    pub fn merge_table_cells_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::json_u32;
+        self.merge_table_cells_native(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "startRow").unwrap_or(0) as u16,
+            json_u32(options_json, "startCol").unwrap_or(0) as u16,
+            json_u32(options_json, "endRow").unwrap_or(0) as u16,
+            json_u32(options_json, "endCol").unwrap_or(0) as u16,
+        )
+        .map_err(|e| e.into())
+    }
+
     /// 병합된 셀을 나눈다 (split).
     ///
     /// 반환값: JSON `{"ok":true,"cellCount":<N>}`
@@ -1272,6 +1345,27 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// `splitTableCellInto` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, row, col, nRows, mCols,
+    /// equalRowHeight?, mergeFirst? }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = splitTableCellIntoEx)]
+    pub fn split_table_cell_into_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_bool, json_u32};
+        self.split_table_cell_into_native(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "row").unwrap_or(0) as u16,
+            json_u32(options_json, "col").unwrap_or(0) as u16,
+            json_u32(options_json, "nRows").unwrap_or(1) as u16,
+            json_u32(options_json, "mCols").unwrap_or(1) as u16,
+            json_bool(options_json, "equalRowHeight").unwrap_or(false),
+            json_bool(options_json, "mergeFirst").unwrap_or(false),
+        )
+        .map_err(|e| e.into())
+    }
+
     /// 범위 내 셀들을 각각 N줄 × M칸으로 분할한다.
     ///
     /// 반환값: JSON `{"ok":true,"cellCount":<N>}`
@@ -1300,6 +1394,28 @@ impl HwpDocument {
             n_rows as u16,
             m_cols as u16,
             equal_row_height,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// `splitTableCellsInRange` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, startRow, startCol,
+    /// endRow, endCol, nRows, mCols, equalRowHeight? }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = splitTableCellsInRangeEx)]
+    pub fn split_table_cells_in_range_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_bool, json_u32};
+        self.split_table_cells_in_range_native(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "startRow").unwrap_or(0) as u16,
+            json_u32(options_json, "startCol").unwrap_or(0) as u16,
+            json_u32(options_json, "endRow").unwrap_or(0) as u16,
+            json_u32(options_json, "endCol").unwrap_or(0) as u16,
+            json_u32(options_json, "nRows").unwrap_or(1) as u16,
+            json_u32(options_json, "mCols").unwrap_or(1) as u16,
+            json_bool(options_json, "equalRowHeight").unwrap_or(false),
         )
         .map_err(|e| e.into())
     }
@@ -1711,6 +1827,25 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// `getTextInCell` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, cellIdx, cellParaIdx,
+    /// charOffset?, count }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = getTextInCellEx)]
+    pub fn get_text_in_cell_ex(&self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::json_u32;
+        self.get_text_in_cell_native(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "charOffset").unwrap_or(0) as usize,
+            json_u32(options_json, "count").unwrap_or(0) as usize,
+        )
+        .map_err(|e| e.into())
+    }
+
     // ─── Phase 1 끝 ─────────────────────────────────────────
 
     // ─── Phase 2: 커서/히트 테스트 API ──────────────────────────
@@ -1729,6 +1864,43 @@ impl HwpDocument {
             section_idx as usize,
             para_idx as usize,
             char_offset as usize,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// 줄 경계 offset을 특정 시각 줄 기준으로 해석한 커서 좌표를 반환한다.
+    ///
+    /// `at_end=false`이면 lineIndex 줄의 시작, `at_end=true`이면 lineIndex 줄의 끝을 반환한다.
+    /// soft-wrap 경계에서는 같은 charOffset이 이전 줄 끝과 다음 줄 시작을 동시에 뜻할 수 있어
+    /// Home/End가 이 API로 시각 줄 affinity를 명시한다.
+    #[wasm_bindgen(js_name = getCursorRectOnLine)]
+    pub fn get_cursor_rect_on_line(
+        &self,
+        section_idx: u32,
+        para_idx: u32,
+        line_index: u32,
+        at_end: bool,
+        parent_para_idx: u32,
+        control_idx: u32,
+        cell_idx: u32,
+        cell_para_idx: u32,
+    ) -> Result<String, JsValue> {
+        let cell_ctx = if parent_para_idx == u32::MAX {
+            None
+        } else {
+            Some((
+                parent_para_idx as usize,
+                control_idx as usize,
+                cell_idx as usize,
+                cell_para_idx as usize,
+            ))
+        };
+        self.get_cursor_rect_on_line_native(
+            section_idx as usize,
+            para_idx as usize,
+            line_index as usize,
+            at_end,
+            cell_ctx,
         )
         .map_err(|e| e.into())
     }
@@ -2031,7 +2203,7 @@ impl HwpDocument {
 
     /// 셀 속성을 조회한다.
     ///
-    /// 반환: JSON `{width, height, paddingLeft, paddingRight, paddingTop, paddingBottom, verticalAlign, textDirection, isHeader}`
+    /// 반환: JSON `{width, height, paddingLeft, paddingRight, paddingTop, paddingBottom, applyInnerMargin, verticalAlign, textDirection, isHeader, cellProtect, fieldName, editableInForm, ...borderFill}`
     #[wasm_bindgen(js_name = getCellProperties)]
     pub fn get_cell_properties(
         &self,
@@ -2263,11 +2435,9 @@ impl HwpDocument {
         let row_count = json_u32(options_json, "rowCount").unwrap_or(2) as u16;
         let col_count = json_u32(options_json, "colCount").unwrap_or(2) as u16;
         let treat_as_char = json_bool(options_json, "treatAsChar").unwrap_or(false);
-        // colWidths: JSON 배열에서 u32 목록 추출
-        let col_widths: Option<Vec<u32>> = {
-            let key = "colWidths";
-            if let Some(start) = options_json.find(&format!("\"{}\"", key)) {
-                let rest = &options_json[start..];
+        fn parse_u32_array(json: &str, key: &str) -> Option<Vec<u32>> {
+            if let Some(start) = json.find(&format!("\"{}\"", key)) {
+                let rest = &json[start..];
                 if let Some(arr_start) = rest.find('[') {
                     if let Some(arr_end) = rest[arr_start..].find(']') {
                         let arr_str = &rest[arr_start + 1..arr_start + arr_end];
@@ -2289,7 +2459,9 @@ impl HwpDocument {
             } else {
                 None
             }
-        };
+        }
+        let col_widths = parse_u32_array(options_json, "colWidths");
+        let row_heights = parse_u32_array(options_json, "rowHeights");
 
         self.create_table_ex_native(
             section_idx,
@@ -2299,6 +2471,7 @@ impl HwpDocument {
             col_count,
             treat_as_char,
             col_widths.as_deref(),
+            row_heights.as_deref(),
         )
         .map_err(|e| e.into())
     }
@@ -2356,6 +2529,63 @@ impl HwpDocument {
             natural_height_px,
             extension,
             description,
+            paper_offset_x_hu,
+            paper_offset_y_hu,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// 커서 위치에 그림을 삽입한다 (확장, options object — #1413).
+    ///
+    /// positional `insertPicture` 와 동일 동작의 얇은 어댑터. 이미지 바이너리는 별도
+    /// `image_data` 인자(Uint8Array)로 받고, 나머지는 JSON options 로 받는다. 필드 추가/
+    /// 순서 변경 시 호출부 영향이 작다.
+    ///
+    /// options JSON 키 (positional 과 동일 의미, camelCase):
+    /// `{ sectionIdx, paraIdx, charOffset?, cellPath?: string, width, height,
+    ///    naturalWidthPx, naturalHeightPx, extension?, description?,
+    ///    paperOffsetXHu?: number|null, paperOffsetYHu?: number|null }`
+    /// - `cellPath` 는 cell_path_json 문자열(빈 문자열/`"[]"` 이면 본문 inline).
+    /// - 반환값은 `insertPicture` 와 동일.
+    #[wasm_bindgen(js_name = insertPictureEx)]
+    pub fn insert_picture_ex(
+        &mut self,
+        options_json: &str,
+        image_data: &[u8],
+    ) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_i32, json_str, json_u32};
+        let section_idx = json_u32(options_json, "sectionIdx").unwrap_or(0);
+        let para_idx = json_u32(options_json, "paraIdx").unwrap_or(0);
+        let char_offset = json_u32(options_json, "charOffset").unwrap_or(0);
+        let cell_path_json = json_str(options_json, "cellPath").unwrap_or_default();
+        let width = json_u32(options_json, "width").unwrap_or(0);
+        let height = json_u32(options_json, "height").unwrap_or(0);
+        let natural_width_px = json_u32(options_json, "naturalWidthPx").unwrap_or(0);
+        let natural_height_px = json_u32(options_json, "naturalHeightPx").unwrap_or(0);
+        let extension = json_str(options_json, "extension").unwrap_or_default();
+        let description = json_str(options_json, "description").unwrap_or_default();
+        // paperOffset 은 키 부재 시 None(셀 좌상단 default) — positional 의 Option 동작과 동일.
+        let paper_offset_x_hu = json_i32(options_json, "paperOffsetXHu");
+        let paper_offset_y_hu = json_i32(options_json, "paperOffsetYHu");
+
+        let cell_path: Vec<(usize, usize, usize)> =
+            if cell_path_json.is_empty() || cell_path_json == "[]" {
+                Vec::new()
+            } else {
+                DocumentCore::parse_cell_path(&cell_path_json).map_err(JsValue::from)?
+            };
+        self.insert_picture_native(
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+            &cell_path,
+            image_data,
+            width,
+            height,
+            natural_width_px,
+            natural_height_px,
+            &extension,
+            &description,
             paper_offset_x_hu,
             paper_offset_y_hu,
         )
@@ -2806,6 +3036,29 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// `setNoteEquationProperties` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ kind, sectionIdx, parentParaIdx, noteControlIdx, noteParaIdx,
+    /// innerControlIdx, props: object }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = setNoteEquationPropertiesEx)]
+    pub fn set_note_equation_properties_ex(
+        &mut self,
+        options_json: &str,
+    ) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_object, json_str, json_u32};
+        let props_json = json_object(options_json, "props").unwrap_or_else(|| "{}".to_string());
+        self.set_note_equation_properties_native(
+            &json_str(options_json, "kind").unwrap_or_default(),
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "noteControlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "noteParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "innerControlIdx").unwrap_or(0) as usize,
+            &props_json,
+        )
+        .map_err(|e| e.into())
+    }
+
     /// 수식 스크립트를 SVG로 렌더링하여 반환한다 (미리보기 전용).
     ///
     /// 반환: 완전한 `<svg>` 문자열
@@ -3057,6 +3310,24 @@ impl HwpDocument {
     ) -> Result<String, JsValue> {
         self.move_line_endpoint_native(sec as usize, para as usize, ci as usize, sx, sy, ex, ey)
             .map_err(|e| e.into())
+    }
+
+    /// `moveLineEndpoint` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sec, para, ci, sx, sy, ex, ey }` (좌표는 i32). positional 과 동일 동작.
+    #[wasm_bindgen(js_name = moveLineEndpointEx)]
+    pub fn move_line_endpoint_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_i32, json_u32};
+        self.move_line_endpoint_native(
+            json_u32(options_json, "sec").unwrap_or(0) as usize,
+            json_u32(options_json, "para").unwrap_or(0) as usize,
+            json_u32(options_json, "ci").unwrap_or(0) as usize,
+            json_i32(options_json, "sx").unwrap_or(0),
+            json_i32(options_json, "sy").unwrap_or(0),
+            json_i32(options_json, "ex").unwrap_or(0),
+            json_i32(options_json, "ey").unwrap_or(0),
+        )
+        .map_err(|e| e.into())
     }
 
     /// 구역 내 모든 연결선의 좌표를 연결된 도형 위치에 맞게 갱신한다.
@@ -3441,6 +3712,37 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// `moveVertical` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, paraIdx, charOffset?, delta, preferredX,
+    /// parentParaIdx?, controlIdx?, cellIdx?, cellParaIdx? }`. cell 컨텍스트 키가 모두
+    /// 생략되면 본문 이동(parentParaIdx=MAX 동작과 동일). positional 과 동일 동작.
+    #[wasm_bindgen(js_name = moveVerticalEx)]
+    pub fn move_vertical_ex(&self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_f64, json_i32, json_u32};
+        // parentParaIdx 부재 시 u32::MAX(본문) — positional 분기와 동일.
+        let parent_para_idx = json_u32(options_json, "parentParaIdx").unwrap_or(u32::MAX);
+        let cell_ctx = if parent_para_idx == u32::MAX {
+            None
+        } else {
+            Some((
+                parent_para_idx as usize,
+                json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+                json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+                json_u32(options_json, "cellParaIdx").unwrap_or(0) as usize,
+            ))
+        };
+        self.move_vertical_native(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "paraIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "charOffset").unwrap_or(0) as usize,
+            json_i32(options_json, "delta").unwrap_or(0),
+            json_f64(options_json, "preferredX").unwrap_or(0.0),
+            cell_ctx,
+        )
+        .map_err(|e| e.into())
+    }
+
     // ─── 필드 API (Task 230) ─────────────────────────────────
 
     /// 문서 내 모든 필드 목록을 JSON 배열로 반환한다.
@@ -3487,6 +3789,159 @@ impl HwpDocument {
     ) -> Result<String, JsValue> {
         self.set_field_value_by_name(name, value)
             .map_err(|e| e.into())
+    }
+
+    /// 현재 본문 위치에 ClickHere 누름틀 필드를 삽입한다.
+    #[wasm_bindgen(js_name = insertClickHereField)]
+    pub fn insert_click_here_field_api(
+        &mut self,
+        section_idx: u32,
+        para_idx: u32,
+        char_offset: u32,
+        guide: &str,
+        memo: &str,
+        name: &str,
+        editable: bool,
+    ) -> Result<String, JsValue> {
+        self.insert_click_here_field_at(
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+            guide,
+            memo,
+            name,
+            editable,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// `insertClickHereField` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, paraIdx, charOffset?, guide?, memo?, name?, editable? }`.
+    /// positional 과 동일 동작.
+    #[wasm_bindgen(js_name = insertClickHereFieldEx)]
+    pub fn insert_click_here_field_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_bool, json_str, json_u32};
+        self.insert_click_here_field_at(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "paraIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "charOffset").unwrap_or(0) as usize,
+            &json_str(options_json, "guide").unwrap_or_default(),
+            &json_str(options_json, "memo").unwrap_or_default(),
+            &json_str(options_json, "name").unwrap_or_default(),
+            json_bool(options_json, "editable").unwrap_or(false),
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// 현재 셀/글상자 위치에 ClickHere 누름틀 필드를 삽입한다.
+    #[wasm_bindgen(js_name = insertClickHereFieldInCell)]
+    pub fn insert_click_here_field_in_cell_api(
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        control_idx: u32,
+        cell_idx: u32,
+        cell_para_idx: u32,
+        char_offset: u32,
+        is_textbox: bool,
+        guide: &str,
+        memo: &str,
+        name: &str,
+        editable: bool,
+    ) -> Result<String, JsValue> {
+        self.insert_click_here_field_at_in_cell(
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            cell_para_idx as usize,
+            char_offset as usize,
+            is_textbox,
+            guide,
+            memo,
+            name,
+            editable,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// `insertClickHereFieldInCell` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, cellIdx, cellParaIdx,
+    /// charOffset?, isTextbox?, guide?, memo?, name?, editable? }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = insertClickHereFieldInCellEx)]
+    pub fn insert_click_here_field_in_cell_ex(
+        &mut self,
+        options_json: &str,
+    ) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_bool, json_str, json_u32};
+        self.insert_click_here_field_at_in_cell(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "charOffset").unwrap_or(0) as usize,
+            json_bool(options_json, "isTextbox").unwrap_or(false),
+            &json_str(options_json, "guide").unwrap_or_default(),
+            &json_str(options_json, "memo").unwrap_or_default(),
+            &json_str(options_json, "name").unwrap_or_default(),
+            json_bool(options_json, "editable").unwrap_or(false),
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// 현재 중첩 표 cellPath 위치에 ClickHere 누름틀 필드를 삽입한다.
+    #[wasm_bindgen(js_name = insertClickHereFieldByPath)]
+    pub fn insert_click_here_field_by_path_api(
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        path_json: &str,
+        char_offset: u32,
+        guide: &str,
+        memo: &str,
+        name: &str,
+        editable: bool,
+    ) -> Result<String, JsValue> {
+        let path = DocumentCore::parse_cell_path(path_json)?;
+        self.insert_click_here_field_at_by_path(
+            section_idx as usize,
+            parent_para_idx as usize,
+            &path,
+            char_offset as usize,
+            guide,
+            memo,
+            name,
+            editable,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// `insertClickHereFieldByPath` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, path: string, charOffset?, guide?,
+    /// memo?, name?, editable? }`. `path` 는 cell_path JSON 문자열. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = insertClickHereFieldByPathEx)]
+    pub fn insert_click_here_field_by_path_ex(
+        &mut self,
+        options_json: &str,
+    ) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_bool, json_str, json_u32};
+        let path_json = json_str(options_json, "path").unwrap_or_default();
+        let path = DocumentCore::parse_cell_path(&path_json)?;
+        self.insert_click_here_field_at_by_path(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            &path,
+            json_u32(options_json, "charOffset").unwrap_or(0) as usize,
+            &json_str(options_json, "guide").unwrap_or_default(),
+            &json_str(options_json, "memo").unwrap_or_default(),
+            &json_str(options_json, "name").unwrap_or_default(),
+            json_bool(options_json, "editable").unwrap_or(false),
+        )
+        .map_err(|e| e.into())
     }
 
     // ─────────────────────────────────────────────
@@ -3559,6 +4014,27 @@ impl HwpDocument {
                 cell_para as usize,
                 form_ci as usize,
                 value_json,
+            )
+            .map_err(|e| e.into())
+    }
+
+    /// `setFormValueInCell` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sec, tablePara, tableCi, cellIdx, cellPara, formCi, value: object }`.
+    /// positional 과 동일 동작.
+    #[wasm_bindgen(js_name = setFormValueInCellEx)]
+    pub fn set_form_value_in_cell_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_object, json_u32};
+        let value_json = json_object(options_json, "value").unwrap_or_else(|| "{}".to_string());
+        self.core
+            .set_form_value_in_cell_native(
+                json_u32(options_json, "sec").unwrap_or(0) as usize,
+                json_u32(options_json, "tablePara").unwrap_or(0) as usize,
+                json_u32(options_json, "tableCi").unwrap_or(0) as usize,
+                json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+                json_u32(options_json, "cellPara").unwrap_or(0) as usize,
+                json_u32(options_json, "formCi").unwrap_or(0) as usize,
+                &value_json,
             )
             .map_err(|e| e.into())
     }
@@ -3676,7 +4152,7 @@ impl HwpDocument {
 
     /// 커서 위치의 필드 범위 정보를 조회한다 (본문 문단).
     ///
-    /// 반환: `{inField, fieldId?, startCharIdx?, endCharIdx?, isGuide?, guideName?}`
+    /// 반환: `{inField, fieldId?, startCharIdx?, endCharIdx?, isGuide?, guideName?, editableInForm?}`
     #[wasm_bindgen(js_name = getFieldInfoAt)]
     pub fn get_field_info_at_api(
         &self,
@@ -3711,6 +4187,24 @@ impl HwpDocument {
             cell_para_idx as usize,
             char_offset as usize,
             is_textbox,
+        )
+    }
+
+    /// `getFieldInfoAtInCell` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, cellIdx, cellParaIdx,
+    /// charOffset?, isTextbox? }`. positional 과 동일 동작(String 반환).
+    #[wasm_bindgen(js_name = getFieldInfoAtInCellEx)]
+    pub fn get_field_info_at_in_cell_ex(&self, options_json: &str) -> String {
+        use crate::document_core::helpers::{json_bool, json_u32};
+        self.get_field_info_at_in_cell(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "charOffset").unwrap_or(0) as usize,
+            json_bool(options_json, "isTextbox").unwrap_or(false),
         )
     }
 
@@ -3764,6 +4258,30 @@ impl HwpDocument {
         }
     }
 
+    /// `removeFieldAtInCell` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, cellIdx, cellParaIdx,
+    /// charOffset?, isTextbox? }`. positional 과 동일 동작(String 반환).
+    #[wasm_bindgen(js_name = removeFieldAtInCellEx)]
+    pub fn remove_field_at_in_cell_ex(&mut self, options_json: &str) -> String {
+        use crate::document_core::helpers::{json_bool, json_u32};
+        match self.remove_field_at_in_cell(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "charOffset").unwrap_or(0) as usize,
+            json_bool(options_json, "isTextbox").unwrap_or(false),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let escaped = e.to_string().replace('\\', "\\\\").replace('"', "\\\"");
+                format!("{{\"ok\":false,\"error\":\"{}\"}}", escaped)
+            }
+        }
+    }
+
     /// 활성 필드를 설정한다 (본문 문단 — 안내문 숨김용).
     #[wasm_bindgen(js_name = setActiveField)]
     pub fn set_active_field_api(
@@ -3800,6 +4318,24 @@ impl HwpDocument {
             cell_para_idx as usize,
             char_offset as usize,
             is_textbox,
+        )
+    }
+
+    /// `setActiveFieldInCell` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, cellIdx, cellParaIdx,
+    /// charOffset?, isTextbox? }`. positional 과 동일 동작(bool 반환).
+    #[wasm_bindgen(js_name = setActiveFieldInCellEx)]
+    pub fn set_active_field_in_cell_ex(&mut self, options_json: &str) -> bool {
+        use crate::document_core::helpers::{json_bool, json_u32};
+        self.set_active_field_in_cell(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "charOffset").unwrap_or(0) as usize,
+            json_bool(options_json, "isTextbox").unwrap_or(false),
         )
     }
 
@@ -3949,7 +4485,7 @@ impl HwpDocument {
                         let orig_memo = f.memo_text().unwrap_or("").to_string();
                         if guide != orig_guide || memo != orig_memo {
                             // guide 또는 memo가 변경되었으므로 command 재구축
-                            let new_command = Field::build_clickhere_command(guide, memo, "");
+                            let new_command = Field::build_clickhere_command(guide, memo);
                             f.command = new_command;
                         }
                         // command가 변경되지 않았으면 원본 보존
@@ -4197,6 +4733,28 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// `getSelectionRectsInCell` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, cellIdx, startCellParaIdx,
+    /// startCharOffset, endCellParaIdx, endCharOffset }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = getSelectionRectsInCellEx)]
+    pub fn get_selection_rects_in_cell_ex(&self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::json_u32;
+        self.get_selection_rects_native(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "startCellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "startCharOffset").unwrap_or(0) as usize,
+            json_u32(options_json, "endCellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "endCharOffset").unwrap_or(0) as usize,
+            Some((
+                json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+                json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+                json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+            )),
+        )
+        .map_err(|e| e.into())
+    }
+
     /// 각주/미주 내부 선택 영역의 줄별 사각형을 반환한다.
     #[wasm_bindgen(js_name = getSelectionRectsInFootnote)]
     pub fn get_selection_rects_in_footnote(
@@ -4267,6 +4825,28 @@ impl HwpDocument {
                 parent_para_idx as usize,
                 control_idx as usize,
                 cell_idx as usize,
+            )),
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// `deleteRangeInCell` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, cellIdx, startCellParaIdx,
+    /// startCharOffset, endCellParaIdx, endCharOffset }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = deleteRangeInCellEx)]
+    pub fn delete_range_in_cell_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::json_u32;
+        self.delete_range_native(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "startCellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "startCharOffset").unwrap_or(0) as usize,
+            json_u32(options_json, "endCellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "endCharOffset").unwrap_or(0) as usize,
+            Some((
+                json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+                json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+                json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
             )),
         )
         .map_err(|e| e.into())
@@ -4655,6 +5235,9 @@ impl HwpDocument {
             Some(s) => s.clone(),
             None => return false,
         };
+        let old_csid = style.char_shape_id as u32;
+        let old_psid = style.para_shape_id;
+        let style_type = style.style_type;
 
         // CharShape 수정
         if !char_mods_json.is_empty() && char_mods_json != "{}" {
@@ -4693,44 +5276,85 @@ impl HwpDocument {
 
         // raw_data 무효화
         self.core.document.doc_info.styles[style_id as usize].raw_data = None;
+        self.core.document.doc_info.raw_stream_dirty = true;
 
-        // ── 스타일 변경을 해당 스타일을 사용하는 모든 문단에 전파 ──
-        let updated_style = self.core.document.doc_info.styles[style_id as usize].clone();
         let sid = style_id as u8;
-        let new_csid = updated_style.char_shape_id as u32;
-        let new_psid = updated_style.para_shape_id;
-        for section in &mut self.core.document.sections {
-            for para in &mut section.paragraphs {
+        let mut body_targets = Vec::new();
+        let mut cell_targets = Vec::new();
+        for (sec_idx, section) in self.core.document.sections.iter().enumerate() {
+            for (para_idx, para) in section.paragraphs.iter().enumerate() {
                 if para.style_id == sid {
-                    para.para_shape_id = new_psid;
-                    para.char_shapes.clear();
-                    para.char_shapes
-                        .push(crate::model::paragraph::CharShapeRef {
-                            start_pos: 0,
-                            char_shape_id: new_csid,
-                        });
+                    body_targets.push((sec_idx, para_idx));
                 }
-                // 셀 내 문단도 전파
-                for ctrl in &mut para.controls {
-                    if let crate::model::control::Control::Table(ref mut table) = *ctrl {
-                        for cell in &mut table.cells {
-                            for cpara in &mut cell.paragraphs {
+                for (control_idx, ctrl) in para.controls.iter().enumerate() {
+                    if let Control::Table(table) = ctrl {
+                        for (cell_idx, cell) in table.cells.iter().enumerate() {
+                            for (cell_para_idx, cpara) in cell.paragraphs.iter().enumerate() {
                                 if cpara.style_id == sid {
-                                    cpara.para_shape_id = new_psid;
-                                    cpara.char_shapes.clear();
-                                    cpara
-                                        .char_shapes
-                                        .push(crate::model::paragraph::CharShapeRef {
-                                            start_pos: 0,
-                                            char_shape_id: new_csid,
-                                        });
+                                    cell_targets.push((
+                                        sec_idx,
+                                        para_idx,
+                                        control_idx,
+                                        cell_idx,
+                                        cell_para_idx,
+                                    ));
                                 }
                             }
                         }
                     }
                 }
             }
-            section.raw_stream = None;
+        }
+
+        // ── 스타일 변경을 해당 스타일을 사용하는 모든 문단에 전파 ──
+        let updated_style = self.core.document.doc_info.styles[style_id as usize].clone();
+        let new_csid = updated_style.char_shape_id as u32;
+        let new_psid = updated_style.para_shape_id;
+
+        for (sec_idx, para_idx) in body_targets {
+            if let Some(para) = self
+                .core
+                .document
+                .sections
+                .get_mut(sec_idx)
+                .and_then(|s| s.paragraphs.get_mut(para_idx))
+            {
+                if style_type == 0 && para.para_shape_id == old_psid {
+                    para.para_shape_id = new_psid;
+                }
+                para.replace_style_char_shape_preserving_overrides(old_csid, new_csid);
+            }
+            self.core.reflow_body_paragraph(sec_idx, para_idx);
+            if let Some(section) = self.core.document.sections.get_mut(sec_idx) {
+                section.raw_stream = None;
+            }
+        }
+
+        for (sec_idx, para_idx, control_idx, cell_idx, cell_para_idx) in cell_targets {
+            if let Ok(cpara) = self.core.get_cell_paragraph_mut(
+                sec_idx,
+                para_idx,
+                control_idx,
+                cell_idx,
+                cell_para_idx,
+            ) {
+                if style_type == 0 && cpara.para_shape_id == old_psid {
+                    cpara.para_shape_id = new_psid;
+                }
+                cpara.replace_style_char_shape_preserving_overrides(old_csid, new_csid);
+            }
+            self.core.reflow_cell_paragraph(
+                sec_idx,
+                para_idx,
+                control_idx,
+                cell_idx,
+                cell_para_idx,
+            );
+            self.core
+                .mark_cell_control_dirty(sec_idx, para_idx, control_idx);
+            if let Some(section) = self.core.document.sections.get_mut(sec_idx) {
+                section.raw_stream = None;
+            }
         }
 
         // 스타일 캐시 무효화 + 전체 리빌드
@@ -4755,12 +5379,23 @@ impl HwpDocument {
         let style_type = json_i32(json, "type").unwrap_or(0) as u8;
         let next_style_id = json_i32(json, "nextStyleId").unwrap_or(0) as u8;
 
-        // 기본 "바탕글" 스타일(ID 0)의 CharShape/ParaShape를 복사
+        // 한컴 스타일 추가 흐름은 현재 문단의 모양을 기본값으로 삼는다.
+        // 호출자가 base ID를 넘기지 않으면 기존 호환성을 위해 바탕글을 사용한다.
         let base_style = self.core.document.doc_info.styles.first();
-        let (char_shape_id, para_shape_id) = match base_style {
+        let (fallback_char_shape_id, fallback_para_shape_id) = match base_style {
             Some(s) => (s.char_shape_id, s.para_shape_id),
             None => (0, 0),
         };
+        let char_shape_id = json_i32(json, "baseCharShapeId")
+            .filter(|id| *id >= 0)
+            .map(|id| id as u16)
+            .filter(|id| (*id as usize) < self.core.document.doc_info.char_shapes.len())
+            .unwrap_or(fallback_char_shape_id);
+        let para_shape_id = json_i32(json, "baseParaShapeId")
+            .filter(|id| *id >= 0)
+            .map(|id| id as u16)
+            .filter(|id| (*id as usize) < self.core.document.doc_info.para_shapes.len())
+            .unwrap_or(fallback_para_shape_id);
 
         let new_style = Style {
             raw_data: None,
@@ -4773,6 +5408,7 @@ impl HwpDocument {
             char_shape_id,
         };
         self.core.document.doc_info.styles.push(new_style);
+        self.core.document.doc_info.raw_stream_dirty = true;
         let new_id = (self.core.document.doc_info.styles.len() - 1) as i32;
         // 스타일 캐시 갱신
         self.core.styles = crate::renderer::style_resolver::resolve_styles(
@@ -5147,6 +5783,26 @@ impl HwpDocument {
             .map_err(|e| e.into())
     }
 
+    /// `evaluateTableFormula` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, targetRow, targetCol,
+    /// formula: string, writeResult? }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = evaluateTableFormulaEx)]
+    pub fn evaluate_table_formula_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_bool, json_str, json_u32};
+        self.core
+            .evaluate_table_formula(
+                json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+                json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+                json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+                json_u32(options_json, "targetRow").unwrap_or(0) as usize,
+                json_u32(options_json, "targetCol").unwrap_or(0) as usize,
+                &json_str(options_json, "formula").unwrap_or_default(),
+                json_bool(options_json, "writeResult").unwrap_or(false),
+            )
+            .map_err(|e| e.into())
+    }
+
     /// 글꼴 이름으로 font_id를 조회하거나 새로 생성한다.
     ///
     /// 한글(0번) 카테고리에서 이름 검색 → 없으면 7개 전체 카테고리에 신규 등록.
@@ -5177,6 +5833,20 @@ impl HwpDocument {
             .map_err(|e| e.into())
     }
 
+    /// 글자 서식 ID를 직접 복원한다 (본문 문단).
+    #[wasm_bindgen(js_name = setCharShapeId)]
+    pub fn set_char_shape_id(
+        &mut self,
+        sec_idx: usize,
+        para_idx: usize,
+        start_offset: usize,
+        end_offset: usize,
+        char_shape_id: u32,
+    ) -> Result<String, JsValue> {
+        self.set_char_shape_id_native(sec_idx, para_idx, start_offset, end_offset, char_shape_id)
+            .map_err(|e| e.into())
+    }
+
     /// 글자 서식을 적용한다 (셀 내 문단).
     #[wasm_bindgen(js_name = applyCharFormatInCell)]
     pub fn apply_char_format_in_cell(
@@ -5203,6 +5873,74 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// `applyCharFormatInCell` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ secIdx, parentParaIdx, controlIdx, cellIdx, cellParaIdx,
+    /// startOffset, endOffset, props: object }`. `props` 는 글자 서식 JSON 객체(positional
+    /// 의 props_json 과 동일). positional 과 동일 동작.
+    #[wasm_bindgen(js_name = applyCharFormatInCellEx)]
+    pub fn apply_char_format_in_cell_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_object, json_u32};
+        let props_json = json_object(options_json, "props").unwrap_or_else(|| "{}".to_string());
+        self.apply_char_format_in_cell_native(
+            json_u32(options_json, "secIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "startOffset").unwrap_or(0) as usize,
+            json_u32(options_json, "endOffset").unwrap_or(0) as usize,
+            &props_json,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// 글자 서식 ID를 직접 복원한다 (셀 내 문단).
+    #[wasm_bindgen(js_name = setCharShapeIdInCell)]
+    pub fn set_char_shape_id_in_cell(
+        &mut self,
+        sec_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        cell_para_idx: usize,
+        start_offset: usize,
+        end_offset: usize,
+        char_shape_id: u32,
+    ) -> Result<String, JsValue> {
+        self.set_char_shape_id_in_cell_native(
+            sec_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            cell_para_idx,
+            start_offset,
+            end_offset,
+            char_shape_id,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// `setCharShapeIdInCell` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ secIdx, parentParaIdx, controlIdx, cellIdx, cellParaIdx,
+    /// startOffset, endOffset, charShapeId }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = setCharShapeIdInCellEx)]
+    pub fn set_char_shape_id_in_cell_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::json_u32;
+        self.set_char_shape_id_in_cell_native(
+            json_u32(options_json, "secIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "startOffset").unwrap_or(0) as usize,
+            json_u32(options_json, "endOffset").unwrap_or(0) as usize,
+            json_u32(options_json, "charShapeId").unwrap_or(0),
+        )
+        .map_err(|e| e.into())
+    }
+
     /// 감추기 설정
     #[wasm_bindgen(js_name = setPageHide)]
     pub fn set_page_hide(
@@ -5225,6 +5963,26 @@ impl HwpDocument {
             hide_border,
             hide_fill,
             hide_page_num,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// `setPageHide` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sec, para, hideHeader?, hideFooter?, hideMaster?, hideBorder?,
+    /// hideFill?, hidePageNum? }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = setPageHideEx)]
+    pub fn set_page_hide_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_bool, json_u32};
+        self.set_page_hide_native(
+            json_u32(options_json, "sec").unwrap_or(0) as usize,
+            json_u32(options_json, "para").unwrap_or(0) as usize,
+            json_bool(options_json, "hideHeader").unwrap_or(false),
+            json_bool(options_json, "hideFooter").unwrap_or(false),
+            json_bool(options_json, "hideMaster").unwrap_or(false),
+            json_bool(options_json, "hideBorder").unwrap_or(false),
+            json_bool(options_json, "hideFill").unwrap_or(false),
+            json_bool(options_json, "hidePageNum").unwrap_or(false),
         )
         .map_err(|e| e.into())
     }
@@ -5261,6 +6019,18 @@ impl HwpDocument {
             .map_err(|e| e.into())
     }
 
+    /// 문단의 paraShapeId를 직접 설정한다.
+    #[wasm_bindgen(js_name = setParaShapeId)]
+    pub fn set_para_shape_id(
+        &mut self,
+        sec_idx: usize,
+        para_idx: usize,
+        para_shape_id: u16,
+    ) -> Result<String, JsValue> {
+        self.set_para_shape_id_native(sec_idx, para_idx, para_shape_id)
+            .map_err(|e| e.into())
+    }
+
     /// 문단 서식을 적용한다 (셀 내 문단).
     #[wasm_bindgen(js_name = applyParaFormatInCell)]
     pub fn apply_para_format_in_cell(
@@ -5279,6 +6049,28 @@ impl HwpDocument {
             cell_idx,
             cell_para_idx,
             props_json,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// 셀 내 문단의 paraShapeId를 직접 설정한다.
+    #[wasm_bindgen(js_name = setCellParaShapeId)]
+    pub fn set_cell_para_shape_id(
+        &mut self,
+        sec_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        cell_para_idx: usize,
+        para_shape_id: u16,
+    ) -> Result<String, JsValue> {
+        self.set_cell_para_shape_id_native(
+            sec_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            cell_para_idx,
+            para_shape_id,
         )
         .map_err(|e| e.into())
     }
@@ -5349,6 +6141,26 @@ impl HwpDocument {
             start_char_offset as usize,
             end_cell_para_idx as usize,
             end_char_offset as usize,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// `copySelectionInCell` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, cellIdx, startCellParaIdx,
+    /// startCharOffset, endCellParaIdx, endCharOffset }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = copySelectionInCellEx)]
+    pub fn copy_selection_in_cell_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::json_u32;
+        self.copy_selection_in_cell_native(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "startCellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "startCharOffset").unwrap_or(0) as usize,
+            json_u32(options_json, "endCellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "endCharOffset").unwrap_or(0) as usize,
         )
         .map_err(|e| e.into())
     }
@@ -5508,6 +6320,26 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// `exportSelectionInCellHtml` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, cellIdx, startCellParaIdx,
+    /// startCharOffset, endCellParaIdx, endCharOffset }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = exportSelectionInCellHtmlEx)]
+    pub fn export_selection_in_cell_html_ex(&self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::json_u32;
+        self.export_selection_in_cell_html_native(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "startCellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "startCharOffset").unwrap_or(0) as usize,
+            json_u32(options_json, "endCellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "endCharOffset").unwrap_or(0) as usize,
+        )
+        .map_err(|e| e.into())
+    }
+
     /// 컨트롤 객체를 HTML 문자열로 변환한다.
     #[wasm_bindgen(js_name = exportControlHtml)]
     pub fn export_control_html(
@@ -5603,6 +6435,25 @@ impl HwpDocument {
             cell_para_idx as usize,
             char_offset as usize,
             html,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// `pasteHtmlInCell` 의 options object 변형 (#1413).
+    ///
+    /// options JSON 키: `{ sectionIdx, parentParaIdx, controlIdx, cellIdx, cellParaIdx,
+    /// charOffset?, html: string }`. positional 과 동일 동작.
+    #[wasm_bindgen(js_name = pasteHtmlInCellEx)]
+    pub fn paste_html_in_cell_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
+        use crate::document_core::helpers::{json_str, json_u32};
+        self.paste_html_in_cell_native(
+            json_u32(options_json, "sectionIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "parentParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "controlIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "cellParaIdx").unwrap_or(0) as usize,
+            json_u32(options_json, "charOffset").unwrap_or(0) as usize,
+            &json_str(options_json, "html").unwrap_or_default(),
         )
         .map_err(|e| e.into())
     }
