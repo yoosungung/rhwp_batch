@@ -50,9 +50,11 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           TARGET="${{ matrix.target }}"
           ARCHIVE="${BIN_NAME}-${TAG}-${TARGET}.tar.gz"
+          STAGE="package"
 
-          cp "target/${TARGET}/release/${BIN_NAME}" .
-          tar -czf "${ARCHIVE}" "${BIN_NAME}"
+          mkdir -p "${STAGE}"
+          cp "target/${TARGET}/release/${BIN_NAME}" "${STAGE}/${BIN_NAME}"
+          tar -czf "${ARCHIVE}" -C "${STAGE}" "${BIN_NAME}"
 
           HASH="$(openssl dgst -sha256 -r "${ARCHIVE}" | awk '{print $1}')"
           echo "${HASH}  ${ARCHIVE}" > "${ARCHIVE}.sha256"
