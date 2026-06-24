@@ -1,13 +1,4 @@
-# ── Build stage ──────────────────────────────────────────────────────────────
-FROM rust:1-bookworm AS builder
-
-WORKDIR /src
-COPY . .
-
-# workspace 전체 빌드 (rhwp 의존성 포함)
-RUN cargo build --release -p rhwp-batch
-
-# ── Runtime stage ─────────────────────────────────────────────────────────────
+# Runtime image — pre-built Linux binary at dist/rhwp-batch (CI or local).
 FROM debian:bookworm-slim
 
 # NanumGothic 폰트만 동봉 (D8 v1 결정)
@@ -17,7 +8,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /src/target/release/rhwp-batch /usr/local/bin/rhwp-batch
+COPY dist/rhwp-batch /usr/local/bin/rhwp-batch
 
 # 기본 볼륨 마운트 포인트 (Kubernetes Job 사용 패턴)
 VOLUME ["/templates", "/input", "/output"]

@@ -106,9 +106,11 @@ rhwp-batch --version
 docker pull registry.local/rhwp-batch:0.7.17
 ```
 
-직접 이미지를 빌드할 때:
+직접 이미지를 빌드할 때 (먼저 Linux 릴리즈 바이너리를 `dist/`에 둔다):
 
 ```bash
+cargo build --release -p rhwp-batch
+install -Dm755 target/release/rhwp-batch dist/rhwp-batch
 docker build -f deploy/Dockerfile.batch -t rhwp-batch:local .
 docker run --rm rhwp-batch:local --version
 ```

@@ -6,7 +6,8 @@ target/
 # rhwp (원본 crate) 산출물·샘플·임시 디렉토리
 rhwp/output/
 rhwp/samples/
-rhwp/saved/
+rhwp/saved/*
+!rhwp/saved/blank2010.hwp
 rhwp/template/
 
 # rhwp-batch 샘플

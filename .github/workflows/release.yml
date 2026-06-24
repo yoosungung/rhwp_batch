@@ -96,10 +96,26 @@ jobs:
 
   docker:
     name: Build and push Docker image
+    needs: build-binaries
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download Linux binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: x86_64-unknown-linux-gnu
+          path: artifacts
+
+      - name: Prepare binary for image
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          TARGET="x86_64-unknown-linux-gnu"
+          tar -xzf "artifacts/${BIN_NAME}-${TAG}-${TARGET}.tar.gz"
+          install -Dm755 "${BIN_NAME}" dist/rhwp-batch
+        env:
+          BIN_NAME: rhwp-batch
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -129,5 +145,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
