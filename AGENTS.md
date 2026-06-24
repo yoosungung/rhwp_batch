@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 본 파일은 클로드 코드(claude.ai/code) 및 기여자가 본 저장소에서 작업할 때 참고하는
 **워크스페이스 안내서**다. 프로젝트 관리(계획·결정·사용법·설계)는
@@ -6,6 +6,7 @@
 3종으로 분리해 관리한다.
 
 > **다른 문서**:
+>
 > - 사용자 가이드: [README.md](README.md)
 > - 기술적 구조·정보: [DESIGN.md](DESIGN.md)
 > - 향후 계획·결정 항목·위험 관리: [ROADMAP.md](ROADMAP.md)
@@ -79,13 +80,15 @@ Docker는 **컨테이너 이미지 산출용**으로만 사용한다. 사용자 
 본 CLAUDE.md는 **워크스페이스 구조·빌드 안내**만 다룬다. 작업 중 어떤
 문서를 봐야 하는지·어떤 정보가 어디 정본인지는 아래 표가 정본이다.
 
-| 문서 | 대상 | 역할 | 정본 영역 |
-|------|------|------|----------|
-| [README.md](README.md) | 사용자 (데이터 엔지니어·운영자) | 빠른 시작, CLI 사양, 양식 작성 가이드, 운영 예시 | CLI 사양·옵션·종료 코드·비-목표 |
-| [DESIGN.md](DESIGN.md) | 개발자·리뷰어 | 진입점 (두 하위 DESIGN.md로 라우팅) | — |
-| [rhwp/DESIGN.md](rhwp/DESIGN.md) | 개발자·리뷰어 | rhwp 라이브러리 분석, IR 모델, DocumentCore 활용, 자산 매핑표 | rhwp API 부수 효과·메모리·동시성 |
-| [rhwp-batch/DESIGN.md](rhwp-batch/DESIGN.md) | 개발자·리뷰어 | rhwp-batch crate 모듈 구조·데이터 흐름 | rhwp-batch 내부 설계 |
-| [ROADMAP.md](ROADMAP.md) | 계획자·기여자 | 결정 항목, 마일스톤, 위험 관리 | 결정 항목 표·마일스톤·위험 표 |
+
+| 문서                                           | 대상                 | 역할                                            | 정본 영역                  |
+| -------------------------------------------- | ------------------ | --------------------------------------------- | ---------------------- |
+| [README.md](README.md)                       | 사용자 (데이터 엔지니어·운영자) | 빠른 시작, CLI 사양, 양식 작성 가이드, 운영 예시               | CLI 사양·옵션·종료 코드·비-목표   |
+| [DESIGN.md](DESIGN.md)                       | 개발자·리뷰어            | 진입점 (두 하위 DESIGN.md로 라우팅)                     | —                      |
+| [rhwp/DESIGN.md](rhwp/DESIGN.md)             | 개발자·리뷰어            | rhwp 라이브러리 분석, IR 모델, DocumentCore 활용, 자산 매핑표 | rhwp API 부수 효과·메모리·동시성 |
+| [rhwp-batch/DESIGN.md](rhwp-batch/DESIGN.md) | 개발자·리뷰어            | rhwp-batch crate 모듈 구조·데이터 흐름                 | rhwp-batch 내부 설계       |
+| [ROADMAP.md](ROADMAP.md)                     | 계획자·기여자            | 결정 항목, 마일스톤, 위험 관리                            | 결정 항목 표·마일스톤·위험 표      |
+
 
 > 정본 영역이 어긋나면 표시된 정본 문서를 우선한다. CLAUDE.md는 위 문서의
 > 내용을 중복으로 보유하지 않는다.
