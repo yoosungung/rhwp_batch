@@ -64,8 +64,9 @@ pub struct FootnoteShape {
     pub suffix_char: char,
     /// 시작 번호
     pub start_number: u16,
-    /// 구분선 길이
-    pub separator_length: HwpUnit16,
+    /// 구분선 길이. 한컴 미주 기본값 noteLine="14692344"(전폭 sentinel)이
+    /// i16 범위를 넘으므로 i32로 보존한다(i16 절단 시 0x2ff8=12280 → 짧은 구분선 버그).
+    pub separator_length: i32,
     /// HWPX 원본 슬롯: 구분선 위 여백.
     pub separator_margin_top: HwpUnit16,
     /// HWP5 원본 슬롯: 구분선 위 여백. HWPX 경로의 과거 매핑값 보존에도 사용될 수 있다.

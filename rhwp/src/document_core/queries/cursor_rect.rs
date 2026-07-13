@@ -24,6 +24,57 @@ fn effective_char_count(text_run: &TextRunNode) -> usize {
     text_run.text.chars().count()
 }
 
+/// 표 셀 안 편집 캐럿과 IME 조합창이 공유하는 가시 경계다.
+///
+/// TextRun의 실제 좌표가 고정 높이 셀 밖으로 이어져도 문서 모델의 offset은 보존한다.
+/// 대신 편집 UI가 사용할 좌표만 이 bbox 안으로 제한한다.
+#[derive(Clone, Copy)]
+struct CellCursorBounds {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+fn clamp_cursor_to_cell_bounds(
+    x: f64,
+    y: f64,
+    height: f64,
+    bounds: CellCursorBounds,
+) -> (f64, f64, f64, bool) {
+    let right = bounds.x + bounds.w.max(0.0);
+    let bottom = bounds.y + bounds.h.max(0.0);
+    let clamped_height = height.min(bounds.h.max(0.0));
+    let max_y = (bottom - clamped_height).max(bounds.y);
+    let clamped_x = x.clamp(bounds.x, right);
+    let clamped_y = y.clamp(bounds.y, max_y);
+    let overflowed = (x - clamped_x).abs() > 0.01
+        || (y - clamped_y).abs() > 0.01
+        || (height - clamped_height).abs() > 0.01;
+    (clamped_x, clamped_y, clamped_height, overflowed)
+}
+
+fn format_cursor_rect_json(
+    page_index: u32,
+    x: f64,
+    y: f64,
+    height: f64,
+    cell_bounds: Option<CellCursorBounds>,
+) -> String {
+    if let Some(bounds) = cell_bounds {
+        let (x, y, height, overflowed) = clamp_cursor_to_cell_bounds(x, y, height, bounds);
+        format!(
+            "{{\"pageIndex\":{},\"x\":{:.1},\"y\":{:.1},\"height\":{:.1},\"cellBounds\":{{\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1}}},\"cellOverflowed\":{}}}",
+            page_index, x, y, height, bounds.x, bounds.y, bounds.w, bounds.h, overflowed
+        )
+    } else {
+        format!(
+            "{{\"pageIndex\":{},\"x\":{:.1},\"y\":{:.1},\"height\":{:.1}}}",
+            page_index, x, y, height
+        )
+    }
+}
+
 fn note_number_format_from_hwp_code(code: u8) -> crate::renderer::NumberFormat {
     match code {
         0 => crate::renderer::NumberFormat::Digit,
@@ -827,7 +878,7 @@ impl DocumentCore {
         // 후보 페이지를 순회하며 커서 위치 탐색
         // 1차: 정확한 앵커(zero-width 노드) 우선 검색, 2차: 일반 검색
         for &page_num in &pages {
-            let tree = self.build_page_tree(page_num)?;
+            let tree = self.build_page_tree_cached(page_num)?;
             if !self.show_control_codes {
                 if let Ok(para) = self.get_render_paragraph_ref(section_idx, para_idx) {
                     if let Some(hit) = find_inline_flow_cursor_hit(
@@ -1068,6 +1119,134 @@ impl DocumentCore {
                 }
             }
             None
+        }
+
+        fn is_non_inline_ole_control(para: &Paragraph, control_index: usize) -> bool {
+            if !para.text.is_empty() {
+                return false;
+            }
+            para.controls.get(control_index).is_some_and(|control| {
+                matches!(
+                    control,
+                    Control::Shape(shape)
+                        if matches!(shape.as_ref(), crate::model::shape::ShapeObject::Ole(_))
+                            && !shape.common().treat_as_char
+                )
+            })
+        }
+
+        fn ole_object_caret_metrics(
+            para: &Paragraph,
+            styles: &crate::renderer::style_resolver::ResolvedStyleSet,
+            ole_top: f64,
+        ) -> (f64, f64) {
+            let line_height = para
+                .line_segs
+                .first()
+                .map(|line| {
+                    crate::renderer::hwpunit_to_px(line.line_height, crate::renderer::DEFAULT_DPI)
+                })
+                .filter(|height| *height > 0.0)
+                .unwrap_or(13.0);
+            let text_height = para
+                .line_segs
+                .first()
+                .map(|line| {
+                    crate::renderer::hwpunit_to_px(line.text_height, crate::renderer::DEFAULT_DPI)
+                })
+                .filter(|height| *height > 0.0)
+                .unwrap_or(line_height);
+            let baseline = para
+                .line_segs
+                .first()
+                .map(|line| {
+                    crate::renderer::hwpunit_to_px(
+                        line.baseline_distance,
+                        crate::renderer::DEFAULT_DPI,
+                    )
+                })
+                .filter(|baseline| *baseline > 0.0)
+                .unwrap_or(text_height * 0.85);
+            let font_size = para
+                .char_shape_id_at(0)
+                .and_then(|id| styles.char_styles.get(id as usize))
+                .map(|style| style.font_size)
+                .filter(|size| *size > 0.0)
+                .unwrap_or(text_height)
+                .max(10.0);
+            let caret_height = font_size.min(line_height.max(font_size));
+            let caret_y = ole_top + (baseline - caret_height * 0.85).max(0.0);
+            (caret_y, caret_height)
+        }
+
+        fn find_ole_object_cursor_hit(
+            node: &RenderNode,
+            sec: usize,
+            para_idx: usize,
+            render_para: Option<&Paragraph>,
+            styles: &crate::renderer::style_resolver::ResolvedStyleSet,
+            offset: usize,
+            page_index: u32,
+        ) -> Option<CursorHit> {
+            if offset != 0 {
+                return None;
+            }
+
+            let control_ref = match &node.node_type {
+                RenderNodeType::RawSvg(raw_node) => raw_node.control_ref.as_ref(),
+                RenderNodeType::Placeholder(placeholder_node) => {
+                    placeholder_node.control_ref.as_ref()
+                }
+                _ => None,
+            };
+            if let Some(control_ref) = control_ref.filter(|control_ref| control_ref.kind == "ole") {
+                if control_ref.section_index == sec
+                    && control_ref.para_index == para_idx
+                    && render_para.is_some_and(|para| {
+                        is_non_inline_ole_control(para, control_ref.control_index)
+                    })
+                {
+                    let (y, height) = render_para
+                        .map(|para| ole_object_caret_metrics(para, styles, node.bbox.y))
+                        .unwrap_or((node.bbox.y, 10.0));
+                    return Some(CursorHit {
+                        page_index,
+                        x: node.bbox.x + node.bbox.width,
+                        y,
+                        height,
+                    });
+                }
+            }
+
+            for child in &node.children {
+                if let Some(hit) = find_ole_object_cursor_hit(
+                    child,
+                    sec,
+                    para_idx,
+                    render_para,
+                    styles,
+                    offset,
+                    page_index,
+                ) {
+                    return Some(hit);
+                }
+            }
+            None
+        }
+
+        if let Some(hit) = find_ole_object_cursor_hit(
+            &tree.root,
+            section_idx,
+            para_idx,
+            self.get_render_paragraph_ref(section_idx, para_idx).ok(),
+            &self.styles,
+            char_offset,
+            first_page,
+        ) {
+            return Ok(format!(
+                "{{\"pageIndex\":{},\"x\":{:.1},\"y\":{:.1},\"height\":{:.1}}}",
+                hit.page_index, hit.x, hit.y, hit.height
+            ));
         }
 
         if let Some(line_hit) = find_para_line(
@@ -2408,6 +2587,38 @@ impl DocumentCore {
             height: f64,
         }
 
+        fn find_table_cell_bounds(
+            node: &RenderNode,
+            parent_para: usize,
+            ctrl_idx: usize,
+            c_idx: usize,
+        ) -> Option<CellCursorBounds> {
+            if let RenderNodeType::Table(ref table) = node.node_type {
+                let matches_table =
+                    table.para_index == Some(parent_para) && table.control_index == Some(ctrl_idx);
+                if matches_table {
+                    for child in &node.children {
+                        if let RenderNodeType::TableCell(ref cell) = child.node_type {
+                            if cell.model_cell_index == Some(c_idx as u32) {
+                                return Some(CellCursorBounds {
+                                    x: child.bbox.x,
+                                    y: child.bbox.y,
+                                    w: child.bbox.width,
+                                    h: child.bbox.height,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            for child in &node.children {
+                if let Some(bounds) = find_table_cell_bounds(child, parent_para, ctrl_idx, c_idx) {
+                    return Some(bounds);
+                }
+            }
+            None
+        }
+
         fn find_cursor_in_cell(
             node: &RenderNode,
             parent_para: usize,
@@ -2473,6 +2684,8 @@ impl DocumentCore {
 
         for &page_num in &pages {
             let tree = self.build_page_tree(page_num)?;
+            let cell_bounds =
+                find_table_cell_bounds(&tree.root, parent_para_idx, control_idx, cell_idx);
             if let Some(hit) = find_cursor_in_cell(
                 &tree.root,
                 parent_para_idx,
@@ -2482,9 +2695,12 @@ impl DocumentCore {
                 char_offset,
                 page_num,
             ) {
-                return Ok(format!(
-                    "{{\"pageIndex\":{},\"x\":{:.1},\"y\":{:.1},\"height\":{:.1}}}",
-                    hit.page_index, hit.x, hit.y, hit.height
+                return Ok(format_cursor_rect_json(
+                    hit.page_index,
+                    hit.x,
+                    hit.y,
+                    hit.height,
+                    cell_bounds,
                 ));
             }
         }
@@ -2492,6 +2708,8 @@ impl DocumentCore {
         // 빈 셀 fallback: 해당 셀의 아무 TextRun을 찾아 위치 반환
         let first_page = pages[0];
         let tree = self.build_page_tree(first_page)?;
+        let first_page_cell_bounds =
+            find_table_cell_bounds(&tree.root, parent_para_idx, control_idx, cell_idx);
 
         fn find_cell_run(
             node: &RenderNode,
@@ -2526,9 +2744,12 @@ impl DocumentCore {
             cell_idx,
             cell_para_idx,
         ) {
-            return Ok(format!(
-                "{{\"pageIndex\":{},\"x\":{:.1},\"y\":{:.1},\"height\":{:.1}}}",
-                first_page, x, y, h
+            return Ok(format_cursor_rect_json(
+                first_page,
+                x,
+                y,
+                h,
+                first_page_cell_bounds,
             ));
         }
 
@@ -2583,12 +2804,17 @@ impl DocumentCore {
             let pad_left = cell_pos.2;
             let pad_top = cell_pos.3;
             let caret_h = (ch - pad_top - cell_pos.4).max(10.0); // 패딩 제외한 높이
-            return Ok(format!(
-                "{{\"pageIndex\":{},\"x\":{:.1},\"y\":{:.1},\"height\":{:.1}}}",
+            return Ok(format_cursor_rect_json(
                 first_page,
                 cx + pad_left,
                 cy + pad_top,
-                caret_h
+                caret_h,
+                Some(CellCursorBounds {
+                    x: cx,
+                    y: cy,
+                    w: _cw,
+                    h: ch,
+                }),
             ));
         }
 
@@ -2662,6 +2888,45 @@ impl DocumentCore {
         path_json: &str,
         char_offset: usize,
     ) -> Result<String, HwpError> {
+        self.get_cursor_rect_by_path_with_hint(
+            section_idx,
+            parent_para_idx,
+            path_json,
+            char_offset,
+            None,
+        )
+    }
+
+    /// [#2021] 후보 페이지를 힌트 페이지(±1) 우선으로 재배열한다 — 거대 표처럼 호스트
+    /// 문단이 수십 페이지에 걸칠 때, 캐시 무효화 직후의 선형 페이지 트리 재빌드 탐색이
+    /// 캐럿 페이지 인덱스에 비례해 커지는 것을 차단한다 (탐색 순서만 변경, 좌표 불변).
+    fn order_pages_by_hint(pages: Vec<u32>, hint_page: Option<u32>) -> Vec<u32> {
+        let Some(hint) = hint_page else { return pages };
+        let mut ordered = Vec::with_capacity(pages.len());
+        for cand in [Some(hint), hint.checked_sub(1), hint.checked_add(1)]
+            .into_iter()
+            .flatten()
+        {
+            if pages.contains(&cand) && !ordered.contains(&cand) {
+                ordered.push(cand);
+            }
+        }
+        for p in pages {
+            if !ordered.contains(&p) {
+                ordered.push(p);
+            }
+        }
+        ordered
+    }
+
+    pub(crate) fn get_cursor_rect_by_path_with_hint(
+        &self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        path_json: &str,
+        char_offset: usize,
+        hint_page: Option<u32>,
+    ) -> Result<String, HwpError> {
         use crate::renderer::layout::{compute_char_positions, CellContext, CellPathEntry};
         use crate::renderer::render_tree::{RenderNode, RenderNodeType};
 
@@ -2672,8 +2937,11 @@ impl DocumentCore {
 
         let _para = self.resolve_paragraph_by_path(section_idx, parent_para_idx, &path)?;
 
-        // 커서 좌표를 렌더 트리에서 찾기
-        let pages = self.find_pages_for_paragraph(section_idx, parent_para_idx)?;
+        // 커서 좌표를 렌더 트리에서 찾기 ([#2021] 힌트 페이지 우선 탐색)
+        let pages = Self::order_pages_by_hint(
+            self.find_pages_for_paragraph(section_idx, parent_para_idx)?,
+            hint_page,
+        );
 
         fn table_ctx_from_node(
             node: &RenderNode,
@@ -2776,10 +3044,12 @@ impl DocumentCore {
             page: u32,
             current_table_ctx: Option<CellContext>,
             current_cell_ctx: Option<CellContext>,
-        ) -> Option<(u32, f64, f64, f64)> {
+            current_cell_bounds: Option<CellCursorBounds>,
+        ) -> Option<(u32, f64, f64, f64, Option<CellCursorBounds>)> {
             let table_ctx =
                 table_ctx_from_node(node, current_table_ctx.as_ref(), current_cell_ctx.as_ref());
             let mut child_cell_ctx = current_cell_ctx.clone();
+            let mut child_cell_bounds = current_cell_bounds;
             if let RenderNodeType::TableCell(ref tc) = node.node_type {
                 if let Some(cell_idx) = tc.model_cell_index {
                     child_cell_ctx = cell_ctx_for_table_cell(
@@ -2788,6 +3058,12 @@ impl DocumentCore {
                         0,
                         tc.text_direction,
                     );
+                    child_cell_bounds = Some(CellCursorBounds {
+                        x: node.bbox.x,
+                        y: node.bbox.y,
+                        w: node.bbox.width,
+                        h: node.bbox.height,
+                    });
                 }
             }
             if let RenderNodeType::TextRun(ref tr) = node.node_type {
@@ -2812,7 +3088,13 @@ impl DocumentCore {
                         } else {
                             0.0
                         };
-                        return Some((page, node.bbox.x + xr, node.bbox.y, node.bbox.height));
+                        return Some((
+                            page,
+                            node.bbox.x + xr,
+                            node.bbox.y,
+                            node.bbox.height,
+                            child_cell_bounds,
+                        ));
                     }
                 }
             }
@@ -2827,6 +3109,7 @@ impl DocumentCore {
                     page,
                     table_ctx.clone(),
                     child_cell_ctx.clone(),
+                    child_cell_bounds,
                 ) {
                     return Some(hit);
                 }
@@ -2836,7 +3119,7 @@ impl DocumentCore {
 
         for &page_num in &pages {
             let tree = self.build_page_tree_cached(page_num)?;
-            if let Some((pi, x, y, h)) = find_cursor_by_path(
+            if let Some((pi, x, y, h, cell_bounds)) = find_cursor_by_path(
                 self,
                 &tree.root,
                 section_idx,
@@ -2846,11 +3129,9 @@ impl DocumentCore {
                 page_num,
                 None,
                 None,
+                None,
             ) {
-                return Ok(format!(
-                    "{{\"pageIndex\":{},\"x\":{:.1},\"y\":{:.1},\"height\":{:.1}}}",
-                    pi, x, y, h
-                ));
+                return Ok(format_cursor_rect_json(pi, x, y, h, cell_bounds));
             }
         }
 
@@ -2866,13 +3147,15 @@ impl DocumentCore {
                 page: u32,
                 current_table_ctx: Option<CellContext>,
                 current_cell_ctx: Option<CellContext>,
-            ) -> Option<(u32, f64, f64, f64)> {
+                current_cell_bounds: Option<CellCursorBounds>,
+            ) -> Option<(u32, f64, f64, f64, Option<CellCursorBounds>)> {
                 let table_ctx = table_ctx_from_node(
                     node,
                     current_table_ctx.as_ref(),
                     current_cell_ctx.as_ref(),
                 );
                 let mut child_cell_ctx = current_cell_ctx.clone();
+                let mut child_cell_bounds = current_cell_bounds;
                 if let RenderNodeType::TableCell(ref tc) = node.node_type {
                     if let Some(cell_idx) = tc.model_cell_index {
                         child_cell_ctx = cell_ctx_for_table_cell(
@@ -2881,6 +3164,12 @@ impl DocumentCore {
                             0,
                             tc.text_direction,
                         );
+                        child_cell_bounds = Some(CellCursorBounds {
+                            x: node.bbox.x,
+                            y: node.bbox.y,
+                            w: node.bbox.width,
+                            h: node.bbox.height,
+                        });
                     }
                 }
                 if let RenderNodeType::TextRun(ref tr) = node.node_type {
@@ -2890,7 +3179,13 @@ impl DocumentCore {
                         core.repair_unwrapped_wrapper_cell_context(section_idx, ctx);
                     }
                     if cell_context_matches(&cell_context, parent_para, path) {
-                        return Some((page, node.bbox.x, node.bbox.y, node.bbox.height));
+                        return Some((
+                            page,
+                            node.bbox.x,
+                            node.bbox.y,
+                            node.bbox.height,
+                            child_cell_bounds,
+                        ));
                     }
                 }
                 for child in &node.children {
@@ -2903,13 +3198,14 @@ impl DocumentCore {
                         page,
                         table_ctx.clone(),
                         child_cell_ctx.clone(),
+                        child_cell_bounds,
                     ) {
                         return Some(hit);
                     }
                 }
                 None
             }
-            if let Some((pi, x, y, h)) = find_any_run(
+            if let Some((pi, x, y, h, cell_bounds)) = find_any_run(
                 self,
                 &tree.root,
                 section_idx,
@@ -2918,11 +3214,9 @@ impl DocumentCore {
                 page_num,
                 None,
                 None,
+                None,
             ) {
-                return Ok(format!(
-                    "{{\"pageIndex\":{},\"x\":{:.1},\"y\":{:.1},\"height\":{:.1}}}",
-                    pi, x, y, h
-                ));
+                return Ok(format_cursor_rect_json(pi, x, y, h, cell_bounds));
             }
         }
 
@@ -4879,7 +5173,19 @@ impl DocumentCore {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_x_on_line, LineRunView};
+    use super::{clamp_cursor_to_cell_bounds, resolve_x_on_line, CellCursorBounds, LineRunView};
+
+    #[test]
+    fn cell_cursor_bounds_clamp_coordinates_and_height() {
+        let bounds = CellCursorBounds {
+            x: 10.0,
+            y: 20.0,
+            w: 30.0,
+            h: 8.0,
+        };
+        let (x, y, height, overflowed) = clamp_cursor_to_cell_bounds(50.0, 40.0, 14.0, bounds);
+        assert_eq!((x, y, height, overflowed), (40.0, 20.0, 8.0, true));
+    }
 
     // 줄 단위 x 해석(`resolve_x_on_line`)의 회귀 테스트.
     //
@@ -5014,5 +5320,178 @@ mod tests {
         assert_eq!(resolve_x_on_line(&line, 250.0), (0, 0));
         // 오른쪽 끝 너머도 마찬가지.
         assert_eq!(resolve_x_on_line(&line, 999.0), (0, 0));
+    }
+
+    /// [#2021] 계측 프로브 — 대형 표 문서의 콜드 rect 비용 분해.
+    /// 실행: cargo test --profile release-test --lib document_core::queries::cursor_rect -- --ignored --nocapture
+    #[test]
+    #[ignore = "계측 프로브 — 수동 실행"]
+    fn probe_2021_cursor_rect_by_path_cold_cost() {
+        use std::time::Instant;
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("samples/issue1949_giant_cell_nested_tables_perf.hwp");
+        let bytes = std::fs::read(&p).expect("read sample");
+        let core = crate::document_core::DocumentCore::from_bytes(&bytes).expect("parse");
+
+        let doc = core.document();
+        let mut host = None;
+        'outer: for (pi, para) in doc.sections[0].paragraphs.iter().enumerate() {
+            for (ci, c) in para.controls.iter().enumerate() {
+                if matches!(c, crate::model::control::Control::Table(_)) {
+                    host = Some((pi, ci));
+                    break 'outer;
+                }
+            }
+        }
+        let (host_pi, host_ci) = host.expect("표 없음");
+        let path_json = format!(
+            r#"[{{"controlIndex":{},"cellIndex":0,"cellParaIndex":0}}]"#,
+            host_ci
+        );
+
+        let total_pages = core.page_count();
+        let pages = core.find_pages_for_paragraph(0, host_pi).expect("pages");
+        eprintln!(
+            "#2021 probe: 총 {}쪽 / 호스트 pi={} 걸친 페이지 = {}개 (first={:?} last={:?})",
+            total_pages,
+            host_pi,
+            pages.len(),
+            pages.first(),
+            pages.last()
+        );
+
+        let t = Instant::now();
+        let warm = core.get_cursor_rect_by_path_native(0, host_pi, &path_json, 0);
+        eprintln!(
+            "#2021 probe: 웜 ok={} ({:.1}ms)",
+            warm.is_ok(),
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+
+        core.invalidate_page_tree_cache();
+        let t = Instant::now();
+        let cold = core.get_cursor_rect_by_path_native(0, host_pi, &path_json, 0);
+        let cold_ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "#2021 probe: 콜드 ok={} ({:.1}ms) rect={:?}",
+            cold.is_ok(),
+            cold_ms,
+            cold.as_deref().unwrap_or("-")
+        );
+
+        // 셀 내부 깊은 문단 — 실제 시나리오(후반 페이지에 렌더되는 셀 문단) 재현
+        if let Some(crate::model::control::Control::Table(t)) =
+            doc.sections[0].paragraphs[host_pi].controls.get(host_ci)
+        {
+            let n_paras = t.cells.first().map(|c| c.paragraphs.len()).unwrap_or(0);
+            for frac in [2usize, 4, 10] {
+                let cpi = n_paras.saturating_sub(1) / frac * (frac - 1);
+                let path_deep = format!(
+                    r#"[{{"controlIndex":{},"cellIndex":0,"cellParaIndex":{}}}]"#,
+                    host_ci, cpi
+                );
+                core.invalidate_page_tree_cache();
+                let t2 = Instant::now();
+                let r = core.get_cursor_rect_by_path_native(0, host_pi, &path_deep, 0);
+                eprintln!(
+                    "#2021 probe: 셀0 문단 {}/{} 콜드 ok={} ({:.1}ms) rect={:?}",
+                    cpi,
+                    n_paras,
+                    r.is_ok(),
+                    t2.elapsed().as_secs_f64() * 1000.0,
+                    r.as_deref().unwrap_or("-")
+                );
+            }
+        }
+
+        // 뒤쪽 셀(마지막 셀) — 캐럿 페이지가 문서 후반일 때의 선형 탐색 비용
+        if let Some(crate::model::control::Control::Table(t)) =
+            doc.sections[0].paragraphs[host_pi].controls.get(host_ci)
+        {
+            let last_cell = t.cells.len().saturating_sub(1);
+            let path_last = format!(
+                r#"[{{"controlIndex":{},"cellIndex":{},"cellParaIndex":0}}]"#,
+                host_ci, last_cell
+            );
+            core.invalidate_page_tree_cache();
+            let t2 = Instant::now();
+            let cold_last = core.get_cursor_rect_by_path_native(0, host_pi, &path_last, 0);
+            eprintln!(
+                "#2021 probe: 마지막 셀(idx {}) 콜드 ok={} ({:.1}ms) rect={:?}",
+                last_cell,
+                cold_last.is_ok(),
+                t2.elapsed().as_secs_f64() * 1000.0,
+                cold_last.as_deref().unwrap_or("-")
+            );
+        }
+
+        if let Ok(ref json) = cold {
+            let page: u32 = json
+                .split("\"pageIndex\":")
+                .nth(1)
+                .and_then(|s| s.split(&[',', '}'][..]).next())
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            core.invalidate_page_tree_cache();
+            let t = Instant::now();
+            let _ = core.build_page_tree_cached(page);
+            eprintln!(
+                "#2021 probe: 캐럿 페이지({}) 1장 빌드 = {:.1}ms",
+                page,
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    /// [#2021] 힌트 탐색 동등성 핀 — 힌트 유/무·오힌트 fallback 모두 좌표 완전 일치.
+    #[test]
+    fn issue_2021_hint_search_equivalence() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("samples/issue1949_giant_cell_nested_tables_perf.hwp");
+        let bytes = std::fs::read(&p).expect("read sample");
+        let core = crate::document_core::DocumentCore::from_bytes(&bytes).expect("parse");
+        let doc = core.document();
+        let mut host = None;
+        'outer: for (pi, para) in doc.sections[0].paragraphs.iter().enumerate() {
+            for (ci, c) in para.controls.iter().enumerate() {
+                if matches!(c, crate::model::control::Control::Table(_)) {
+                    host = Some((pi, ci));
+                    break 'outer;
+                }
+            }
+        }
+        let (host_pi, host_ci) = host.expect("표 없음");
+        let total = core.page_count() as u32;
+        for cell in 0..3usize {
+            let path = format!(
+                r#"[{{"controlIndex":{},"cellIndex":{},"cellParaIndex":0}}]"#,
+                host_ci, cell
+            );
+            core.invalidate_page_tree_cache();
+            let base = core
+                .get_cursor_rect_by_path_with_hint(0, host_pi, &path, 0, None)
+                .expect("base rect");
+            // 정힌트(정답 페이지) / 오힌트(마지막 페이지·범위 밖) 전부 동일해야 한다.
+            let base_page: u32 = base
+                .split("\"pageIndex\":")
+                .nth(1)
+                .and_then(|s| s.split(&[',', '}'][..]).next())
+                .and_then(|s| s.trim().parse().ok())
+                .expect("pageIndex");
+            for hint in [
+                Some(base_page),
+                Some(total.saturating_sub(1)),
+                Some(total + 7),
+            ] {
+                core.invalidate_page_tree_cache();
+                let hinted = core
+                    .get_cursor_rect_by_path_with_hint(0, host_pi, &path, 0, hint)
+                    .expect("hinted rect");
+                assert_eq!(
+                    base, hinted,
+                    "#2021 힌트 {hint:?} 좌표 불일치 (cell {cell})"
+                );
+            }
+        }
     }
 }

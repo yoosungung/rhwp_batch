@@ -252,6 +252,11 @@ pub struct ParaShape {
     pub head_type: HeadType,
     /// 문단 수준 (0~6 → 1~7수준, attr1 bit 25~27)
     pub para_level: u8,
+    /// [#1986] HWPX breakSetting@breakLatinWord 원문 보존
+    /// (BREAK_WORD/KEEP_WORD/HYPHENATION). 파서 미수집 시 None → 직렬화 기본값
+    /// KEEP_WORD. 값이 3가지라 attr1 비트 인코딩 대신 원문 보존으로 무손실 방출.
+    /// 꼬리말·표셀 등 재계산 경로에서 줄나눔이 달라져 레이아웃이 갈리는 것을 막는다.
+    pub break_latin_word: Option<String>,
 }
 
 /// ParaShape 비교: raw_data 필드 제외 (라운드트립용 원본 바이트는 논리적 동일성과 무관)
@@ -275,6 +280,7 @@ impl PartialEq for ParaShape {
             && self.line_spacing_v2 == other.line_spacing_v2
             && self.head_type == other.head_type
             && self.para_level == other.para_level
+            && self.break_latin_word == other.break_latin_word
     }
 }
 
@@ -316,7 +322,7 @@ pub struct NumberingHead {
     pub number_format: u8,
 }
 
-/// 글머리표 정의 (HWPTAG_BULLET, 표 44, 20바이트)
+/// 글머리표 정의 (HWPTAG_BULLET, 표 44, 24바이트)
 #[derive(Debug, Clone, Default)]
 pub struct Bullet {
     /// 원본 레코드 바이트 (라운드트립 보존용)
@@ -327,6 +333,8 @@ pub struct Bullet {
     pub width_adjust: i16,
     /// 본문과의 거리
     pub text_distance: i16,
+    /// 글자 모양 아이디 참조 (문단 머리 정보 12바이트의 마지막 4바이트)
+    pub char_shape_id: u32,
     /// 글머리표 문자 (●, ■, ▶ 등)
     pub bullet_char: char,
     /// 이미지 글머리표 여부 (0=문자, ID=이미지)
@@ -438,8 +446,75 @@ pub struct BorderFill {
     pub borders: [BorderLine; 4],
     /// 대각선
     pub diagonal: DiagonalLine,
+    /// 중심선 방향
+    pub center_line: CenterLine,
     /// 채우기 정보
     pub fill: Fill,
+}
+
+/// 중심선 방향 (HWPX borderFill@centerLine)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CenterLine {
+    /// 없음
+    #[default]
+    None,
+    /// HWPX `VERTICAL` 값. 한컴 2024 기준으로는 셀 중앙 가로선으로 표시된다.
+    Vertical,
+    /// HWPX `HORIZONTAL` 값. 한컴 2024 기준으로는 셀 중앙 세로선으로 표시된다.
+    Horizontal,
+    /// 가로+세로 중심선
+    Cross,
+}
+
+impl CenterLine {
+    pub fn from_hwp_attr(attr: u16) -> Self {
+        if attr & (1 << 13) == 0 {
+            return Self::None;
+        }
+        let slash_crooked = attr & (1 << 8) != 0;
+        let backslash_crooked = attr & (1 << 10) != 0;
+        match (slash_crooked, backslash_crooked) {
+            (true, false) => Self::Vertical,
+            (false, true) => Self::Horizontal,
+            _ => Self::Cross,
+        }
+    }
+
+    pub fn from_hwpx(value: &str) -> Self {
+        match value {
+            "VERTICAL" => Self::Vertical,
+            "HORIZONTAL" => Self::Horizontal,
+            "CROSS" => Self::Cross,
+            _ => Self::None,
+        }
+    }
+
+    pub fn hwp_attr_bits(self) -> u16 {
+        match self {
+            Self::None => 0,
+            Self::Vertical => (1 << 13) | (0x03 << 8),
+            Self::Horizontal => (1 << 13) | (1 << 10),
+            Self::Cross => (1 << 13) | (0x03 << 8) | (1 << 10),
+        }
+    }
+
+    pub fn hwp_binary_attr_bits(self) -> u16 {
+        match self {
+            Self::None => 0,
+            Self::Vertical => (1 << 13) | (0x03 << 8),
+            Self::Horizontal => (1 << 13) | (1 << 10),
+            Self::Cross => (1 << 13) | (0x03 << 8) | (1 << 10),
+        }
+    }
+
+    pub fn as_hwpx(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Vertical => "VERTICAL",
+            Self::Horizontal => "HORIZONTAL",
+            Self::Cross => "CROSS",
+        }
+    }
 }
 
 /// 테두리선 정보
@@ -499,7 +574,7 @@ pub enum BorderLineType {
 /// 대각선 정보
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DiagonalLine {
-    /// 대각선 종류 (0: Slash, 1: BackSlash, 2: Crooked)
+    /// 대각선 선 종류 코드. BorderLineType의 HWP/HWPX 코드와 같은 값을 사용한다.
     pub diagonal_type: u8,
     /// 대각선 굵기
     pub width: u8,
@@ -589,6 +664,7 @@ pub enum ImageFillMode {
     TileVertLeft,
     TileVertRight,
     FitToSize,
+    Total,
     Center,
     CenterTop,
     CenterBottom,

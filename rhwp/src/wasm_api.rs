@@ -418,6 +418,8 @@ impl HwpDocument {
     /// - `"all"` → 모든 PaintOp 렌더 (기본 `renderPageToCanvas` 와 동일)
     /// - `"background"` → page background layer
     /// - `"flow"` → 본문 layer (BehindText / InFrontOfText plane 제외)
+    /// - `"flow-dynamic"` → 본문 layer 중 Image/RawSvg 제외
+    /// - `"flow-static"` → page background + 본문 Image/RawSvg layer
     /// - `"behind"` → BehindText overlay layer
     /// - `"front"` → InFrontOfText overlay layer
     ///
@@ -439,11 +441,13 @@ impl HwpDocument {
             "all" => LayerFilter::All,
             "background" => LayerFilter::BackgroundOnly,
             "flow" => LayerFilter::FlowOnly,
+            "flow-dynamic" => LayerFilter::FlowDynamic,
+            "flow-static" => LayerFilter::FlowStatic,
             "behind" => LayerFilter::WrapOnly(TextWrap::BehindText),
             "front" => LayerFilter::WrapOnly(TextWrap::InFrontOfText),
             _ => {
                 return Err(JsValue::from_str(
-                    "invalid layer_kind: 'all' | 'background' | 'flow' | 'behind' | 'front'",
+                    "invalid layer_kind: 'all' | 'background' | 'flow' | 'flow-dynamic' | 'flow-static' | 'behind' | 'front'",
                 ))
             }
         };
@@ -820,6 +824,44 @@ impl HwpDocument {
             text,
         )
         .map_err(|e| e.into())
+    }
+
+    /// 표 셀 내부 문단에 텍스트를 삽입하되 전체 페이지네이션은 호출자가 지연한다.
+    ///
+    /// Studio의 page-local 단일 입력처럼 현재 페이지를 먼저 갱신하고 idle 시점에
+    /// 전체 페이지네이션을 한 번만 수행하는 경로에서 사용한다.
+    #[wasm_bindgen(js_name = insertTextInCellDeferredPagination)]
+    pub fn insert_text_in_cell_deferred_pagination(
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        control_idx: u32,
+        cell_idx: u32,
+        cell_para_idx: u32,
+        char_offset: u32,
+        text: &str,
+    ) -> Result<String, JsValue> {
+        self.insert_text_in_cell_native_deferred_pagination(
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            cell_para_idx as usize,
+            char_offset as usize,
+            text,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// 지연된 페이지네이션을 즉시 flush하고 최신 페이지 수를 반환한다.
+    #[wasm_bindgen(js_name = flushDeferredPagination)]
+    pub fn flush_deferred_pagination(&mut self) -> Result<String, JsValue> {
+        self.invalidate_page_tree_cache();
+        self.paginate();
+        Ok(format!(
+            "{{\"ok\":true,\"pageCount\":{}}}",
+            self.page_count()
+        ))
     }
 
     /// `insertTextInCell` 의 options object 변형 (#1413).
@@ -1418,6 +1460,96 @@ impl HwpDocument {
             json_bool(options_json, "equalRowHeight").unwrap_or(false),
         )
         .map_err(|e| e.into())
+    }
+
+    /// 선택된 표 셀 범위를 행/열 바꿈 복사용 내부 버퍼에 저장한다.
+    ///
+    /// 반환값: JSON `{"ok":true,"sourceRows":N,"sourceCols":N,"targetRows":N,"targetCols":N}`
+    #[wasm_bindgen(js_name = copyTableCellsTransposed)]
+    pub fn copy_table_cells_transposed(
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        control_idx: u32,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+    ) -> Result<String, JsValue> {
+        self.copy_table_cells_transposed_native(
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            start_row as u16,
+            start_col as u16,
+            end_row as u16,
+            end_col as u16,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// 행/열 바꿈 복사 버퍼를 대상 시작 셀부터 붙여넣는다.
+    ///
+    /// 반환값: JSON `{"ok":true,"sourceRows":N,"sourceCols":N,"targetRows":N,"targetCols":N}`
+    #[wasm_bindgen(js_name = pasteTableCellsTransposed)]
+    pub fn paste_table_cells_transposed(
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        control_idx: u32,
+        start_row: u32,
+        start_col: u32,
+    ) -> Result<String, JsValue> {
+        self.paste_table_cells_transposed_native(
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            start_row as u16,
+            start_col as u16,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// 선택된 전체 표를 제자리에서 전치한다.
+    ///
+    /// 반환값: JSON `{"ok":true,"sourceRows":N,"sourceCols":N,"targetRows":N,"targetCols":N}`
+    #[wasm_bindgen(js_name = transposeTableCellsInPlace)]
+    pub fn transpose_table_cells_in_place(
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        control_idx: u32,
+    ) -> Result<String, JsValue> {
+        self.transpose_table_cells_in_place_native(
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// 행/열 바꿈 복사 버퍼를 커서 위치에 새 표로 생성해 붙여넣는다.
+    ///
+    /// 반환값: JSON `{"ok":true,"paraIdx":N,"controlIdx":N,"sourceRows":N,"sourceCols":N,"targetRows":N,"targetCols":N}`
+    #[wasm_bindgen(js_name = pasteTableCellsTransposedAsTable)]
+    pub fn paste_table_cells_transposed_as_table(
+        &mut self,
+        section_idx: u32,
+        para_idx: u32,
+        char_offset: u32,
+    ) -> Result<String, JsValue> {
+        self.paste_table_cells_transposed_as_new_table_native(
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// 행/열 바꿈 복사 버퍼 보유 여부를 반환한다.
+    #[wasm_bindgen(js_name = hasTableTransposeClipboard)]
+    pub fn has_table_transpose_clipboard(&self) -> bool {
+        self.has_table_transpose_clipboard_native()
     }
 
     /// 캐럿 위치에서 문단을 분할한다 (Enter 키).
@@ -2221,6 +2353,26 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// 셀 고유 속성을 조회한다.
+    ///
+    /// cellzone overlay를 합성하지 않고 셀 자체의 borderFill만 반환한다.
+    #[wasm_bindgen(js_name = getCellOwnProperties)]
+    pub fn get_cell_own_properties(
+        &self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        control_idx: u32,
+        cell_idx: u32,
+    ) -> Result<String, JsValue> {
+        self.get_cell_own_properties_native(
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+        )
+        .map_err(|e| e.into())
+    }
+
     /// 셀 속성을 수정한다.
     ///
     /// 반환: JSON `{"ok":true}`
@@ -2238,6 +2390,34 @@ impl HwpDocument {
             parent_para_idx as usize,
             control_idx as usize,
             cell_idx as usize,
+            json,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// 선택 영역을 하나의 셀처럼 취급하는 cellzone 테두리/배경 속성을 적용한다.
+    ///
+    /// 반환: JSON `{"ok":true,"startRow":...,"borderFillId":...}`
+    #[wasm_bindgen(js_name = setCellZoneProperties)]
+    pub fn set_cell_zone_properties(
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        control_idx: u32,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+        json: &str,
+    ) -> Result<String, JsValue> {
+        self.set_cell_zone_properties_native(
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            start_row as u16,
+            start_col as u16,
+            end_row as u16,
+            end_col as u16,
             json,
         )
         .map_err(|e| e.into())
@@ -4604,6 +4784,28 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// [#2021] 경로 기반 커서 좌표 조회 + 페이지 힌트 — 직전 캐럿 페이지를 전달하면
+    /// 해당 페이지(±1)를 먼저 탐색해, 거대 표 문서에서 캐시 무효화 직후의 선형 페이지
+    /// 재빌드 비용을 피한다. 힌트가 틀려도 종전 전체 탐색으로 fallback (좌표 불변).
+    #[wasm_bindgen(js_name = getCursorRectByPathNear)]
+    pub fn get_cursor_rect_by_path_near(
+        &self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        path_json: &str,
+        char_offset: u32,
+        hint_page: u32,
+    ) -> Result<String, JsValue> {
+        self.get_cursor_rect_by_path_with_hint(
+            section_idx as usize,
+            parent_para_idx as usize,
+            path_json,
+            char_offset as usize,
+            Some(hint_page),
+        )
+        .map_err(|e| e.into())
+    }
+
     /// 경로 기반 셀 정보 조회 (중첩 표용).
     ///
     /// 반환: JSON `{"row":N,"col":N,"rowSpan":N,"colSpan":N}`
@@ -6580,6 +6782,14 @@ impl HwpDocument {
     #[wasm_bindgen(js_name = getBookmarks)]
     pub fn get_bookmarks(&self) -> Result<String, JsValue> {
         self.core.get_bookmarks_native().map_err(|e| e.into())
+    }
+
+    /// 문서 구조(개요/조문) 트리를 JSON으로 반환 (사이드바 목차 네비게이션용)
+    ///
+    /// `mode`: `"auto"` | `"outline"` | `"clause"` (인식 불가 시 `auto`).
+    #[wasm_bindgen(js_name = getStructure)]
+    pub fn get_structure(&self, mode: &str) -> Result<String, JsValue> {
+        self.core.get_structure_native(mode).map_err(|e| e.into())
     }
 
     /// 책갈피 추가

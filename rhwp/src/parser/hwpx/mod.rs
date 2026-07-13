@@ -64,6 +64,16 @@ pub enum HwpxError {
     MissingFile(String),
     /// 데이터 변환 오류
     ConversionError(String),
+    /// [Issue #1946] 비밀번호 암호화 HWPX(ODF encryption-data, AES-256-CBC).
+    /// 복호화 미지원 — 암호문을 UTF-8 로 오독하는 대신 명확히 분류한다.
+    Encrypted(String),
+}
+
+impl HwpxError {
+    /// 암호화 문서 여부 — 배치 게이트의 ENCRYPTED_SKIP 분류에 사용.
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self, HwpxError::Encrypted(_))
+    }
 }
 
 impl std::fmt::Display for HwpxError {
@@ -73,11 +83,38 @@ impl std::fmt::Display for HwpxError {
             HwpxError::XmlError(e) => write!(f, "XML 파싱 오류: {}", e),
             HwpxError::MissingFile(e) => write!(f, "필수 파일 누락: {}", e),
             HwpxError::ConversionError(e) => write!(f, "변환 오류: {}", e),
+            HwpxError::Encrypted(e) => write!(f, "암호화된 문서(복호화 미지원): {}", e),
         }
     }
 }
 
 impl std::error::Error for HwpxError {}
+
+/// [Issue #1946] META-INF/manifest.xml 바이트에서 ODF 암호화 표식을 감지한다.
+/// 암호화면 알고리즘 요약을, 아니면 None 을 반환한다. manifest 자체는 평문이므로
+/// UTF-8 손실 없이 검사 가능하나, 안전을 위해 lossy 로 읽어 부분 손상에도 동작한다.
+fn detect_odf_encryption(manifest_bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(manifest_bytes);
+    if !text.contains("encryption-data") {
+        return None;
+    }
+    let algo = if text.contains("aes256-cbc") {
+        "AES-256-CBC"
+    } else if text.contains("aes128-cbc") {
+        "AES-128-CBC"
+    } else {
+        "미상 알고리즘"
+    };
+    let kdf = if text.contains("pbkdf2") {
+        " + PBKDF2"
+    } else {
+        ""
+    };
+    Some(format!(
+        "ODF encryption-data 감지 ({}{}) — 비밀번호 보호 문서",
+        algo, kdf
+    ))
+}
 
 impl From<zip::result::ZipError> for HwpxError {
     fn from(e: zip::result::ZipError) -> Self {
@@ -142,6 +179,16 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
     // 1. ZIP 컨테이너 열기
     let mut reader = reader::HwpxReader::open(data)?;
 
+    // [Issue #1946] 암호화 HWPX 조기 감지. META-INF/manifest.xml 은 암호화 문서에서도
+    // 평문이며, 암호화된 엔트리마다 <odf:encryption-data> 블록을 갖는다. 감지하면
+    // 암호문(Contents/*.xml)을 UTF-8 로 오독하기 전에 명확한 Encrypted 에러로 반환한다
+    // (종전엔 "UTF-8 변환 실패" 오진단). manifest 부재/평문 문서는 종전 경로 유지.
+    if let Ok(manifest) = reader.read_file_bytes("META-INF/manifest.xml") {
+        if let Some(detail) = detect_odf_encryption(&manifest) {
+            return Err(HwpxError::Encrypted(detail));
+        }
+    }
+
     // 1-1. 보조 엔트리 원본 보존 (라운드트립 무손실).
     //   IR 로 모델링되지 않는 엔트리(version.xml/settings.xml/Preview/*)는
     //   직렬화기가 하드코딩 상수로 재생성하면서 원본 플랫폼/인쇄설정/미리보기를
@@ -151,6 +198,7 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
         "settings.xml",
         "Preview/PrvText.txt",
         "Preview/PrvImage.png",
+        crate::model::document::HWP5_ORIGIN_HWPX_MARKER_PATH,
     ];
     let mut hwpx_aux_entries: Vec<(String, Vec<u8>)> = Vec::new();
     for path in HWPX_AUX_PATHS {
@@ -174,11 +222,14 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
     let header_xml = reader.read_file("Contents/header.xml")?;
     let (mut doc_info, doc_properties) = header::parse_hwpx_header(&header_xml)?;
 
-    // [Task #554] HWP3 → HWPX 변환본 식별: hwpml 스키마 버전 = "1.4"
-    // 변환본은 한글97의 "마지막 줄 tolerance" (1600 HU) 가 누락되어 페이지 수가
-    // 늘어나므로, 본 시점에 식별하여 page_def.margin_bottom 보정 (post-process)에 사용.
+    // [Task #1608] head version("1.4")은 HWPML **스키마 버전**일 뿐 HWP3→HWPX 변환 지표가
+    // 아니다. 네이티브 한글2022 HWPX(version.xml: major=5 minor=1 "Hancom Office Hangul")도
+    // head version 1.4 라, 과거 `is_hwp3_origin = (head version == "1.4")` (Task #554) 판정은
+    // 거의 모든 모던 HWPX 를 HWP3-origin 으로 오탐지해 부당한 "마지막 줄" tolerance(1600 HU)를
+    // 부여했고, 이것이 경계 문서를 1쪽 적게 렌더하는 −1쪽 갭의 한 요인이었다(Task #1600 요인 A).
+    // 메타데이터로 진짜 변환본과 네이티브를 구별할 판별자가 없어(조사 확정), 파싱 시점의 HWP3
+    // tolerance 부여를 제거한다.
     let hwpml_version = header::parse_hwpx_hwpml_version(&header_xml);
-    let is_hwp3_origin = hwpml_version.as_deref() == Some("1.4");
     // 무손실: 원본 HWPML 버전을 보존해 직렬화 때 그대로 재방출(하드코딩 금지).
     doc_info.hwpml_version = hwpml_version.clone();
 
@@ -258,15 +309,9 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
         }
     }
 
-    // [Task #554] HWP3 변환본 보정: 한글97의 마지막 줄 tolerance 모방.
-    // HWPX→HWP 저장 contract 에서는 PAGE_DEF margin_bottom 원본값을 보존해야 하므로
-    // margin 자체를 줄이지 않고 pagination 전용 tolerance 로만 전달한다.
-    if is_hwp3_origin {
-        for section in sections.iter_mut() {
-            section.section_def.page_def.pagination_bottom_tolerance =
-                section.section_def.page_def.margin_bottom.min(1600);
-        }
-    }
+    // [Task #1608] (제거) 과거 Task #554 의 HWP3-origin tolerance 부여는
+    // head version == "1.4" 오탐지로 네이티브 HWPX 전반에 부당 적용되어 삭제했다.
+    // 상세 사유는 위 hwpml_version 파싱부 주석 참조.
 
     // 5. BinData 이미지 로딩
     let mut bin_data_content = Vec::new();
@@ -291,7 +336,19 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
                 });
             }
             Err(e) => {
-                eprintln!("경고: BinData '{}' 로드 실패: {}", item.href, e);
+                // [#1917] 로드 실패(상한 초과·엔트리 손상 등) 시에도 빈 데이터
+                // placeholder를 등록해 manifest·binaryItemIDRef를 보존한다.
+                // 미등록 시 직렬화기가 <hp:pic>를 통째로 드롭해 왕복 구조
+                // 손실(IR_DIFF 하드 실패)이 발생한다. 이미지 데이터만 손실.
+                eprintln!(
+                    "경고: BinData '{}' 로드 실패: {} — placeholder 등록(이미지 데이터 소실)",
+                    item.href, e
+                );
+                bin_data_content.push(BinDataContent {
+                    id: (i + 1) as u16,
+                    data: Vec::new(),
+                    extension: hwpx_bin_data_extension(item),
+                });
             }
         }
     }
@@ -347,6 +404,7 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
         extra_streams: contract.streams,
         hwpx_aux_entries,
         is_hwp3_variant: false,
+        is_hwpx_variant: false,
     };
 
     // [Task #873] BinData Link 타입 의 외부 file path 영역 영역 Picture.external_path 영역

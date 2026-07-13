@@ -91,6 +91,7 @@ mod tests {
                 image_fill: None,
                 diagonal_attr: 0,
                 diagonal: Default::default(),
+                center_line: Default::default(),
             }],
             numberings: Vec::new(),
             bullets: Vec::new(),
@@ -815,6 +816,150 @@ mod tests {
             img_top,
             img_bottom,
             overlap_chars,
+        );
+    }
+
+    /// Issue #1230: Square-wrap(어울림) 비-TAC 그림에서 `shape_attr.current_*` 가
+    /// `common`(개체 틀)보다 부풀려진 경우(KICE EMF 그래프 패턴: common=198px,
+    /// current=367px), 텍스트는 파일 LINE_SEG(sw) 기준 common 만큼만 좁혀지는데
+    /// 그림이 current 크기로 그려져 본문과 겹치던 문제의 회귀 가드.
+    ///
+    /// 재현 파일이 저장소에 없어(KICE 수능특강) `samples/exam_science.hwp` pi=21
+    /// (common=11250×10230, wrap=Square, tac=false, 호스트 6줄 sw=19592) 의
+    /// current 를 KICE 비율(×1.853)로 부풀려 같은 IR 상태를 합성한다.
+    /// 한컴은 개체 틀(common)에 맞춰 그린다 (#1230 정답지 분석).
+    #[test]
+    fn test_1230_square_wrap_inflated_current_draws_at_frame() {
+        use crate::model::control::Control;
+        use crate::model::shape::TextWrap;
+
+        let Some(mut core) = load_document("samples/exam_science.hwp") else {
+            return;
+        };
+        // pi=21 ci=0 Square 그림의 current 만 부풀림 — 파일 LINE_SEG(sw=19592)는 불변.
+        {
+            let para = &mut core.document.sections[0].paragraphs[21];
+            let Some(Control::Picture(pic)) = para.controls.get_mut(0) else {
+                panic!("#1230: exam_science pi=21 ci=0 이 Picture 가 아님");
+            };
+            assert!(!pic.common.treat_as_char, "#1230 전제: 비-TAC");
+            assert!(
+                matches!(pic.common.text_wrap, TextWrap::Square),
+                "#1230 전제: wrap=Square"
+            );
+            assert_eq!(pic.common.width, 11250, "#1230 전제: common.width");
+            pic.shape_attr.current_width = 20846; // 11250 × 1.853 (KICE 198→367px 비율)
+            pic.shape_attr.current_height = 18956; // 10230 × 1.853
+        }
+
+        let tree = core
+            .build_page_render_tree(0)
+            .expect("#1230: exam_science 페이지 1 렌더 실패");
+
+        // pi=21 ci=0 Image 노드 bbox 수집
+        fn find_image<'a>(node: &'a RenderNode, out: &mut Option<&'a RenderNode>) {
+            if let RenderNodeType::Image(img) = &node.node_type {
+                if img.para_index == Some(21) && img.control_index == Some(0) {
+                    *out = Some(node);
+                }
+            }
+            for child in &node.children {
+                find_image(child, out);
+            }
+        }
+        let mut img_node = None;
+        find_image(&tree.root, &mut img_node);
+        let img = img_node.expect("#1230: pi=21 ci=0 Image 노드를 찾지 못함");
+
+        // 1) 표시 폭/높이 = 개체 틀(common) 크기 (11250HU=150px, 10230HU=136.4px)
+        assert!(
+            (img.bbox.width - 150.0).abs() < 2.0,
+            "#1230: 그림이 개체 틀(common=150px)이 아닌 {}px 로 그려짐 (current 과대 렌더)",
+            img.bbox.width
+        );
+        assert!(
+            (img.bbox.height - 136.4).abs() < 2.0,
+            "#1230: 그림 높이가 개체 틀(common=136.4px)이 아닌 {}px",
+            img.bbox.height
+        );
+
+        // 2) 그림 사각형과 수평 겹치는 TextRun 없음 (wrap 텍스트 침범 금지)
+        fn collect_overlapping_text(
+            node: &RenderNode,
+            img_bbox: &crate::renderer::render_tree::BoundingBox,
+            out: &mut Vec<(f64, f64, String)>,
+        ) {
+            if let RenderNodeType::TextRun(run) = &node.node_type {
+                let b = &node.bbox;
+                let y_mid = b.y + b.height / 2.0;
+                // wrap 텍스트는 프레임에 딱 붙게 배치되므로(후행 공백 bbox 포함)
+                // 4px 이상 파고든 경우만 침범으로 판정한다. 버그 상태의 침범은 ~127px.
+                let horizontal_overlap =
+                    b.x < img_bbox.x + img_bbox.width - 4.0 && b.x + b.width > img_bbox.x + 4.0;
+                if y_mid > img_bbox.y && y_mid < img_bbox.y + img_bbox.height && horizontal_overlap
+                {
+                    out.push((b.x, b.y, run.text.clone()));
+                }
+            }
+            for child in &node.children {
+                collect_overlapping_text(child, img_bbox, out);
+            }
+        }
+        let mut overlaps = Vec::new();
+        collect_overlapping_text(&tree.root, &img.bbox, &mut overlaps);
+        assert!(
+            overlaps.is_empty(),
+            "#1230: 텍스트가 그림 영역(x={:.1}..{:.1})에 침범: {:?}",
+            img.bbox.x,
+            img.bbox.x + img.bbox.width,
+            overlaps
+        );
+    }
+
+    /// Issue #1838 회귀 가드: 셀 폭을 초과하는 텍스트(공백 포함)가 파일 lineseg
+    /// (짧은 값 기준 단일 줄, 외부 도구 값 교체 시나리오)와 부정합해도 **모든 글자가
+    /// SVG 에 방출**되어야 한다 (조용한 글리프 탈락 금지).
+    ///
+    /// 진단 확정 사항 (basic-table-01 합성):
+    /// - compose/렌더트리/SVG 모두 전체 텍스트 보존 — 글리프 탈락 없음.
+    /// - SVG 는 per-cluster(<text> 글자 단위) 방출이라 "앞토큰" 같은 다글자
+    ///   부분문자열 검색은 항상 실패한다 — 존재 검사는 글자 단위로 해야 함.
+    /// - 초과분은 cell clipPath 안에 있어 시각적으로만 잘린다 (별도 개선 축:
+    ///   한컴은 열었을 때 재줄바꿈해 2줄 표시).
+    #[test]
+    fn test_1838_overwide_cell_text_keeps_all_glyphs_in_svg() {
+        use crate::model::control::Control;
+
+        let Some(mut core) = load_document("samples/hwpx/basic-table-01.hwpx") else {
+            return;
+        };
+        let value = "앞토큰 뒤토큰뒤토큰(괄호포함내용내용내용)";
+        {
+            let para = &mut core.document.sections[0].paragraphs[0];
+            let Some(Control::Table(table)) = para.controls.get_mut(2) else {
+                panic!("#1838: basic-table-01 문단 0 ctrl[2] 가 표가 아님");
+            };
+            // 실제 파일 상태 충실 재현: text/char_offsets/char_count 는 파서 정합값,
+            // line_segs 는 짧은 원본값 기준 단일 줄로 잔존.
+            let cell_para = &mut table.cells[0].paragraphs[0];
+            assert_eq!(cell_para.line_segs.len(), 1, "#1838 전제: 단일 lineseg");
+            cell_para.text = value.to_string();
+            let n = cell_para.text.chars().count() as u32;
+            cell_para.char_offsets = (0..n).collect();
+            cell_para.char_count = n + 1;
+        }
+        let svg = core.render_page_svg_native(0).unwrap_or_default();
+        assert!(!svg.is_empty(), "#1838: SVG 비어있음");
+
+        // per-cluster 방출이므로 글자 단위로 존재 검사 (공백 제외 전 글자)
+        let missing: Vec<char> = value
+            .chars()
+            .filter(|c| *c != ' ')
+            .filter(|c| !svg.contains(&format!(">{c}<")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "#1838: 셀 폭 초과 텍스트의 글자가 SVG 에서 누락됨: {missing:?}"
         );
     }
 

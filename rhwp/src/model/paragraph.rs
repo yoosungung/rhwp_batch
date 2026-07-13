@@ -30,6 +30,8 @@ pub struct Paragraph {
     pub range_tags: Vec<RangeTag>,
     /// 필드 텍스트 범위 (0x03~0x04 사이 텍스트 인덱스 + 컨트롤 인덱스)
     pub field_ranges: Vec<FieldRange>,
+    /// 고아 FIELD_END (다단락 필드의 종료 마커 — begin 이 다른 문단). HWPX 전용 (Task #1556).
+    pub orphan_field_ends: Vec<OrphanFieldEnd>,
     /// 컨트롤 목록 (표, 그림, 각주 등)
     pub controls: Vec<Control>,
     /// 각 컨트롤에 대응하는 CTRL_DATA 레코드 (라운드트립 보존용)
@@ -180,6 +182,27 @@ impl LineSeg {
 
     /// 한 줄이 하나의 세그먼트로만 구성될 때 사용하는 HWP5 tag 조합.
     pub const TAG_SINGLE_SEGMENT_LINE: u32 = Self::TAG_FIRST_SEGMENT | Self::TAG_LAST_SEGMENT;
+    /// HWP5 출처 문단의 원본 LineSeg 부재 의미를 HWPX 재파스에서도 보존하기 위한 tag 조합.
+    pub const TAG_MISSING_LINESEG_PLACEHOLDER: u32 =
+        Self::TAG_SINGLE_SEGMENT_LINE | Self::TAG_EMPTY_SEGMENT | Self::TAG_IMPLEMENTATION_PROPERTY;
+
+    /// HWP5 원본에서 LineSeg가 없던 문단을 HWPX 산출물에 명시할 때 쓰는 LineSeg.
+    pub fn missing_lineseg_placeholder() -> Self {
+        Self {
+            tag: Self::TAG_MISSING_LINESEG_PLACEHOLDER,
+            ..Self::default()
+        }
+    }
+
+    /// rhwp가 HWP5 -> HWPX export 중 생성한 원본 LineSeg 부재 보존용 LineSeg인지 여부.
+    pub fn is_missing_lineseg_placeholder(&self) -> bool {
+        self.line_height == 0
+            && self.text_height == 0
+            && self.baseline_distance == 0
+            && self.line_spacing == 0
+            && self.tag & Self::TAG_MISSING_LINESEG_PLACEHOLDER
+                == Self::TAG_MISSING_LINESEG_PLACEHOLDER
+    }
 
     /// 페이지의 첫 줄인지 여부
     pub fn is_first_line_of_page(&self) -> bool {
@@ -251,6 +274,21 @@ pub struct FieldRange {
     pub end_char_idx: usize,
     /// controls[] 배열 내 인덱스 (해당 Field 컨트롤 참조)
     pub control_idx: usize,
+}
+
+/// 고아 FIELD_END (0x04) — 짝이 되는 FIELD_BEGIN 이 다른 문단에 있는
+/// 다단락 필드의 종료 마커. begin 문단에서 `Control::Field` 로 보존되는 것과 달리,
+/// end 문단에는 컨트롤·FieldRange 가 없어 8유닛 슬롯을 표현할 산출물이 없다.
+/// 이를 기록해 직렬화기가 `<hp:fieldEnd>` 를 같은 위치에 복원한다 (Task #1556).
+#[derive(Debug, Clone, Default)]
+pub struct OrphanFieldEnd {
+    /// text 문자열 내 위치 (이 인덱스 직전에 8유닛 fieldEnd 슬롯이 놓인다).
+    /// 텍스트 끝이면 `text.chars().count()`.
+    pub char_idx: usize,
+    /// `<hp:fieldEnd beginIDRef="..">` — 짝 fieldBegin 의 id 참조.
+    pub begin_id_ref: u32,
+    /// `<hp:fieldEnd fieldid="..">` — 필드 인스턴스 id.
+    pub field_id: u32,
 }
 
 impl Paragraph {
@@ -362,7 +400,14 @@ impl Paragraph {
 
     /// 빈 문단을 생성한다 (문단 끝 마커만 포함).
     ///
-    /// 표 셀 생성 등에서 최소한의 유효한 문단이 필요할 때 사용한다.
+    /// `para_shape_id`/`style_id` 는 0, `char_shapes` 는 빈 채로 남는다. 이 0 은
+    /// "기본 서식" 이 아니라 그 문서 `header.xml` 의 **0번 항목**이며, 저장기는 빈
+    /// `char_shapes` 를 `charPrIDRef="0"` 으로 쓴다. 따라서 이미 존재하는 문서에
+    /// 문단을 끼워 넣을 때 이 함수를 쓰면 그 문서의 0번 문단모양·글자모양이 적용된다.
+    ///
+    /// 상속할 이웃 문단이 있는 경우 [`Paragraph::new_empty_like`] 를 쓴다. 이 함수는
+    /// 상속원이 아예 없는 경우 — 새 빈 문서 생성, HTML 임포트, 문단이 하나도 없던
+    /// 셀을 파싱할 때 — 에만 쓴다.
     pub fn new_empty() -> Self {
         Paragraph {
             char_count: 1, // 끝 마커(0x000D) 포함
@@ -376,6 +421,29 @@ impl Paragraph {
                 ..Default::default()
             }],
             ..Default::default()
+        }
+    }
+
+    /// `template` 의 서식을 상속한 빈 문단을 생성한다.
+    ///
+    /// 문단모양(`para_shape_id`), 스타일(`style_id`), 끝 글자모양(마지막
+    /// `char_shapes` 엔트리)만 가져온다. 텍스트·컨트롤·필드는 상속하지 않는다.
+    /// 새 문단은 템플릿 문단 *뒤에* 이어지므로(문단 끝 Enter), 혼합 글자모양
+    /// 문단에서는 첫 엔트리가 아니라 문단 끝의 글자모양이 상속 기준이다.
+    pub fn new_empty_like(template: &Paragraph) -> Self {
+        Paragraph {
+            para_shape_id: template.para_shape_id,
+            style_id: template.style_id,
+            char_shapes: template
+                .char_shapes
+                .last()
+                .map(|cs| CharShapeRef {
+                    start_pos: 0,
+                    char_shape_id: cs.char_shape_id,
+                })
+                .into_iter()
+                .collect(),
+            ..Paragraph::new_empty()
         }
     }
 
@@ -830,6 +898,7 @@ impl Paragraph {
             line_segs: new_line_segs,
             range_tags: new_range_tags,
             field_ranges: Vec::new(), // controls가 이동하지 않으므로 새 문단에는 필드 없음
+            orphan_field_ends: Vec::new(),
             char_count: new_char_count,
             para_shape_id: self.para_shape_id,
             style_id: self.style_id,

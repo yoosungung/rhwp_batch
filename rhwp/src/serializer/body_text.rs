@@ -37,9 +37,41 @@ pub fn serialize_section(section: &Section) -> Vec<u8> {
     let memo_lists = collect_memo_lists(section);
     let has_memo_tail = !memo_lists.is_empty();
     let para_count = section.paragraphs.len();
+    // [Issue #1915] IR 계약 폴백: 첫 문단에 Control::SectionDef 가 없는 IR(HWP3 파서
+    // 산출물, 외부 생성 IR)은 secd/PAGE_DEF 계열 레코드가 통째로 누락되어 재로드 시
+    // 용지·여백이 0 이 된다 (hwpdocs 10k 서베이 41건, 전부 HWP3-origin).
+    // hwpx_to_hwp 어댑터의 insert_section_def_control 보강과 동일 계약을 직렬화기
+    // 진입에서 적용한다 — 첫 문단만 SectionDef 컨트롤을 삽입한 사본으로 직렬화.
+    // 원본 스트림 경로(raw_stream)는 위에서 이미 반환되므로 영향 없음.
+    // 실질 page_def(용지 크기 보유)가 있을 때만 보강한다 — 기본값(0×0) section_def
+    // 를 가진 합성/부분 IR(유닛테스트 fixture 등)에 무의미한 secd 를 주입해 레코드
+    // 시퀀스를 바꾸지 않기 위함.
+    let has_real_page_def =
+        section.section_def.page_def.width > 0 && section.section_def.page_def.height > 0;
+    let first_para_with_secd = section.paragraphs.first().and_then(|p| {
+        if !has_real_page_def
+            || p.controls
+                .iter()
+                .any(|c| matches!(c, Control::SectionDef(_)))
+        {
+            None
+        } else {
+            let mut clone = p.clone();
+            clone.controls.insert(
+                0,
+                Control::SectionDef(Box::new(section.section_def.clone())),
+            );
+            Some(clone)
+        }
+    });
     for (i, para) in section.paragraphs.iter().enumerate() {
         let is_last = i == para_count - 1 && !has_memo_tail;
-        serialize_paragraph_with_msb(para, 0, is_last, &mut records);
+        let para_ref = if i == 0 {
+            first_para_with_secd.as_ref().unwrap_or(para)
+        } else {
+            para
+        };
+        serialize_paragraph_with_msb(para_ref, 0, is_last, &mut records);
     }
     if has_memo_tail {
         serialize_memo_tail(section, &memo_lists, &mut records);
@@ -482,7 +514,15 @@ fn serialize_para_text(para: &Paragraph) -> Vec<u8> {
         }
 
         // 갭에 컨트롤 문자 배치 (각 컨트롤 = 8 code unit)
-        while prev_end + 8 <= offset && ctrl_idx < para.controls.len() {
+        // [#1795] 이 인덱스에 삽입될 FIELD_END(각 8 cu)의 공간을 먼저 예약한다.
+        // 예약 없이 갭을 컨트롤로 채우면 FIELD_END 전용 갭(8 cu)을 다음 컨트롤이
+        // 선점하여 이후 모든 char_offsets 가 시프트되고, 재파싱 시 lineseg
+        // text_start 매핑이 어긋나 줄바꿈 위치가 이동한다 (seoul_0043 글상자).
+        let pending_field_end_cus = field_ends
+            .get(&i)
+            .map(|markers| markers.len() as u32 * 8)
+            .unwrap_or(0);
+        while prev_end + 8 + pending_field_end_cus <= offset && ctrl_idx < para.controls.len() {
             let (ctrl_code, ctrl_id) = control_char_code_and_id(&para.controls[ctrl_idx]);
             push_extended_ctrl(&mut code_units, ctrl_code, ctrl_id);
             ctrl_idx += 1;
@@ -520,7 +560,9 @@ fn serialize_para_text(para: &Paragraph) -> Vec<u8> {
                 prev_end = offset + 1;
             }
             '\u{00A0}' => {
-                code_units.push(0x0018);
+                // 묶음 빈칸 (HWP 5.0 표 7: 코드 30). 코드 24(0x18)는 하이픈으로
+                // 재파싱 시 '-' 가 되므로 쓰면 안 된다 (#1793).
+                code_units.push(0x001E);
                 prev_end = offset + 1;
             }
             '\u{2007}' => {
@@ -1118,6 +1160,22 @@ mod tests {
         assert_ne!(compute_control_mask(&para) & (1u32 << 0x001f), 0);
     }
 
+    /// [#1793] 묶음 빈칸(NBSP, U+00A0)은 코드 30(0x1E)으로 직렬화되어야 한다.
+    /// 코드 24(0x18)는 하이픈이라 재파싱 시 '-' 로 손상된다.
+    #[test]
+    fn test_nbsp_serializes_as_code_30() {
+        let para = Paragraph {
+            char_count: 4,
+            text: "가\u{00A0}나".to_string(),
+            char_offsets: vec![0, 1, 2],
+            ..Default::default()
+        };
+
+        let bytes = test_serialize_para_text(&para);
+
+        assert_eq!(&bytes[2..4], &0x001E_u16.to_le_bytes());
+    }
+
     /// 컨트롤 문자 코드 매핑 테스트
     #[test]
     fn test_control_char_code() {
@@ -1169,6 +1227,72 @@ mod tests {
         assert!(bytes
             .windows(expected_field_end.len())
             .any(|window| window == expected_field_end));
+    }
+
+    /// [#1795] FIELD_END 전용 갭(8 cu)을 다음 컨트롤(FIELD_BEGIN)이 선점하면
+    /// 이후 char_offsets 가 시프트되어 lineseg text_start 매핑이 어긋난다.
+    /// 필드 2개 문단에서 스트림 배치와 offsets 가 라운드트립 보존되는지 검증.
+    #[test]
+    fn test_field_end_gap_not_stolen_by_next_control() {
+        let make_field = || {
+            Control::Field(Field {
+                field_type: FieldType::Hyperlink,
+                ctrl_id: tags::FIELD_HYPERLINK,
+                ..Default::default()
+            })
+        };
+        let para = Paragraph {
+            char_count: 38,
+            text: "ab cd".to_string(),
+            // [FB0 0..8] a=8 b=9 [FE0 10..18] ' '=18 [FB1 19..27] c=27 d=28 [FE1] 0x0D
+            char_offsets: vec![8, 9, 18, 27, 28],
+            char_shapes: vec![CharShapeRef {
+                start_pos: 0,
+                char_shape_id: 0,
+            }],
+            line_segs: vec![LineSeg {
+                text_start: 0,
+                ..Default::default()
+            }],
+            controls: vec![make_field(), make_field()],
+            field_ranges: vec![
+                crate::model::paragraph::FieldRange {
+                    start_char_idx: 0,
+                    end_char_idx: 2,
+                    control_idx: 0,
+                },
+                crate::model::paragraph::FieldRange {
+                    start_char_idx: 3,
+                    end_char_idx: 5,
+                    control_idx: 1,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let section = Section {
+            paragraphs: vec![para],
+            raw_stream: None,
+            ..Default::default()
+        };
+
+        let bytes = serialize_section(&section);
+        let parsed = parse_body_text_section(&bytes).unwrap();
+
+        assert_eq!(parsed.paragraphs.len(), 1);
+        let p = &parsed.paragraphs[0];
+        assert_eq!(p.text, "ab cd");
+        assert_eq!(
+            p.char_offsets,
+            vec![8, 9, 18, 27, 28],
+            "FIELD_END 갭 선점으로 char_offsets 가 시프트되면 안 된다"
+        );
+        assert_eq!(p.field_ranges.len(), 2);
+        assert_eq!(
+            p.field_ranges[1].start_char_idx, 3,
+            "두 번째 필드 범위가 앞으로 당겨지면 안 된다"
+        );
+        assert_eq!(p.field_ranges[1].end_char_idx, 5);
     }
 
     /// 확장 컨트롤 포함 문단 라운드트립

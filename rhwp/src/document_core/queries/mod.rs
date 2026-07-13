@@ -6,3 +6,4 @@ pub(crate) mod field_query;
 mod form_query;
 pub mod rendering;
 mod search_query;
+pub mod structure;

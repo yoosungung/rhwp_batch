@@ -364,7 +364,8 @@ impl LayoutEngine {
         vpos_accounts_for_height: bool,
     ) -> f64 {
         // 그림 크기 (HWPUNIT → 픽셀)
-        let (pic_width_hu, pic_height_hu) = picture_display_size_hu(picture);
+        // [Issue #1230] 측면흐름 wrap 은 common(개체 틀) 프레임으로 그린다.
+        let (pic_width_hu, pic_height_hu) = super::utils::picture_flow_frame_size_hu(picture);
         let pic_width = hwpunit_to_px(pic_width_hu, self.dpi);
         let pic_height = hwpunit_to_px(pic_height_hu, self.dpi);
 
@@ -403,6 +404,26 @@ impl LayoutEngine {
             y_offset,
             alignment,
         );
+
+        // [Issue #2032] restrictInPage(쪽 영역 안으로 제한, HWP5 attr bit 13 = HWPX pos@flowWithText):
+        // vert=Para floating 그림의 하단이 쪽 영역을 벗어나면 쪽 영역 안으로 끌어올린다.
+        // 미적용 시 앵커+offset 조합으로 좌표가 페이지 캔버스 밖이 되어 그림이 어느
+        // 페이지에서도 보이지 않는다 (완전 소실). floating 표 동등 로직
+        // (table_layout.rs compute_table_y 의 Para 클램프) 과 동일 시멘틱.
+        // 상단(top bleed) 은 한컴도 허용하는 사례가 있어 하단 초과만 교정한다
+        // (표의 allow_para_top_bleed 예외와 동일 취지).
+        // vpos_accounts_for_height(파일 vpos 가 그림 공간을 이미 반영) 이면 그림은
+        // base_y 위쪽 gap 안에 그려지므로 (frame 하단 = base_y) 클램프 비대상.
+        let base_y = if !picture.common.treat_as_char
+            && picture.common.flow_with_text
+            && !vpos_accounts_for_height
+            && matches!(picture.common.vert_rel_to, VertRelTo::Para)
+        {
+            let body_bottom = col_area.y + col_area.height - total_height;
+            base_y.min(body_bottom.max(col_area.y))
+        } else {
+            base_y
+        };
 
         // 캡션 방향에 따라 그림 위치 오프셋 계산
         let (caption_top_offset, caption_left_offset) = if let Some(ref caption) = picture.caption {
@@ -535,6 +556,7 @@ impl LayoutEngine {
                 cap_w,
                 cap_y,
                 &mut self.auto_counter.borrow_mut(),
+                bin_data_content,
                 Some(cell_ctx),
             );
         }
@@ -577,11 +599,19 @@ impl LayoutEngine {
             return 0.0;
         }
 
-        let mut total_height = 0.0;
+        let mut line_seg_height = 0.0f64;
+        let mut composed_height = 0.0f64;
         for para in &caption.paragraphs {
+            if let (Some(first), Some(last)) = (para.line_segs.first(), para.line_segs.last()) {
+                let para_top = first.vertical_pos.min(0);
+                let para_bottom = last.vertical_pos + last.line_height;
+                line_seg_height =
+                    line_seg_height.max(hwpunit_to_px(para_bottom - para_top, self.dpi));
+            }
+
             let composed = compose_paragraph(para);
             if composed.lines.is_empty() {
-                total_height += hwpunit_to_px(400, self.dpi); // 기본 줄 높이
+                composed_height += hwpunit_to_px(400, self.dpi); // 기본 줄 높이
             } else {
                 for (i, line) in composed.lines.iter().enumerate() {
                     let line_h = hwpunit_to_px(line.line_height, self.dpi);
@@ -590,12 +620,12 @@ impl LayoutEngine {
                     } else {
                         0.0 // 마지막 줄은 line_spacing 제외
                     };
-                    total_height += line_h + spacing;
+                    composed_height += line_h + spacing;
                 }
             }
         }
 
-        total_height
+        line_seg_height.max(composed_height)
     }
 
     /// 캡션을 레이아웃한다.
@@ -610,6 +640,7 @@ impl LayoutEngine {
         content_width: f64,
         y_start: f64,
         auto_counter: &mut AutoNumberCounter,
+        bin_data_content: &[BinDataContent],
         cell_ctx: Option<super::CellContext>,
     ) {
         if caption.paragraphs.is_empty() {
@@ -625,6 +656,7 @@ impl LayoutEngine {
 
         let mut para_y = y_start;
         for (pi, para) in caption.paragraphs.iter().enumerate() {
+            let para_y_before_layout = para_y;
             // 먼저 문단을 조합
             let mut composed = compose_paragraph(para);
 
@@ -651,15 +683,110 @@ impl LayoutEngine {
                 composed.lines.len(),
                 0,
                 0,
-                ctx,
+                ctx.clone(),
                 false,
                 false,
                 0.0,
                 None,
-                None,
-                None,
+                Some(para),
+                Some(bin_data_content),
                 None, // 캡션 컨텍스트 — wrap zone 무관
             );
+
+            self.layout_caption_topbottom_pictures(
+                tree,
+                parent_node,
+                para,
+                &caption_area,
+                para_y_before_layout,
+                bin_data_content,
+                ctx.as_ref(),
+            );
+        }
+    }
+
+    fn layout_caption_topbottom_pictures(
+        &self,
+        tree: &mut PageRenderTree,
+        parent_node: &mut RenderNode,
+        para: &Paragraph,
+        caption_area: &LayoutRect,
+        para_y: f64,
+        bin_data_content: &[BinDataContent],
+        cell_ctx: Option<&super::CellContext>,
+    ) {
+        let anchor_y = para
+            .line_segs
+            .first()
+            .filter(|seg| seg.vertical_pos >= 0)
+            .map(|seg| caption_area.y + hwpunit_to_px(seg.vertical_pos, self.dpi))
+            .unwrap_or(para_y);
+
+        for (ctrl_idx, ctrl) in para.controls.iter().enumerate() {
+            let Control::Picture(pic) = ctrl else {
+                continue;
+            };
+            if !matches!(pic.common.text_wrap, TextWrap::TopAndBottom) {
+                continue;
+            }
+            if tree
+                .get_inline_shape_position(0, 0, ctrl_idx, cell_ctx)
+                .is_some()
+            {
+                continue;
+            }
+
+            let (pic_width_hu, pic_height_hu) = picture_display_size_hu(pic);
+            let pic_width = hwpunit_to_px(pic_width_hu, self.dpi);
+            let pic_height = hwpunit_to_px(pic_height_hu, self.dpi);
+            let placement_area = LayoutRect {
+                x: caption_area.x,
+                y: anchor_y,
+                width: caption_area.width,
+                height: pic_height.max(caption_area.height),
+            };
+            let mut placement_common = pic.common.clone();
+            placement_common.treat_as_char = false;
+            let (pic_x, pic_y) = self.compute_object_position(
+                &placement_common,
+                pic_width,
+                pic_height,
+                &placement_area,
+                &placement_area,
+                &placement_area,
+                &placement_area,
+                anchor_y,
+                Alignment::Left,
+            );
+            let pic_area = LayoutRect {
+                x: pic_x,
+                y: pic_y,
+                width: pic_width,
+                height: pic_height,
+            };
+            let mut pic_for_layout = (**pic).clone();
+            pic_for_layout.common.treat_as_char = false;
+            pic_for_layout.common.horizontal_offset = 0;
+            pic_for_layout.common.vertical_offset = 0;
+            pic_for_layout.common.horz_align = HorzAlign::Left;
+            pic_for_layout.common.vert_align = VertAlign::Top;
+
+            self.layout_picture(
+                tree,
+                parent_node,
+                &pic_for_layout,
+                &pic_area,
+                bin_data_content,
+                Alignment::Left,
+                Some(0),
+                Some(0),
+                Some(ctrl_idx),
+                cell_ctx,
+            );
+
+            if pic.common.treat_as_char {
+                tree.set_inline_shape_position(0, 0, ctrl_idx, cell_ctx, pic_x, pic_y);
+            }
         }
     }
 

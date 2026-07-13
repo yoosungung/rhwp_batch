@@ -23,6 +23,134 @@ use crate::renderer::svg_layer::SvgLayerRenderer;
 use std::cell::RefCell;
 use std::fmt::Write as _;
 
+// ── [#2004] 부동 전면 이미지 스택 → 인라인 재분류 (render-전용, 원본 무손상) ──
+
+/// 부동(tac=false) 그림/그림-도형의 공통 속성(읽기).
+fn floating_stack_picture_common(ctrl: &Control) -> Option<&crate::model::shape::CommonObjAttr> {
+    match ctrl {
+        Control::Picture(pic) => Some(&pic.common),
+        Control::Shape(shape) => match shape.as_ref() {
+            crate::model::shape::ShapeObject::Picture(p) => Some(&p.common),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 한 문단이 "동일 위치·겹침불허·전면급 부동 그림 다수" 스택인지.
+/// 한글은 이런 그림을 쪽당 1장씩 배치하지만 rhwp 는 앵커 쪽에 겹쳐 그린다(#2004 부동 변종).
+/// 게이트를 좁혀(모든 컨트롤이 tac=false·Square·overlap=false·전면급 그림 + 동일 세로오프셋 +
+/// 개수≥2 + 가시 텍스트 없음) 일반 부동개체 문단 오검출을 차단한다.
+fn para_is_floating_image_stack(para: &Paragraph, min_height_hu: i32) -> bool {
+    use crate::model::shape::TextWrap;
+    if para.text.chars().any(|c| c > '\u{001F}' && c != '\u{FFFC}') {
+        return false;
+    }
+    if para.controls.is_empty() {
+        return false;
+    }
+    let mut count = 0usize;
+    let mut min_voff = i32::MAX;
+    let mut max_voff = i32::MIN;
+    let mut min_pic_h = i32::MAX;
+    for ctrl in &para.controls {
+        let Some(common) = floating_stack_picture_common(ctrl) else {
+            return false;
+        };
+        if common.treat_as_char
+            || !matches!(common.text_wrap, TextWrap::Square)
+            || common.allow_overlap
+            || (common.height as i32) < min_height_hu
+        {
+            return false;
+        }
+        let voff = common.vertical_offset as i32;
+        min_voff = min_voff.min(voff);
+        max_voff = max_voff.max(voff);
+        min_pic_h = min_pic_h.min(common.height as i32);
+        count += 1;
+    }
+    // [#2004] 세로오프셋이 동일하거나(#1995: 전부 0) 이미지 높이보다 작은 band 안에서
+    // varying(156714340: 0/-3360/-2940 …)이어 서로 크게 겹치면 "겹침 스택"으로 판정한다.
+    // 오프셋 spread ≥ 이미지 높이면 이미 세로로 벌어진 정상 배치이므로 제외.
+    count >= 2 && (max_voff as i64 - min_voff as i64) <= min_pic_h as i64
+}
+
+/// 문단의 그림/그림-도형을 인라인(tac=true)으로 재분류(정규화본에만 적용, 원본 무손상).
+fn reclassify_floating_pictures_inline(para: &mut Paragraph) {
+    for ctrl in para.controls.iter_mut() {
+        match ctrl {
+            Control::Picture(pic) => pic.common.treat_as_char = true,
+            Control::Shape(shape) => {
+                if let crate::model::shape::ShapeObject::Picture(p) = shape.as_mut() {
+                    p.common.treat_as_char = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// [#2004] 문단이 품은 표의 셀에서 부동 이미지 스택을 "이미지 1장짜리 inline 문단 N개"로
+/// 분할·재분류한다(정규화본 전용, 원본 무손상). 156714340: 1×1 부동 표 셀에 전면 Square
+/// 이미지 5장 스택. 부동 이미지는 셀 앵커 절대배치라 겹치고, flow 에 없어 intra-cell
+/// 분할이 못 나눈다 → inline 문단 단위로 나눠 셀 흐름 유닛이 되게 한다. 변경 시 true.
+fn reclassify_cell_floating_stacks(para: &mut Paragraph, min_height_hu: i32) -> bool {
+    let mut changed = false;
+    for ctrl in para.controls.iter_mut() {
+        if let Control::Table(table) = ctrl {
+            for cell in table.cells.iter_mut() {
+                if !cell
+                    .paragraphs
+                    .iter()
+                    .any(|p| para_is_floating_image_stack(p, min_height_hu))
+                {
+                    continue;
+                }
+                let mut new_paras: Vec<Paragraph> = Vec::with_capacity(cell.paragraphs.len());
+                for cell_para in cell.paragraphs.drain(..) {
+                    if para_is_floating_image_stack(&cell_para, min_height_hu) {
+                        // [#2004 Stage1] 분할 문단에 이미지 높이를 담은 합성 line_seg 를
+                        // 부여한다. line_segs 를 비우면 셀 composition 이 placeholder
+                        // 1줄(400HWPU)로 붕괴해 셀 측정이 스택 총높이를 못 본다(3차 실증).
+                        // raw_lh(이미지 높이) ≥ font size 라 corrected_line_height 가
+                        // 줄간격 팽창 없이 그대로 반영한다.
+                        use crate::model::paragraph::LineSeg;
+                        let template = cell_para.line_segs.first().cloned().unwrap_or_default();
+                        let mut cum_vpos = template.vertical_pos;
+                        for img_ctrl in &cell_para.controls {
+                            let mut sp = cell_para.clone();
+                            sp.controls = vec![img_ctrl.clone()];
+                            let img_h = floating_stack_picture_common(img_ctrl)
+                                .map(|cm| cm.height as i32)
+                                .unwrap_or(template.line_height);
+                            sp.line_segs = vec![LineSeg {
+                                text_start: 0,
+                                vertical_pos: cum_vpos,
+                                line_height: img_h,
+                                text_height: img_h,
+                                baseline_distance: img_h,
+                                line_spacing: 0,
+                                column_start: 0,
+                                segment_width: template.segment_width,
+                                tag: LineSeg::TAG_SINGLE_SEGMENT_LINE,
+                            }];
+                            cum_vpos = cum_vpos.saturating_add(img_h);
+                            reclassify_floating_pictures_inline(&mut sp);
+                            new_paras.push(sp);
+                        }
+                        changed = true;
+                    } else {
+                        new_paras.push(cell_para);
+                    }
+                }
+                cell.paragraphs = new_paras;
+            }
+        }
+    }
+    changed
+}
+
 fn uses_hwp3_origin_page_tolerance(document: &Document) -> bool {
     let total_paragraphs: usize = document.sections.iter().map(|s| s.paragraphs.len()).sum();
     if total_paragraphs <= 50 {
@@ -32,6 +160,13 @@ fn uses_hwp3_origin_page_tolerance(document: &Document) -> bool {
     let para_shape_ratio = document.doc_info.para_shapes.len() as f64 / total_paragraphs as f64;
     let char_shape_ratio = document.doc_info.char_shapes.len() as f64 / total_paragraphs as f64;
     para_shape_ratio < 0.05 && char_shape_ratio < 0.15
+}
+
+fn uses_hwp3_origin_flow_spacing_before(document: &Document) -> bool {
+    // HWP3-origin HWP5 변환본은 parser 단계에서 ParaShape spacing 계열을 절반으로
+    // 정규화하므로, 본문 흐름 계산에서는 원래 spacing_before를 복원한다.
+    // 원본 HWP3는 HWP3 parser가 만든 spacing 값을 기준으로 삼아 여기서 재확대하지 않는다.
+    document.is_hwp3_variant
 }
 
 fn should_insert_hwp3_title_filler_page(
@@ -123,6 +258,8 @@ fn assign_master_pages_for_section(
     result: &mut PaginationResult,
     section_index: usize,
     section: &Section,
+    carry_master_odd: &Option<MasterPageRef>,
+    carry_master_even: &Option<MasterPageRef>,
 ) {
     use crate::model::header_footer::HeaderFooterApply;
 
@@ -136,15 +273,29 @@ fn assign_master_pages_for_section(
         return;
     }
 
-    let mp_both = mps
+    let base_mp_indices: Vec<usize> = mps
         .iter()
-        .position(|m| m.apply_to == HeaderFooterApply::Both && !m.is_extension);
-    let mp_odd = mps
+        .enumerate()
+        .filter(|(_, m)| !m.is_extension)
+        .map(|(i, _)| i)
+        .collect();
+    let single_base_mp = if base_mp_indices.len() == 1 {
+        base_mp_indices.first().copied()
+    } else {
+        None
+    };
+    let mp_both = base_mp_indices
         .iter()
-        .position(|m| m.apply_to == HeaderFooterApply::Odd && !m.is_extension);
-    let mp_even = mps
+        .copied()
+        .find(|&i| mps[i].apply_to == HeaderFooterApply::Both);
+    let mp_odd = base_mp_indices
         .iter()
-        .position(|m| m.apply_to == HeaderFooterApply::Even && !m.is_extension);
+        .copied()
+        .find(|&i| mps[i].apply_to == HeaderFooterApply::Odd);
+    let mp_even = base_mp_indices
+        .iter()
+        .copied()
+        .find(|&i| mps[i].apply_to == HeaderFooterApply::Even);
     let ext_mp_indices: Vec<usize> = mps
         .iter()
         .enumerate()
@@ -162,14 +313,35 @@ fn assign_master_pages_for_section(
         }
 
         let selected = if page.page_number % 2 == 1 {
-            mp_odd.or(mp_both)
+            mp_odd
+                .or(mp_both)
+                .map(|mi| MasterPageRef {
+                    section_index,
+                    master_page_index: mi,
+                })
+                .or_else(|| carry_master_odd.clone())
+                .or_else(|| {
+                    single_base_mp.map(|mi| MasterPageRef {
+                        section_index,
+                        master_page_index: mi,
+                    })
+                })
         } else {
-            mp_even.or(mp_both)
+            mp_even
+                .or(mp_both)
+                .map(|mi| MasterPageRef {
+                    section_index,
+                    master_page_index: mi,
+                })
+                .or_else(|| carry_master_even.clone())
+                .or_else(|| {
+                    single_base_mp.map(|mi| MasterPageRef {
+                        section_index,
+                        master_page_index: mi,
+                    })
+                })
         };
-        page.active_master_page = selected.map(|mi| MasterPageRef {
-            section_index,
-            master_page_index: mi,
-        });
+        page.active_master_page = selected;
 
         if is_last && !ext_mp_indices.is_empty() {
             let replace_exts: Vec<usize> = ext_mp_indices
@@ -193,7 +365,13 @@ fn assign_master_pages_for_section(
             let active_apply = page
                 .active_master_page
                 .as_ref()
-                .and_then(|mp_ref| mps.get(mp_ref.master_page_index))
+                .and_then(|mp_ref| {
+                    if mp_ref.section_index == section_index {
+                        mps.get(mp_ref.master_page_index)
+                    } else {
+                        None
+                    }
+                })
                 .map(|m| m.apply_to);
             let mut remaining_overlap_exts: Vec<usize> = Vec::new();
             for &i in &overlap_exts {
@@ -215,6 +393,33 @@ fn assign_master_pages_for_section(
                     })
                     .collect();
             }
+        }
+    }
+}
+
+fn update_master_page_carry_from_section(
+    section_index: usize,
+    section: &Section,
+    carry_master_odd: &mut Option<MasterPageRef>,
+    carry_master_even: &mut Option<MasterPageRef>,
+) {
+    use crate::model::header_footer::HeaderFooterApply;
+
+    for (master_page_index, master_page) in section.section_def.master_pages.iter().enumerate() {
+        if master_page.is_extension {
+            continue;
+        }
+        let master_ref = MasterPageRef {
+            section_index,
+            master_page_index,
+        };
+        match master_page.apply_to {
+            HeaderFooterApply::Both => {
+                *carry_master_odd = Some(master_ref.clone());
+                *carry_master_even = Some(master_ref);
+            }
+            HeaderFooterApply::Odd => *carry_master_odd = Some(master_ref),
+            HeaderFooterApply::Even => *carry_master_even = Some(master_ref),
         }
     }
 }
@@ -309,6 +514,19 @@ impl DocumentCore {
     /// direct/vector PDF backend is introduced.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn render_pages_pdf_native(&self, page_nums: &[u32]) -> Result<Vec<u8>, HwpError> {
+        self.render_pages_pdf_native_with_options(
+            page_nums,
+            &crate::renderer::pdf::PdfExportOptions::default(),
+        )
+    }
+
+    /// PDF export for an explicit 0-based page selection with font options.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn render_pages_pdf_native_with_options(
+        &self,
+        page_nums: &[u32],
+        options: &crate::renderer::pdf::PdfExportOptions,
+    ) -> Result<Vec<u8>, HwpError> {
         if page_nums.is_empty() {
             return Err(HwpError::RenderError(
                 "PDF export requires at least one page".to_string(),
@@ -319,7 +537,8 @@ impl DocumentCore {
         for &page_num in page_nums {
             svg_pages.push(self.render_page_svg_native(page_num)?);
         }
-        crate::renderer::pdf::svgs_to_pdf(&svg_pages).map_err(HwpError::RenderError)
+        crate::renderer::pdf::svgs_to_pdf_with_options(&svg_pages, options)
+            .map_err(HwpError::RenderError)
     }
 
     /// PDF export for the full document.
@@ -327,6 +546,16 @@ impl DocumentCore {
     pub fn render_document_pdf_native(&self) -> Result<Vec<u8>, HwpError> {
         let pages: Vec<u32> = (0..self.page_count()).collect();
         self.render_pages_pdf_native(&pages)
+    }
+
+    /// PDF export for the full document with font options.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn render_document_pdf_native_with_options(
+        &self,
+        options: &crate::renderer::pdf::PdfExportOptions,
+    ) -> Result<Vec<u8>, HwpError> {
+        let pages: Vec<u32> = (0..self.page_count()).collect();
+        self.render_pages_pdf_native_with_options(&pages, options)
     }
 
     /// SVG 렌더링 (폰트 임베딩 옵션 포함)
@@ -661,17 +890,20 @@ impl DocumentCore {
         Ok(self.build_page_layer_tree(page_num)?.to_json())
     }
 
-    /// 페이지 overlay 이미지 정보만 작은 JSON으로 반환한다.
+    /// 페이지 overlay 이미지와 replay-plane summary만 작은 JSON으로 반환한다.
     ///
     /// Studio는 BehindText/InFrontOfText 그림 overlay 계산을 위해 전체 PageLayerTree JSON을
     /// 파싱할 필요가 없다. 특히 그림이 본문 layer에만 있는 페이지에서는 빈 overlay 배열과
-    /// imageCount만 반환하여 입력 중 대용량 JSON 직렬화/파싱을 피한다.
+    /// imageCount/rawSvgCount/flowImageCount/flowRawSvgCount/hasBehind/hasFront만
+    /// 반환하여 입력 중 대용량 JSON 직렬화/파싱을 피한다.
     pub fn get_page_overlay_images_native(&self, page_num: u32) -> Result<String, HwpError> {
         use crate::model::image::ImageEffect;
         use crate::model::shape::TextWrap;
         use crate::paint::{
-            LayerNode, LayerNodeKind, PaintOp, ResolvedImageKind, ResolvedImagePayload,
+            paint_op_replay_plane_with_layer, LayerNode, LayerNodeKind, PaintOp, PaintReplayPlane,
+            ResolvedImageKind, ResolvedImagePayload,
         };
+        use crate::renderer::render_tree::RenderLayerInfo;
         use crate::renderer::render_tree::{BoundingBox, ImageNode};
         use base64::Engine;
 
@@ -799,16 +1031,51 @@ impl DocumentCore {
             behind: &mut String,
             front: &mut String,
             image_count: &mut usize,
+            raw_svg_count: &mut usize,
+            flow_image_count: &mut usize,
+            flow_raw_svg_count: &mut usize,
+            has_behind: &mut bool,
+            has_front: &mut bool,
+            inherited_layer: Option<RenderLayerInfo>,
         ) {
+            let active_layer = node.layer.or(inherited_layer);
             match &node.kind {
                 LayerNodeKind::Group { children, .. } => {
                     for child in children {
-                        collect(child, behind, front, image_count);
+                        collect(
+                            child,
+                            behind,
+                            front,
+                            image_count,
+                            raw_svg_count,
+                            flow_image_count,
+                            flow_raw_svg_count,
+                            has_behind,
+                            has_front,
+                            active_layer,
+                        );
                     }
                 }
-                LayerNodeKind::ClipRect { child, .. } => collect(child, behind, front, image_count),
+                LayerNodeKind::ClipRect { child, .. } => collect(
+                    child,
+                    behind,
+                    front,
+                    image_count,
+                    raw_svg_count,
+                    flow_image_count,
+                    flow_raw_svg_count,
+                    has_behind,
+                    has_front,
+                    active_layer,
+                ),
                 LayerNodeKind::Leaf { ops } => {
                     for op in ops {
+                        let plane = paint_op_replay_plane_with_layer(op, active_layer);
+                        match plane {
+                            PaintReplayPlane::BehindText => *has_behind = true,
+                            PaintReplayPlane::InFrontOfText => *has_front = true,
+                            _ => {}
+                        }
                         match op {
                             PaintOp::Image {
                                 bbox,
@@ -816,8 +1083,8 @@ impl DocumentCore {
                                 resolved,
                             } => {
                                 *image_count += 1;
-                                match image.text_wrap {
-                                    Some(TextWrap::BehindText) => {
+                                match plane {
+                                    PaintReplayPlane::BehindText => {
                                         write_overlay_image(
                                             behind,
                                             *bbox,
@@ -826,7 +1093,7 @@ impl DocumentCore {
                                             TextWrap::BehindText,
                                         );
                                     }
-                                    Some(TextWrap::InFrontOfText) => {
+                                    PaintReplayPlane::InFrontOfText => {
                                         write_overlay_image(
                                             front,
                                             *bbox,
@@ -835,14 +1102,19 @@ impl DocumentCore {
                                             TextWrap::InFrontOfText,
                                         );
                                     }
-                                    _ => {}
+                                    PaintReplayPlane::Flow | PaintReplayPlane::Background => {
+                                        *flow_image_count += 1;
+                                    }
                                 }
                             }
                             // OLE/차트 미리보기 등은 RawSvg 로 emit 되며 web_canvas 의 draw_image
                             // 경로(IMAGE_CACHE 비동기 디코드)를 그대로 탄다. scheduleReRender 재시도
-                            // 발화를 위해 image_count 에 포함한다.
+                            // 발화를 위해 별도 rawSvgCount 로 노출한다.
                             PaintOp::RawSvg { .. } => {
-                                *image_count += 1;
+                                *raw_svg_count += 1;
+                                if plane == PaintReplayPlane::Flow {
+                                    *flow_raw_svg_count += 1;
+                                }
                             }
                             _ => {}
                         }
@@ -855,11 +1127,34 @@ impl DocumentCore {
         let mut behind = String::new();
         let mut front = String::new();
         let mut image_count = 0usize;
-        collect(&tree.root, &mut behind, &mut front, &mut image_count);
+        let mut raw_svg_count = 0usize;
+        let mut flow_image_count = 0usize;
+        let mut flow_raw_svg_count = 0usize;
+        let mut has_behind = false;
+        let mut has_front = false;
+        collect(
+            &tree.root,
+            &mut behind,
+            &mut front,
+            &mut image_count,
+            &mut raw_svg_count,
+            &mut flow_image_count,
+            &mut flow_raw_svg_count,
+            &mut has_behind,
+            &mut has_front,
+            None,
+        );
 
         Ok(format!(
-            "{{\"behind\":[{}],\"front\":[{}],\"imageCount\":{}}}",
-            behind, front, image_count
+            "{{\"behind\":[{}],\"front\":[{}],\"imageCount\":{},\"rawSvgCount\":{},\"flowImageCount\":{},\"flowRawSvgCount\":{},\"hasBehind\":{},\"hasFront\":{}}}",
+            behind,
+            front,
+            image_count,
+            raw_svg_count,
+            flow_image_count,
+            flow_raw_svg_count,
+            has_behind,
+            has_front
         ))
     }
 
@@ -1744,6 +2039,46 @@ impl DocumentCore {
                     ));
                     return;
                 }
+                RenderNodeType::RawSvg(raw_node) => {
+                    if let Some(control_ref) = raw_node
+                        .control_ref
+                        .as_ref()
+                        .filter(|control_ref| control_ref.kind == "ole")
+                    {
+                        controls.push(format!(
+                            "{{\"type\":\"ole\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}{}}}",
+                            node.bbox.x,
+                            node.bbox.y,
+                            node.bbox.width,
+                            node.bbox.height,
+                            control_ref.section_index,
+                            control_ref.para_index,
+                            control_ref.control_index,
+                            layer_str
+                        ));
+                        return;
+                    }
+                }
+                RenderNodeType::Placeholder(placeholder_node) => {
+                    if let Some(control_ref) = placeholder_node
+                        .control_ref
+                        .as_ref()
+                        .filter(|control_ref| control_ref.kind == "ole")
+                    {
+                        controls.push(format!(
+                            "{{\"type\":\"ole\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}{}}}",
+                            node.bbox.x,
+                            node.bbox.y,
+                            node.bbox.width,
+                            node.bbox.height,
+                            control_ref.section_index,
+                            control_ref.para_index,
+                            control_ref.control_index,
+                            layer_str
+                        ));
+                        return;
+                    }
+                }
                 RenderNodeType::Group(group_node) => {
                     if let (Some(si), Some(pi), Some(ci)) = (
                         group_node.section_index,
@@ -2070,9 +2405,22 @@ impl DocumentCore {
 
     fn paginate_pass(&mut self, force_breaks: &[std::collections::HashSet<usize>]) {
         self.invalidate_page_tree_cache();
+        // [#2004] 부동 이미지 스택 → 인라인 재분류 정규화본 재계산(원본 무손상).
+        self.compute_render_normalized();
         let paginator = Paginator::new(self.dpi);
-        let hwp3_origin_flow_spacing_before =
-            self.document.is_hwp3_variant || self.document.header.version.major == 3;
+        let hwp3_origin_flow_spacing_before = uses_hwp3_origin_flow_spacing_before(&self.document);
+        let is_hwp5_origin_hwpx = self
+            .document
+            .hwpx_aux_entry(crate::model::document::HWP5_ORIGIN_HWPX_MARKER_PATH)
+            .is_some();
+        // [Issue #1770] rhwp HWPX→HWP 변환본(is_hwpx_variant, 마커 감지)은 IR 이
+        // HWPX 시멘틱 그대로이므로 pagination 분기도 HWPX 로 해석한다 (roundtrip
+        // 자기정합). native HWP5 는 마커가 없어 불변.
+        // 반대로 rhwp HWP5→HWPX 산출물은 HWPX ZIP 이지만 HWP5 원본의 lineSeg 부재와
+        // pagination 시멘틱을 유지해야 하므로 HWPX 전용 분기에서 제외한다.
+        let is_hwpx_source = (matches!(self.source_format, crate::parser::FileFormat::Hwpx)
+            && !is_hwp5_origin_hwpx)
+            || self.document.is_hwpx_variant;
         let measurer = HeightMeasurer::new(self.dpi)
             .with_hwp3_variant(self.document.is_hwp3_variant)
             .with_hwp3_origin_flow_spacing_before(hwp3_origin_flow_spacing_before);
@@ -2110,6 +2458,8 @@ impl DocumentCore {
                 pages: Vec::new(),
                 wrap_around_paras: Vec::new(),
                 hidden_empty_paras: std::collections::HashSet::new(),
+                pre_emitted_host_paras: std::collections::HashSet::new(),
+                pre_emitted_host_heights: std::collections::HashMap::new(),
                 endnotes: Vec::new(),
                 endnote_paragraphs: Vec::new(),
                 endnote_para_sources: Vec::new(),
@@ -2151,6 +2501,8 @@ impl DocumentCore {
         let mut carry_header_even: Option<HeaderFooterRef> = None;
         let mut carry_footer_odd: Option<HeaderFooterRef> = None;
         let mut carry_footer_even: Option<HeaderFooterRef> = None;
+        let mut carry_master_odd: Option<MasterPageRef> = None;
+        let mut carry_master_even: Option<MasterPageRef> = None;
 
         // [Task #1046] reflow force-break hint (구역별). reflow 루프(paginate)가 누적해 전달.
         let empty_breaks: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -2183,13 +2535,31 @@ impl DocumentCore {
                         }
                     }
                 }
+                update_master_page_carry_from_section(
+                    idx,
+                    section,
+                    &mut carry_master_odd,
+                    &mut carry_master_even,
+                );
                 continue;
             }
 
-            let composed = if idx < self.composed.len() {
-                &self.composed[idx]
-            } else {
-                continue;
+            // [#2004] render-전용 정규화본(부동 이미지 스택 인라인 재분류) 우선. 원본 무손상.
+            // 직접 필드 접근으로 disjoint-borrow 유지(이후 self.measured_* 가변 대입과 공존).
+            let norm = self.render_normalized.get(idx).and_then(|o| o.as_ref());
+            let para_src: &[Paragraph] = match norm {
+                Some((p, _)) => &p[..],
+                None => &section.paragraphs[..],
+            };
+            let composed: &[ComposedParagraph] = match norm {
+                Some((_, c)) => &c[..],
+                None => {
+                    if idx < self.composed.len() {
+                        &self.composed[idx][..]
+                    } else {
+                        continue;
+                    }
+                }
             };
 
             // 증분 측정: 이전 측정 데이터가 있으면 문단/표 수준 선택적 캐싱
@@ -2198,7 +2568,7 @@ impl DocumentCore {
                     .dirty_paragraphs
                     .get(idx)
                     .and_then(|opt| opt.as_deref());
-                let column_def_sel = Self::find_initial_column_def(&section.paragraphs);
+                let column_def_sel = Self::find_initial_column_def(para_src);
                 let layout_sel = crate::renderer::page_layout::PageLayoutInfo::from_page_def(
                     &section.section_def.page_def,
                     &column_def_sel,
@@ -2210,7 +2580,7 @@ impl DocumentCore {
                     .map(|a| a.width)
                     .unwrap_or(layout_sel.body_area.width);
                 measurer.measure_section_selective(
-                    &section.paragraphs,
+                    para_src,
                     composed,
                     &self.styles,
                     &self.measured_sections[idx],
@@ -2218,7 +2588,7 @@ impl DocumentCore {
                     Some(col_w_sel),
                 )
             } else {
-                let column_def_pre = Self::find_initial_column_def(&section.paragraphs);
+                let column_def_pre = Self::find_initial_column_def(para_src);
                 let layout_pre = crate::renderer::page_layout::PageLayoutInfo::from_page_def(
                     &section.section_def.page_def,
                     &column_def_pre,
@@ -2229,24 +2599,19 @@ impl DocumentCore {
                     .first()
                     .map(|a| a.width)
                     .unwrap_or(layout_pre.body_area.width);
-                measurer.measure_section(
-                    &section.paragraphs,
-                    composed,
-                    &self.styles,
-                    Some(col_w_pre),
-                )
+                measurer.measure_section(para_src, composed, &self.styles, Some(col_w_pre))
             };
 
             let hwp3_origin_page_tolerance =
                 self.document.is_hwp3_variant || uses_hwp3_origin_page_tolerance(&self.document);
-            let column_def = Self::find_initial_column_def(&section.paragraphs);
+            let column_def = Self::find_initial_column_def(para_src);
             // TypesetEngine을 main pagination으로 사용. RHWP_USE_PAGINATOR=1 로 fallback 가능.
             let use_paginator = std::env::var("RHWP_USE_PAGINATOR")
                 .map(|v| v == "1")
                 .unwrap_or(false);
             let mut result = if use_paginator {
                 paginator.paginate_with_measured_opts(
-                    &section.paragraphs,
+                    para_src,
                     &measured,
                     &section.section_def.page_def,
                     &column_def,
@@ -2256,13 +2621,74 @@ impl DocumentCore {
                         hide_empty_line: section.section_def.hide_empty_line,
                         respect_vpos_reset: self.respect_vpos_reset,
                         is_hwp3_variant: self.document.is_hwp3_variant,
+                        footnote_shape: Some(section.section_def.footnote_shape.clone()),
                     },
                 )
             } else {
+                use crate::renderer::pagination::{DeferredEndnote, EndnoteDeferral, EndnoteRef};
                 use crate::renderer::typeset::TypesetEngine;
+                // [미주 배치 — Hancom EndnoteEndOfSection vs EndnoteEndOfDocument]
+                // rhwp 는 지금까지 구역마다 미주를 그 구역 끝에 렌더했으나(END_OF_SECTION),
+                // 한컴 기본값은 END_OF_DOCUMENT(EACH_COLUMN)로 문서 끝에 모아 렌더한다.
+                // END_OF_DOCUMENT 구역의 미주 본문은 마지막 구역 끝(=문서 끝)으로 미룬다.
+                // (참조 표시 위첨자는 원래 위치에 남는다.) 단일 구역은 구역 끝 ≡ 문서 끝
+                // 이라 동작 불변 — 회귀 없음.
+                use crate::model::footnote::FootnotePlacement;
+                let section_count = self.document.sections.len();
+                let is_last_section = idx + 1 == section_count;
+                let is_doc_end = matches!(
+                    section.section_def.endnote_shape.placement,
+                    FootnotePlacement::EachColumn
+                );
+                // 마지막 구역: 앞선 END_OF_DOCUMENT 구역들의 미주 본문을 문서 순서로 수집.
+                let deferred: Vec<DeferredEndnote> = if is_last_section && section_count > 1 {
+                    let mut acc = Vec::new();
+                    for (sj, sec_j) in self.document.sections.iter().enumerate() {
+                        if sj >= idx {
+                            break;
+                        }
+                        if !matches!(
+                            sec_j.section_def.endnote_shape.placement,
+                            FootnotePlacement::EachColumn
+                        ) {
+                            continue;
+                        }
+                        for (pi, para) in sec_j.paragraphs.iter().enumerate() {
+                            for (ci, ctrl) in para.controls.iter().enumerate() {
+                                if let crate::model::control::Control::Endnote(en) = ctrl {
+                                    acc.push(DeferredEndnote {
+                                        reff: EndnoteRef {
+                                            number: en.number,
+                                            section_index: sj,
+                                            para_index: pi,
+                                            control_index: ci,
+                                        },
+                                        endnote: (**en).clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    acc
+                } else {
+                    Vec::new()
+                };
+                let endnote_deferral = if section_count <= 1 {
+                    EndnoteDeferral::None
+                } else if is_last_section {
+                    if deferred.is_empty() {
+                        EndnoteDeferral::None
+                    } else {
+                        EndnoteDeferral::RenderAll(&deferred)
+                    }
+                } else if is_doc_end {
+                    EndnoteDeferral::Suppress
+                } else {
+                    EndnoteDeferral::None
+                };
                 let typesetter = TypesetEngine::new(self.dpi);
                 typesetter.typeset_section_with_variant(
-                    &section.paragraphs,
+                    para_src,
                     composed,
                     &self.styles,
                     &section.section_def.page_def,
@@ -2273,9 +2699,13 @@ impl DocumentCore {
                     self.document.is_hwp3_variant,
                     hwp3_origin_flow_spacing_before,
                     hwp3_origin_page_tolerance,
+                    Some(&section.section_def.footnote_shape),
                     Some(&section.section_def.endnote_shape),
                     force_breaks.get(idx).unwrap_or(&empty_breaks),
-                    matches!(self.source_format, crate::parser::FileFormat::Hwpx),
+                    matches!(self.source_format, crate::parser::FileFormat::Hwp3),
+                    is_hwpx_source,
+                    is_hwp5_origin_hwpx,
+                    endnote_deferral,
                 )
             };
 
@@ -2429,7 +2859,19 @@ impl DocumentCore {
             apply_page_number_layouts_for_section(&mut result, section);
 
             // 바탕쪽 선택은 구역 간 쪽번호 carry 보정 이후 최종 page_number 기준으로 수행한다.
-            assign_master_pages_for_section(&mut result, idx, section);
+            assign_master_pages_for_section(
+                &mut result,
+                idx,
+                section,
+                &carry_master_odd,
+                &carry_master_even,
+            );
+            update_master_page_carry_from_section(
+                idx,
+                section,
+                &mut carry_master_odd,
+                &mut carry_master_even,
+            );
 
             // 구역 간 머리말/꼬리말 상속 (쪽번호 보정 이후 실행)
             if idx > 0 {
@@ -2710,6 +3152,118 @@ impl DocumentCore {
     }
 
     /// 글로벌 페이지 번호로 해당 페이지와 문단/구성 목록을 찾는다.
+    /// [#2004] 섹션의 render-전용 문단 (부동 이미지 스택 재분류본, 없으면 원본).
+    pub(crate) fn section_render_paragraphs(&self, sec_idx: usize) -> &[Paragraph] {
+        match self.render_normalized.get(sec_idx).and_then(|o| o.as_ref()) {
+            Some((paras, _)) => &paras[..],
+            None => self
+                .document
+                .sections
+                .get(sec_idx)
+                .map(|s| &s.paragraphs[..])
+                .unwrap_or(&[]),
+        }
+    }
+
+    /// [#2004] 섹션의 render-전용 구성 (재분류본, 없으면 원본).
+    pub(crate) fn section_render_composed(&self, sec_idx: usize) -> &[ComposedParagraph] {
+        match self.render_normalized.get(sec_idx).and_then(|o| o.as_ref()) {
+            Some((_, comp)) => &comp[..],
+            None => self.composed.get(sec_idx).map(|c| &c[..]).unwrap_or(&[]),
+        }
+    }
+
+    /// [#2004] 부동 전면 이미지 스택 섹션의 정규화본(그림 tac=true 재분류 + 재구성)을 재계산.
+    /// 원본 `document`/`composed` 는 무손상(save 무결). paginate 시작 시 호출.
+    pub(crate) fn compute_render_normalized(&mut self) {
+        let sec_count = self.document.sections.len();
+        let mut out: Vec<Option<(Vec<Paragraph>, Vec<ComposedParagraph>)>> =
+            Vec::with_capacity(sec_count);
+        for idx in 0..sec_count {
+            let section = &self.document.sections[idx];
+            let pd = &section.section_def.page_def;
+            let body_h_hu = pd.height as i32
+                - pd.margin_top as i32
+                - pd.margin_bottom as i32
+                - pd.margin_header as i32
+                - pd.margin_footer as i32;
+            let min_height_hu = (body_h_hu / 2).max(1);
+            let matches: Vec<usize> = section
+                .paragraphs
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| para_is_floating_image_stack(p, min_height_hu))
+                .map(|(i, _)| i)
+                .collect();
+            // [#2004] 표 셀 내부 부동 이미지 스택 검출(본문 스택과 별개 경로).
+            let has_cell_stack = section.paragraphs.iter().any(|p| {
+                p.controls.iter().any(|ctrl| match ctrl {
+                    Control::Table(table) => table.cells.iter().any(|cell| {
+                        cell.paragraphs
+                            .iter()
+                            .any(|cp| para_is_floating_image_stack(cp, min_height_hu))
+                    }),
+                    _ => false,
+                })
+            });
+            if matches.is_empty() && !has_cell_stack {
+                out.push(None);
+                continue;
+            }
+            let mut np = section.paragraphs.clone();
+            if has_cell_stack {
+                for p in np.iter_mut() {
+                    reclassify_cell_floating_stacks(p, min_height_hu);
+                }
+            }
+            for &i in &matches {
+                reclassify_floating_pictures_inline(&mut np[i]);
+            }
+            let base = self.composed.get(idx);
+            let nc: Vec<ComposedParagraph> = np
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    if matches.binary_search(&i).is_ok() {
+                        let mut c = compose_paragraph(p);
+                        // [#2004] composer 가 line_seg 부족(HWP5 빈-문단)으로 1줄로 붕괴하면
+                        // 그림 수만큼 줄을 합성(모두 char_start 동일)해 Stage2 stacked 게이트
+                        // (comp.lines.len()==tac_controls) 가 발동하게 한다.
+                        let npics = c.tac_controls.len();
+                        if npics >= 2 && c.lines.len() != npics && !c.lines.is_empty() {
+                            let template = c.lines[0].clone();
+                            let mut lines = Vec::with_capacity(npics);
+                            for k in 0..npics {
+                                let lh_hu = p
+                                    .controls
+                                    .get(c.tac_controls[k].2)
+                                    .and_then(|ctrl| {
+                                        floating_stack_picture_common(ctrl)
+                                            .map(|cm| cm.height as i32)
+                                    })
+                                    .unwrap_or(template.line_height);
+                                let mut l = template.clone();
+                                l.runs = Vec::new();
+                                l.char_start = 0;
+                                l.line_height = lh_hu;
+                                l.has_line_break = false;
+                                lines.push(l);
+                            }
+                            c.lines = lines;
+                        }
+                        c
+                    } else {
+                        base.and_then(|c| c.get(i))
+                            .cloned()
+                            .unwrap_or_else(|| compose_paragraph(p))
+                    }
+                })
+                .collect();
+            out.push(Some((np, nc)));
+        }
+        self.render_normalized = out;
+    }
+
     pub(crate) fn find_page(
         &self,
         page_num: u32,
@@ -2725,16 +3279,9 @@ impl DocumentCore {
         for (sec_idx, pr) in self.pagination.iter().enumerate() {
             if (page_num as usize) < offset as usize + pr.pages.len() {
                 let local_idx = (page_num - offset) as usize;
-                let paragraphs = if sec_idx < self.document.sections.len() {
-                    &self.document.sections[sec_idx].paragraphs[..]
-                } else {
-                    &[][..]
-                };
-                let composed = if sec_idx < self.composed.len() {
-                    &self.composed[sec_idx][..]
-                } else {
-                    &[][..]
-                };
+                // [#2004] render-전용 정규화본 우선(부동 이미지 스택 재분류). 없으면 원본.
+                let paragraphs = self.section_render_paragraphs(sec_idx);
+                let composed = self.section_render_composed(sec_idx);
                 return Ok((&pr.pages[local_idx], paragraphs, composed));
             }
             offset += pr.pages.len() as u32;
@@ -2754,12 +3301,7 @@ impl DocumentCore {
         let mut global_page = 0u32;
 
         for (sec_idx, pr) in self.pagination.iter().enumerate() {
-            let body_paragraphs = self
-                .document
-                .sections
-                .get(sec_idx)
-                .map(|s| &s.paragraphs[..])
-                .unwrap_or(&[]);
+            let body_paragraphs = self.section_render_paragraphs(sec_idx);
             // [Task #1082] 미주 paragraphs 를 본문 뒤에 합쳐 인덱싱 정합.
             // 미주 PageItem 의 para_index = body_paragraphs.len() + 미주 로컬 인덱스
             // (typeset.rs en_para_idx 와 동일). 합치지 않으면 미주 항목이 out-of-bounds 로
@@ -2777,6 +3319,112 @@ impl DocumentCore {
                 &combined
             };
             let measured = self.measured_sections.get(sec_idx);
+
+            // [Task #1700] cc.items 에 없는 문단(어울림 흡수 / 빈 줄 감춤)을 페이지 PI 로 표면화
+            // 하기 위한 사전 패스. 한글(OLE)은 이들을 본문 문단으로 카운트하므로 문단→페이지
+            // 매핑이 정합된다. 레이아웃/렌더 트리는 변경하지 않으므로 기하·페이지 수·시각 불변.
+            // 1) items 문단 → 표시 페이지(global+1) 매핑 — **마지막** 출현 페이지(다중 페이지 표는
+            //    끝 페이지에 빈 문단이 따라오므로 last-page 가 한글과 정합).
+            let sec_start_page = global_page;
+            let mut item_disp_page: std::collections::HashMap<usize, u32> =
+                std::collections::HashMap::new();
+            // [#1705] 표의 첫(앵커) 출현 페이지 — 어울림 빈 문단이 표 옆 wrap zone 에 있을 때 사용.
+            let mut item_first_page: std::collections::HashMap<usize, u32> =
+                std::collections::HashMap::new();
+            for (li, page) in pr.pages.iter().enumerate() {
+                let disp = sec_start_page + li as u32 + 1;
+                for cc in &page.column_contents {
+                    for item in &cc.items {
+                        let pidx = match item {
+                            PageItem::FullParagraph { para_index }
+                            | PageItem::PartialParagraph { para_index, .. }
+                            | PageItem::Table { para_index, .. }
+                            | PageItem::PartialTable { para_index, .. }
+                            | PageItem::Shape { para_index, .. } => Some(*para_index),
+                            _ => None,
+                        };
+                        if let Some(p) = pidx {
+                            item_disp_page.insert(p, disp); // 마지막(끝) 페이지
+                            item_first_page.entry(p).or_insert(disp); // 첫(앵커) 페이지
+                        }
+                    }
+                }
+            }
+            // 2) 표면화 대상을 페이지별로 그룹화: (para_index, is_wrap, table_pi).
+            //    - 어울림(wrap-around): 앵커 표(table_para_index)의 페이지에 귀속.
+            //    - 빈 줄 감춤(hidden_empty_paras): 직전 item 문단(대개 표)의 페이지에 귀속.
+            let mut extra_by_page: std::collections::HashMap<u32, Vec<(usize, bool, usize)>> =
+                std::collections::HashMap::new();
+            let mut emitted_extra: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            for page in pr.pages.iter() {
+                for cc in &page.column_contents {
+                    for wp in &cc.wrap_around_paras {
+                        if !emitted_extra.insert(wp.para_index) {
+                            continue;
+                        }
+                        // [#1705] 어울림(floating) 표의 트레일링 빈 문단 귀속:
+                        //   line_seg 폭(sw)이 좁으면(표 옆 wrap zone) 표의 **첫(앵커) 페이지**,
+                        //   전체 폭이면(표 아래로 흐름) 표의 **마지막 페이지**.
+                        //   한글은 wrap zone 문단을 앵커 페이지에, 전체폭 문단을 표 끝 페이지에 둔다.
+                        let sw_px = paragraphs
+                            .get(wp.para_index)
+                            .and_then(|p| p.line_segs.first())
+                            .map(|s| hwpunit_to_px(s.segment_width as i32, dpi))
+                            .unwrap_or(0.0);
+                        let body_w = page.layout.body_area.width;
+                        let is_wrap_zone = sw_px > 0.0 && sw_px < body_w * 0.9;
+                        // [#1955] 글뒤로/글앞으로 anchor 표는 플로우를 소비하지 않으므로
+                        // 후행 문단은 폭과 무관하게 **앵커 페이지** 귀속 (한글: stored
+                        // LINE_SEG vpos 가 앵커 쪽 위치를 가리킴).
+                        let anchor_behind = paragraphs
+                            .get(wp.table_para_index)
+                            .map(|p| {
+                                p.controls.iter().any(|c| {
+                                    matches!(c, Control::Table(t)
+                                        if !t.common.treat_as_char
+                                            && matches!(t.common.text_wrap,
+                                                crate::model::shape::TextWrap::BehindText
+                                                    | crate::model::shape::TextWrap::InFrontOfText))
+                                })
+                            })
+                            .unwrap_or(false);
+                        let disp = if is_wrap_zone || anchor_behind {
+                            item_first_page.get(&wp.table_para_index)
+                        } else {
+                            item_disp_page.get(&wp.table_para_index)
+                        }
+                        .copied()
+                        .unwrap_or(sec_start_page + 1);
+                        extra_by_page.entry(disp).or_default().push((
+                            wp.para_index,
+                            true,
+                            wp.table_para_index,
+                        ));
+                    }
+                }
+            }
+            let mut hidden_sorted: Vec<usize> = pr
+                .hidden_empty_paras
+                .iter()
+                .copied()
+                .filter(|p| !item_disp_page.contains_key(p) && !emitted_extra.contains(p))
+                .collect();
+            hidden_sorted.sort_unstable();
+            for hidx in hidden_sorted {
+                let mut disp = sec_start_page + 1;
+                for j in (0..hidx).rev() {
+                    if let Some(d) = item_disp_page.get(&j) {
+                        disp = *d;
+                        break;
+                    }
+                }
+                extra_by_page
+                    .entry(disp)
+                    .or_default()
+                    .push((hidx, false, 0));
+                emitted_extra.insert(hidx);
+            }
 
             for (local_idx, page) in pr.pages.iter().enumerate() {
                 if let Some(pf) = page_filter {
@@ -2915,8 +3563,16 @@ impl DocumentCore {
                                 let line_seg_info =
                                     format_line_seg_brief(paragraphs.get(*para_index));
                                 let source_info = endnote_source_info(*para_index);
+                                // [#2152] 미주 문단 항목은 모든 kind 에 [미주] 라벨 —
+                                // per-pi 오라클이 본문 pi 만 세도록 하는 판별 신호.
+                                let en = if *para_index >= body_len {
+                                    "[미주]"
+                                } else {
+                                    ""
+                                };
                                 out.push_str(&format!(
-                                    "    PartialParagraph  pi={}  lines={}..{}  {}{}  {}\n",
+                                    "    PartialParagraph{}  pi={}  lines={}..{}  {}{}  {}\n",
+                                    en,
                                     para_index,
                                     start_line,
                                     end_line,
@@ -2955,8 +3611,14 @@ impl DocumentCore {
                                 let line_seg_info =
                                     format_line_seg_brief(paragraphs.get(*para_index));
                                 let source_info = endnote_source_info(*para_index);
+                                let en = if *para_index >= body_len {
+                                    "[미주]"
+                                } else {
+                                    ""
+                                };
                                 out.push_str(&format!(
-                                    "    Table          pi={} ci={}  {}  {}{}  {}\n",
+                                    "    Table{}          pi={} ci={}  {}  {}{}  {}\n",
+                                    en,
                                     para_index,
                                     control_index,
                                     table_info,
@@ -2998,8 +3660,13 @@ impl DocumentCore {
                                 } else {
                                     String::new()
                                 };
-                                out.push_str(&format!("    PartialTable   pi={} ci={}  rows={}..{}  cont={}  {}  {}{}  {}{}\n",
-                                    para_index, control_index, start_row, end_row, is_continuation, table_info, vpos_info, source_info, line_seg_info, split_info));
+                                let en = if *para_index >= body_len {
+                                    "[미주]"
+                                } else {
+                                    ""
+                                };
+                                out.push_str(&format!("    PartialTable{}   pi={} ci={}  rows={}..{}  cont={}  {}  {}{}  {}{}\n",
+                                    en, para_index, control_index, start_row, end_row, is_continuation, table_info, vpos_info, source_info, line_seg_info, split_info));
                             }
                             PageItem::Shape {
                                 para_index,
@@ -3026,8 +3693,14 @@ impl DocumentCore {
                                 let line_seg_info =
                                     format_line_seg_brief(paragraphs.get(*para_index));
                                 let source_info = endnote_source_info(*para_index);
+                                let en = if *para_index >= body_len {
+                                    "[미주]"
+                                } else {
+                                    ""
+                                };
                                 out.push_str(&format!(
-                                    "    Shape          pi={} ci={}  {}  {}{}  {}\n",
+                                    "    Shape{}          pi={} ci={}  {}  {}{}  {}\n",
+                                    en,
                                     para_index,
                                     control_index,
                                     shape_info,
@@ -3053,6 +3726,40 @@ impl DocumentCore {
                     }
                 }
 
+                // [Task #1700] cc.items 에 없는 문단(어울림 / 빈 줄 감춤) 표면화.
+                let disp_page = global_page + 1;
+                if let Some(list) = extra_by_page.get(&disp_page) {
+                    for (pidx, is_wrap, tpi) in list {
+                        let preview = paragraphs
+                            .get(*pidx)
+                            .map(|p| {
+                                let t: String = p
+                                    .text
+                                    .chars()
+                                    .filter(|c| *c > '\u{001F}')
+                                    .take(40)
+                                    .collect();
+                                if t.is_empty() {
+                                    "(빈)".to_string()
+                                } else {
+                                    t
+                                }
+                            })
+                            .unwrap_or_default();
+                        if *is_wrap {
+                            out.push_str(&format!(
+                                "    WrapAroundPara  pi={}  table_pi={}  \"{}\"\n",
+                                pidx, tpi, preview
+                            ));
+                        } else {
+                            out.push_str(&format!(
+                                "    HiddenEmptyPara  pi={}  \"{}\"\n",
+                                pidx, preview
+                            ));
+                        }
+                    }
+                }
+
                 global_page += 1;
             }
         }
@@ -3072,6 +3779,9 @@ impl DocumentCore {
     /// 페이지 렌더 트리 캐시 전체 무효화.
     pub(crate) fn invalidate_page_tree_cache(&self) {
         self.page_tree_cache.borrow_mut().clear();
+        // [Task #1949] IR 이 바뀌는 재조판 경계에서 셀 단위 레이아웃 캐시(포인터 키)도
+        // 함께 비워 다른 IR 의 셀 포인터 재사용으로 인한 오재사용을 방지한다.
+        self.layout_engine.clear_layout_caches();
     }
 
     /// 캐시된 페이지 렌더 트리를 반환한다 (캐시 미스 시 빌드 후 캐시).
@@ -3118,12 +3828,22 @@ impl DocumentCore {
         self.layout_engine
             .set_hwp3_variant(self.document.is_hwp3_variant);
         self.layout_engine.set_hwp3_origin_flow_spacing_before(
-            self.document.is_hwp3_variant || self.document.header.version.major == 3,
+            uses_hwp3_origin_flow_spacing_before(&self.document),
         );
-        self.layout_engine.set_hwpx_source(matches!(
-            self.source_format,
-            crate::parser::FileFormat::Hwpx
-        ));
+        let is_hwp5_origin_hwpx = self
+            .document
+            .hwpx_aux_entry(crate::model::document::HWP5_ORIGIN_HWPX_MARKER_PATH)
+            .is_some();
+        // [Issue #1770] HWPX→HWP 변환본도 HWPX 시멘틱 (paginate_pass 와 동일 규칙).
+        self.layout_engine.set_hwpx_source(
+            (matches!(self.source_format, crate::parser::FileFormat::Hwpx) && !is_hwp5_origin_hwpx)
+                || self.document.is_hwpx_variant,
+        );
+        self.layout_engine.set_hwpx_page_preview(
+            self.document
+                .hwpx_aux_entry("Preview/PrvImage.png")
+                .filter(|_| matches!(self.source_format, crate::parser::FileFormat::Hwpx)),
+        );
         // 활성 필드 정보를 레이아웃 엔진에 전달 (안내문 숨김용)
         self.layout_engine
             .set_active_field(self.active_field.as_ref().map(|af| {
@@ -3250,6 +3970,17 @@ impl DocumentCore {
         self.layout_engine.set_total_pages(total_pages);
         self.layout_engine.set_file_name(&self.file_name);
 
+        // [Task #2102] 쪽 배경 이미지 채우기는 구역 첫 쪽에만 적용한다.
+        // 현재 페이지가 소속 구역의 첫 글로벌 페이지인지 판정하여 엔진에 전달.
+        let is_section_first_page = self
+            .pagination
+            .get(page_content.section_index)
+            .and_then(|pr| pr.pages.first())
+            .map(|first| first.page_index == page_content.page_index)
+            .unwrap_or(true);
+        self.layout_engine
+            .set_current_page_is_section_first(is_section_first_page);
+
         let wrap_around_paras = self
             .pagination
             .get(sec_idx)
@@ -3260,6 +3991,12 @@ impl DocumentCore {
         if let Some(pr) = self.pagination.get(sec_idx) {
             self.layout_engine
                 .set_hidden_empty_paras(&pr.hidden_empty_paras);
+            // [Task #1755] pre-emit 된 host 문단 → fragment 쪽 host 렌더 억제.
+            self.layout_engine
+                .set_pre_emitted_host_paras(&pr.pre_emitted_host_paras);
+            // [#2015] pre-emit host 높이 → layout vert_offset 이중계상 보정.
+            self.layout_engine
+                .set_pre_emitted_host_heights(&pr.pre_emitted_host_heights);
             self.layout_engine
                 .set_endnote_para_sources(paragraphs.len(), &pr.endnote_para_sources);
             // 섹션 미주 모양의 정규화 여백 전달 → HeightCursor min-gap 및 renderer overflow 판정.
@@ -3704,6 +4441,33 @@ fn compute_hwp_used_height(
     use crate::renderer::hwpunit_to_px;
     use crate::renderer::pagination::PageItem;
 
+    // [Task #1612] vpos 는 다페이지에서 누적값(예: page2 vpos≈66568~127587 HU)이므로, per-page
+    // `used_height` 와 비교하려면 이 페이지 시작 오프셋을 빼야 한다. 차감하지 않으면 페이지마다
+    // diff 가 ~수백px 누적 증가해 "대형 표 과소측정" 으로 오판된다(#1612). 페이지 첫 문단 항목의
+    // top vpos 를 기준선으로 삼는다(문단 항목이 없으면 0).
+    let base_top: i32 =
+        cc.items
+            .iter()
+            .find_map(|item| {
+                let (para_index, line) = match item {
+                    PageItem::FullParagraph { para_index } => (*para_index, 0usize),
+                    PageItem::PartialParagraph {
+                        para_index,
+                        start_line,
+                        ..
+                    } => (*para_index, *start_line),
+                    PageItem::Table { para_index, .. }
+                    | PageItem::PartialTable { para_index, .. } => (*para_index, 0usize),
+                    _ => return None,
+                };
+                paragraphs
+                    .get(para_index)?
+                    .line_segs
+                    .get(line)
+                    .map(|s| s.vertical_pos)
+            })
+            .unwrap_or(0);
+
     // 1) 단 항목 내 첫 vpos-reset 검색
     for item in &cc.items {
         let (para_idx, range_start, range_end) = match item {
@@ -3737,7 +4501,7 @@ fn compute_hwp_used_height(
                 if seg.vertical_pos == 0 {
                     if let Some(prev) = p.line_segs.get(i.saturating_sub(1)) {
                         let bottom_hwpu = prev.vertical_pos + prev.line_height + prev.line_spacing;
-                        return Some(hwpunit_to_px(bottom_hwpu, dpi));
+                        return Some(hwpunit_to_px((bottom_hwpu - base_top).max(0), dpi));
                     }
                 }
             }
@@ -3773,7 +4537,7 @@ fn compute_hwp_used_height(
     let p = paragraphs.get(para_idx)?;
     let seg = p.line_segs.get(line_idx)?;
     let bottom_hwpu = seg.vertical_pos + seg.line_height + seg.line_spacing;
-    Some(hwpunit_to_px(bottom_hwpu, dpi))
+    Some(hwpunit_to_px((bottom_hwpu - base_top).max(0), dpi))
 }
 
 /// LINE_SEG vertical_pos 범위를 문자열로 포맷.
@@ -3872,6 +4636,52 @@ mod tests {
     use super::*;
     use crate::model::bin_data::BinDataContent;
     use crate::renderer::render_tree::RenderNodeType;
+
+    /// [Task #1612] `compute_hwp_used_height` 는 per-page 높이를 내야 한다. vpos 는
+    /// 다페이지에서 누적값이므로 페이지 시작 오프셋을 차감하지 않으면 page N>1 에서
+    /// 누적값(수백~수천px)을 반환해 dump-pages diff 가 "대형 표 과소측정" 으로 오판된다.
+    #[test]
+    fn task1612_hwp_used_height_is_per_page_not_cumulative() {
+        use crate::model::paragraph::{LineSeg, Paragraph};
+        use crate::renderer::pagination::{ColumnContent, PageItem};
+
+        let seg = |vpos: i32| LineSeg {
+            vertical_pos: vpos,
+            line_height: 1700,
+            line_spacing: 0,
+            ..Default::default()
+        };
+        // para 0 = page-1 콘텐츠(vpos 0..), para 1 = page-2 콘텐츠(vpos 누적값 66568..).
+        let p0 = Paragraph {
+            line_segs: vec![seg(0), seg(1700)],
+            ..Default::default()
+        };
+        let p1 = Paragraph {
+            line_segs: vec![seg(66568), seg(68268)],
+            ..Default::default()
+        };
+        let paragraphs = vec![p0, p1];
+
+        // "page 2" 단: para 1 만 포함.
+        let cc = ColumnContent {
+            column_index: 0,
+            start_height: 0.0,
+            endnote_flow: false,
+            items: vec![PageItem::FullParagraph { para_index: 1 }],
+            zone_layout: None,
+            zone_y_offset: 0.0,
+            wrap_around_paras: vec![],
+            used_height: 0.0,
+            wrap_anchors: std::collections::HashMap::new(),
+        };
+
+        let h = compute_hwp_used_height(&cc, &paragraphs, 96.0).expect("값이 있어야 함");
+        // per-page: (68268+1700) − 66568 = 3400 HU ≈ 45.3px. 누적이면 ≈ 933px.
+        assert!(
+            h < 100.0,
+            "per-page 높이(누적 vpos 차감)여야 하는데 {h:.1}px (누적값 미차감 의심)"
+        );
+    }
 
     #[test]
     fn build_page_render_tree_exposes_public_page_tree() {
@@ -4063,6 +4873,127 @@ mod tests {
             active.master_page_index, 1,
             "final page_number=2 must select the Even master page, not the section-local Odd page"
         );
+    }
+
+    #[test]
+    fn missing_even_master_page_inherits_previous_even_master() {
+        use crate::model::document::{Document, Section, SectionDef};
+        use crate::model::header_footer::{HeaderFooterApply, MasterPage};
+        use crate::model::page::PageDef;
+        use crate::model::paragraph::Paragraph;
+
+        fn a4_section(section_def: SectionDef) -> Section {
+            Section {
+                section_def,
+                paragraphs: vec![Paragraph::default()],
+                raw_stream: None,
+            }
+        }
+
+        let page_def = PageDef {
+            width: 59528,
+            height: 84188,
+            margin_left: 8504,
+            margin_right: 8504,
+            margin_top: 5668,
+            margin_bottom: 4252,
+            margin_header: 4252,
+            margin_footer: 4252,
+            ..Default::default()
+        };
+
+        let mut document = Document::default();
+        document.sections.push(a4_section(SectionDef {
+            page_def: page_def.clone(),
+            master_pages: vec![MasterPage {
+                apply_to: HeaderFooterApply::Even,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        document.sections.push(a4_section(SectionDef {
+            page_def,
+            master_pages: vec![MasterPage {
+                apply_to: HeaderFooterApply::Odd,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+
+        let mut core = DocumentCore::new_empty();
+        core.set_document(document);
+        core.paginate();
+
+        let page = core
+            .pagination
+            .get(1)
+            .and_then(|result| result.pages.first())
+            .expect("section 1 first page");
+        assert_eq!(page.page_number, 2);
+        let active = page
+            .active_master_page
+            .as_ref()
+            .expect("section 1 even page should inherit previous even master page");
+        assert_eq!(active.section_index, 0);
+        assert_eq!(active.master_page_index, 0);
+    }
+
+    #[test]
+    fn single_base_master_page_applies_when_matching_parity_is_absent() {
+        use crate::model::document::{Document, Section, SectionDef};
+        use crate::model::header_footer::{HeaderFooterApply, MasterPage};
+        use crate::model::page::PageDef;
+        use crate::model::paragraph::Paragraph;
+
+        fn a4_section(section_def: SectionDef) -> Section {
+            Section {
+                section_def,
+                paragraphs: vec![Paragraph::default()],
+                raw_stream: None,
+            }
+        }
+
+        let page_def = PageDef {
+            width: 59528,
+            height: 84188,
+            margin_left: 8504,
+            margin_right: 8504,
+            margin_top: 5668,
+            margin_bottom: 4252,
+            margin_header: 4252,
+            margin_footer: 4252,
+            ..Default::default()
+        };
+
+        let mut document = Document::default();
+        document.sections.push(a4_section(SectionDef {
+            page_def: page_def.clone(),
+            ..Default::default()
+        }));
+        document.sections.push(a4_section(SectionDef {
+            page_def,
+            master_pages: vec![MasterPage {
+                apply_to: HeaderFooterApply::Odd,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+
+        let mut core = DocumentCore::new_empty();
+        core.set_document(document);
+        core.paginate();
+
+        let page = core
+            .pagination
+            .get(1)
+            .and_then(|result| result.pages.first())
+            .expect("section 1 first page");
+        assert_eq!(page.page_number, 2);
+        let active = page
+            .active_master_page
+            .as_ref()
+            .expect("single base master should apply to carried even page");
+        assert_eq!(active.master_page_index, 0);
     }
 
     #[test]

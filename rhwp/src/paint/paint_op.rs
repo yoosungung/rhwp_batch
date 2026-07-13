@@ -49,11 +49,11 @@ pub struct ResolvedImagePayload {
 pub enum PaintOp {
     PageBackground {
         bbox: BoundingBox,
-        background: PageBackgroundNode,
+        background: Box<PageBackgroundNode>,
     },
     TextRun {
         bbox: BoundingBox,
-        run: TextRunNode,
+        run: Box<TextRunNode>,
     },
     GlyphRun {
         bbox: BoundingBox,
@@ -69,68 +69,200 @@ pub enum PaintOp {
     /// 새 backend는 이 op를 선택하고 TextRun mirror를 건너뛸 수 있다.
     CharOverlap {
         bbox: BoundingBox,
-        run: TextRunNode,
+        run: Box<TextRunNode>,
     },
     /// 문단 끝/줄 바꿈/필드 마커처럼 source text와 visual projection이 다른 표식.
     TextControlMark {
         bbox: BoundingBox,
-        run: TextRunNode,
+        run: Box<TextRunNode>,
     },
     /// 탭 리더 visual geometry.
     TabLeader {
         bbox: BoundingBox,
-        run: TextRunNode,
+        run: Box<TextRunNode>,
     },
     /// 밑줄/취소선/강조점 visual geometry.
     TextDecoration {
         bbox: BoundingBox,
-        run: TextRunNode,
+        run: Box<TextRunNode>,
         kind: TextDecorationKind,
     },
     FootnoteMarker {
         bbox: BoundingBox,
-        marker: FootnoteMarkerNode,
+        marker: Box<FootnoteMarkerNode>,
     },
     Line {
         bbox: BoundingBox,
-        line: LineNode,
+        line: Box<LineNode>,
     },
     Rectangle {
         bbox: BoundingBox,
-        rect: RectangleNode,
+        rect: Box<RectangleNode>,
     },
     Ellipse {
         bbox: BoundingBox,
-        ellipse: EllipseNode,
+        ellipse: Box<EllipseNode>,
     },
     Path {
         bbox: BoundingBox,
-        path: PathNode,
+        path: Box<PathNode>,
     },
     Image {
         bbox: BoundingBox,
-        image: ImageNode,
+        image: Box<ImageNode>,
         resolved: Option<Box<ResolvedImagePayload>>,
     },
     Equation {
         bbox: BoundingBox,
-        equation: EquationNode,
+        equation: Box<EquationNode>,
     },
     FormObject {
         bbox: BoundingBox,
-        form: FormObjectNode,
+        form: Box<FormObjectNode>,
     },
     Placeholder {
         bbox: BoundingBox,
-        placeholder: PlaceholderNode,
+        placeholder: Box<PlaceholderNode>,
     },
     RawSvg {
         bbox: BoundingBox,
-        raw: RawSvgNode,
+        raw: Box<RawSvgNode>,
     },
 }
 
 impl PaintOp {
+    pub fn page_background(bbox: BoundingBox, background: PageBackgroundNode) -> Self {
+        Self::PageBackground {
+            bbox,
+            background: Box::new(background),
+        }
+    }
+
+    pub fn text_run(bbox: BoundingBox, run: TextRunNode) -> Self {
+        Self::TextRun {
+            bbox,
+            run: Box::new(run),
+        }
+    }
+
+    pub fn glyph_run(bbox: BoundingBox, run: LayerGlyphRunPaint) -> Self {
+        Self::GlyphRun {
+            bbox,
+            run: Box::new(run),
+        }
+    }
+
+    pub fn glyph_outline(bbox: BoundingBox, outline: LayerGlyphOutlinePaint) -> Self {
+        Self::GlyphOutline {
+            bbox,
+            outline: Box::new(outline),
+        }
+    }
+
+    pub fn char_overlap(bbox: BoundingBox, run: TextRunNode) -> Self {
+        Self::CharOverlap {
+            bbox,
+            run: Box::new(run),
+        }
+    }
+
+    pub fn text_control_mark(bbox: BoundingBox, run: TextRunNode) -> Self {
+        Self::TextControlMark {
+            bbox,
+            run: Box::new(run),
+        }
+    }
+
+    pub fn tab_leader(bbox: BoundingBox, run: TextRunNode) -> Self {
+        Self::TabLeader {
+            bbox,
+            run: Box::new(run),
+        }
+    }
+
+    pub fn text_decoration(bbox: BoundingBox, run: TextRunNode, kind: TextDecorationKind) -> Self {
+        Self::TextDecoration {
+            bbox,
+            run: Box::new(run),
+            kind,
+        }
+    }
+
+    pub fn footnote_marker(bbox: BoundingBox, marker: FootnoteMarkerNode) -> Self {
+        Self::FootnoteMarker {
+            bbox,
+            marker: Box::new(marker),
+        }
+    }
+
+    pub fn line(bbox: BoundingBox, line: LineNode) -> Self {
+        Self::Line {
+            bbox,
+            line: Box::new(line),
+        }
+    }
+
+    pub fn rectangle(bbox: BoundingBox, rect: RectangleNode) -> Self {
+        Self::Rectangle {
+            bbox,
+            rect: Box::new(rect),
+        }
+    }
+
+    pub fn ellipse(bbox: BoundingBox, ellipse: EllipseNode) -> Self {
+        Self::Ellipse {
+            bbox,
+            ellipse: Box::new(ellipse),
+        }
+    }
+
+    pub fn path(bbox: BoundingBox, path: PathNode) -> Self {
+        Self::Path {
+            bbox,
+            path: Box::new(path),
+        }
+    }
+
+    pub fn image(
+        bbox: BoundingBox,
+        image: ImageNode,
+        resolved: Option<ResolvedImagePayload>,
+    ) -> Self {
+        Self::Image {
+            bbox,
+            image: Box::new(image),
+            resolved: resolved.map(Box::new),
+        }
+    }
+
+    pub fn equation(bbox: BoundingBox, equation: EquationNode) -> Self {
+        Self::Equation {
+            bbox,
+            equation: Box::new(equation),
+        }
+    }
+
+    pub fn form_object(bbox: BoundingBox, form: FormObjectNode) -> Self {
+        Self::FormObject {
+            bbox,
+            form: Box::new(form),
+        }
+    }
+
+    pub fn placeholder(bbox: BoundingBox, placeholder: PlaceholderNode) -> Self {
+        Self::Placeholder {
+            bbox,
+            placeholder: Box::new(placeholder),
+        }
+    }
+
+    pub fn raw_svg(bbox: BoundingBox, raw: RawSvgNode) -> Self {
+        Self::RawSvg {
+            bbox,
+            raw: Box::new(raw),
+        }
+    }
+
     pub fn bounds(&self) -> BoundingBox {
         match self {
             PaintOp::PageBackground { bbox, .. }

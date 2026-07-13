@@ -5,6 +5,7 @@ use super::utils::{expand_numbering_format, numbering_format_to_number_format};
 use super::*;
 use crate::model::page::{ColumnDef, PageDef};
 use crate::model::paragraph::{CharShapeRef, LineSeg, Paragraph};
+use crate::model::shape::RectangleShape;
 use crate::model::style::{Numbering, NumberingHead};
 use crate::renderer::composer::compose_paragraph;
 use crate::renderer::style_resolver::ResolvedStyleSet;
@@ -166,6 +167,76 @@ fn test_build_page_with_paragraph() {
     let body = body.unwrap();
     // Column 노드가 있어야 함
     assert!(!body.children.is_empty());
+}
+
+/// [Issue #1945] PartialParagraph 의 start_line 이 조판 라인 수를 넘어도
+/// 패닉하지 않아야 한다 (실문서 크래시 — paragraph_layout.rs 슬라이스 범위 밖).
+/// 수정 전에는 `composed.lines[start_line..end]` 직접 인덱싱이
+/// "range start index N out of range" 로 패닉했다.
+#[test]
+fn partial_paragraph_start_line_beyond_lines_does_not_panic() {
+    let engine = LayoutEngine::with_default_dpi();
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
+
+    // 조판 라인 1개짜리 문단.
+    let paragraphs = vec![Paragraph {
+        text: "한 줄".to_string(),
+        line_segs: vec![LineSeg {
+            line_height: 400,
+            baseline_distance: 320,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+    let composed: Vec<_> = paragraphs.iter().map(|p| compose_paragraph(p)).collect();
+    let styles = ResolvedStyleSet::default();
+
+    let page_content = PageContent {
+        page_index: 0,
+        page_number: 0,
+        section_index: 0,
+        layout,
+        column_contents: vec![ColumnContent {
+            column_index: 0,
+            start_height: 0.0,
+            endnote_flow: false,
+            // start_line(5) > 조판 라인 수(1) — 이월 오버슛 재현.
+            items: vec![PageItem::PartialParagraph {
+                para_index: 0,
+                start_line: 5,
+                end_line: 6,
+            }],
+            zone_layout: None,
+            zone_y_offset: 0.0,
+            wrap_around_paras: Vec::new(),
+            used_height: 0.0,
+            wrap_anchors: std::collections::HashMap::new(),
+        }],
+        active_header: None,
+        active_footer: None,
+        page_number_pos: None,
+        page_hide: None,
+        footnotes: Vec::new(),
+        active_master_page: None,
+        extra_master_pages: Vec::new(),
+    };
+
+    // 패닉 없이 반환하면 성공 (범위 밖 조각은 빈 렌더).
+    let _tree = engine.build_render_tree(
+        &page_content,
+        &paragraphs,
+        &paragraphs,
+        &paragraphs,
+        &composed,
+        &styles,
+        &FootnoteShape::default(),
+        &[],
+        None,
+        &[],
+        None,
+        0,
+        &[],
+    );
 }
 
 #[test]
@@ -1004,12 +1075,22 @@ fn test_expand_numbering_format_digit() {
         raw_para_heads: None,
     };
     let counters = [3, 2, 1, 0, 0, 0, 0];
-    let result =
-        expand_numbering_format("^1.", &counters, &numbering, &numbering.level_start_numbers);
+    let result = expand_numbering_format(
+        "^1.",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        0,
+    );
     assert_eq!(result, "3.");
 
-    let result =
-        expand_numbering_format("^2.", &counters, &numbering, &numbering.level_start_numbers);
+    let result = expand_numbering_format(
+        "^2.",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
     assert_eq!(result, "2.");
 
     let result = expand_numbering_format(
@@ -1017,6 +1098,7 @@ fn test_expand_numbering_format_digit() {
         &counters,
         &numbering,
         &numbering.level_start_numbers,
+        2,
     );
     assert_eq!(result, "(1)");
 }
@@ -1042,9 +1124,142 @@ fn test_expand_numbering_format_hangul() {
         raw_para_heads: None,
     };
     let counters = [1, 3, 0, 0, 0, 0, 0];
-    let result =
-        expand_numbering_format("^2.", &counters, &numbering, &numbering.level_start_numbers);
+    let result = expand_numbering_format(
+        "^2.",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
     assert_eq!(result, "다.");
+}
+
+#[test]
+fn test_expand_numbering_format_level_path() {
+    // ^n/^N: 레벨 경로 자동코드 (#2145). 재현 문서는 전 수준 "^N".
+    let numbering = Numbering {
+        raw_data: None,
+        heads: [NumberingHead {
+            number_format: 0,
+            ..Default::default()
+        }; 7],
+        level_formats: [
+            "^N".to_string(),
+            "^N".to_string(),
+            "^N".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ],
+        start_number: 0,
+        level_start_numbers: [1, 1, 1, 1, 1, 1, 1],
+        raw_para_heads: None,
+    };
+
+    // level 0: "1.", 카운터 전진 후 "2."
+    let counters = [1, 0, 0, 0, 0, 0, 0];
+    let result = expand_numbering_format(
+        "^N",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        0,
+    );
+    assert_eq!(result, "1.");
+    let counters = [2, 0, 0, 0, 0, 0, 0];
+    let result = expand_numbering_format(
+        "^N",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        0,
+    );
+    assert_eq!(result, "2.");
+
+    // level 1: "1.1." → "1.4."
+    let counters = [1, 1, 0, 0, 0, 0, 0];
+    let result = expand_numbering_format(
+        "^N",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
+    assert_eq!(result, "1.1.");
+    let counters = [1, 4, 0, 0, 0, 0, 0];
+    let result = expand_numbering_format(
+        "^N",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
+    assert_eq!(result, "1.4.");
+
+    // ^n: 후행 마침표 없음
+    let counters = [2, 3, 0, 0, 0, 0, 0];
+    let result = expand_numbering_format(
+        "^n",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
+    assert_eq!(result, "2.3");
+
+    // 접두·접미 문자 보존
+    let result = expand_numbering_format(
+        "[^n]",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
+    assert_eq!(result, "[2.3]");
+
+    // 상위 수준 카운터 0이면 시작번호로 폴백
+    let counters = [0, 2, 0, 0, 0, 0, 0];
+    let result = expand_numbering_format(
+        "^N",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
+    assert_eq!(result, "1.2.");
+}
+
+#[test]
+fn test_expand_numbering_format_level_path_mixed_format() {
+    // 수준별 number_format 혼합: L1=Digit, L2=HangulGaNaDa → "1.가."
+    let mut heads = [NumberingHead::default(); 7];
+    heads[1].number_format = 8; // HangulGaNaDa
+    let numbering = Numbering {
+        raw_data: None,
+        heads,
+        level_formats: [
+            "^N".to_string(),
+            "^N".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ],
+        start_number: 0,
+        level_start_numbers: [1, 1, 1, 1, 1, 1, 1],
+        raw_para_heads: None,
+    };
+    let counters = [1, 1, 0, 0, 0, 0, 0];
+    let result = expand_numbering_format(
+        "^N",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
+    assert_eq!(result, "1.가.");
 }
 
 #[test]
@@ -1533,4 +1748,454 @@ fn task1197_paper_nodes_sort_by_plane_z_order_and_stable_index() {
         vec![3, 5, 2, 4, 1],
         "BehindText는 z-order/stable 순서로 먼저, flow, InFrontOfText 순으로 정렬"
     );
+}
+
+#[test]
+fn master_page_controls_sort_by_render_layer_z_order() {
+    fn rect_control(z_order: i32, horizontal_offset: u32) -> Control {
+        Control::Shape(Box::new(ShapeObject::Rectangle(RectangleShape {
+            common: CommonObjAttr {
+                width: 10_000,
+                height: 10_000,
+                horizontal_offset,
+                z_order,
+                text_wrap: TextWrap::InFrontOfText,
+                horz_rel_to: HorzRelTo::Paper,
+                vert_rel_to: VertRelTo::Paper,
+                ..Default::default()
+            },
+            ..Default::default()
+        })))
+    }
+
+    let engine = LayoutEngine::with_default_dpi();
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
+    let mut tree = PageRenderTree::new(0, layout.page_width, layout.page_height);
+    let master_page = MasterPage {
+        paragraphs: vec![Paragraph {
+            controls: vec![
+                rect_control(20, 0),
+                rect_control(10, 20_000),
+                rect_control(20, 40_000),
+            ],
+            ..Default::default()
+        }],
+        text_width: 10_000,
+        text_height: 10_000,
+        ..Default::default()
+    };
+
+    engine.build_master_page_into(
+        &mut tree,
+        Some(&master_page),
+        &layout,
+        &[],
+        &ResolvedStyleSet::default(),
+        &[],
+        0,
+        1,
+    );
+
+    let master_node = tree
+        .root
+        .children
+        .iter()
+        .find(|node| matches!(node.node_type, RenderNodeType::MasterPage))
+        .expect("master page node should be rendered");
+    let z_order: Vec<i32> = master_node
+        .children
+        .iter()
+        .filter_map(|node| match node.node_type {
+            RenderNodeType::Rectangle(_) => node.layer.map(|layer| layer.z_order),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        z_order,
+        vec![10, 20, 20],
+        "master-page children should replay Hancom object order, not raw control order"
+    );
+}
+
+fn first_master_child_layer<F>(tree: &PageRenderTree, predicate: F) -> RenderLayerInfo
+where
+    F: Fn(&RenderNodeType) -> bool + Copy,
+{
+    fn find<F>(node: &RenderNode, predicate: F) -> Option<RenderLayerInfo>
+    where
+        F: Fn(&RenderNodeType) -> bool + Copy,
+    {
+        if predicate(&node.node_type) {
+            return node.layer;
+        }
+        node.children
+            .iter()
+            .find_map(|child| find(child, predicate))
+    }
+
+    let master = tree
+        .root
+        .children
+        .iter()
+        .find(|node| matches!(node.node_type, RenderNodeType::MasterPage))
+        .expect("master page node should be rendered");
+    find(master, predicate).expect("matching master-page child should carry a layer")
+}
+
+fn master_rect_control(width: u32, height: u32) -> Control {
+    Control::Shape(Box::new(ShapeObject::Rectangle(RectangleShape {
+        common: CommonObjAttr {
+            width,
+            height,
+            text_wrap: TextWrap::InFrontOfText,
+            horz_rel_to: HorzRelTo::Paper,
+            vert_rel_to: VertRelTo::Paper,
+            horz_align: HorzAlign::Left,
+            vert_align: VertAlign::Top,
+            ..Default::default()
+        },
+        ..Default::default()
+    })))
+}
+
+#[test]
+fn master_page_paper_sized_background_replays_behind_body_text() {
+    let page = a4_page_def();
+    let tree = render_tree_with_master_page_control(master_rect_control(page.width, page.height));
+    let layer = first_master_child_layer(&tree, |node_type| {
+        matches!(node_type, RenderNodeType::Rectangle(_))
+    });
+
+    assert_eq!(layer.text_wrap, Some(TextWrap::BehindText));
+}
+
+#[test]
+fn master_page_smaller_front_control_stays_in_front_of_body_text() {
+    let page = a4_page_def();
+    let tree =
+        render_tree_with_master_page_control(master_rect_control(page.width / 2, page.height / 2));
+    let layer = first_master_child_layer(&tree, |node_type| {
+        matches!(node_type, RenderNodeType::Rectangle(_))
+    });
+
+    assert_eq!(layer.text_wrap, Some(TextWrap::InFrontOfText));
+}
+
+fn first_master_child_bbox<F>(tree: &PageRenderTree, predicate: F) -> BoundingBox
+where
+    F: Fn(&RenderNodeType) -> bool + Copy,
+{
+    fn find<F>(node: &RenderNode, predicate: F) -> Option<BoundingBox>
+    where
+        F: Fn(&RenderNodeType) -> bool + Copy,
+    {
+        if predicate(&node.node_type) {
+            return Some(node.bbox);
+        }
+        node.children
+            .iter()
+            .find_map(|child| find(child, predicate))
+    }
+
+    let master = tree
+        .root
+        .children
+        .iter()
+        .find(|node| matches!(node.node_type, RenderNodeType::MasterPage))
+        .expect("master page node should be rendered");
+    find(master, predicate).expect("matching master-page child should be rendered")
+}
+
+fn render_tree_with_master_page_control(control: Control) -> PageRenderTree {
+    let engine = LayoutEngine::with_default_dpi();
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
+    let mut tree = PageRenderTree::new(0, layout.page_width, layout.page_height);
+    let master_page = MasterPage {
+        paragraphs: vec![Paragraph {
+            controls: vec![control],
+            ..Default::default()
+        }],
+        text_width: 10_000,
+        text_height: 10_000,
+        ..Default::default()
+    };
+
+    engine.build_master_page_into(
+        &mut tree,
+        Some(&master_page),
+        &layout,
+        &[],
+        &ResolvedStyleSet::default(),
+        &[],
+        0,
+        1,
+    );
+    tree
+}
+
+#[test]
+fn master_page_paper_relative_shape_uses_page_origin() {
+    let tree = render_tree_with_master_page_control(Control::Shape(Box::new(
+        ShapeObject::Rectangle(RectangleShape {
+            common: CommonObjAttr {
+                width: 7_500,
+                height: 3_000,
+                horizontal_offset: 1_500,
+                vertical_offset: 2_250,
+                horz_rel_to: HorzRelTo::Paper,
+                vert_rel_to: VertRelTo::Paper,
+                text_wrap: TextWrap::InFrontOfText,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+    )));
+
+    let bbox = first_master_child_bbox(&tree, |node_type| {
+        matches!(node_type, RenderNodeType::Rectangle(_))
+    });
+    assert!((bbox.x - hwpunit_to_px(1_500, DEFAULT_DPI)).abs() < 0.01);
+    assert!((bbox.y - hwpunit_to_px(2_250, DEFAULT_DPI)).abs() < 0.01);
+}
+
+#[test]
+fn master_page_paper_relative_picture_uses_page_origin() {
+    let tree = render_tree_with_master_page_control(Control::Picture(Box::new(
+        crate::model::image::Picture {
+            common: CommonObjAttr {
+                width: 7_500,
+                height: 3_000,
+                horizontal_offset: 1_500,
+                vertical_offset: 2_250,
+                horz_rel_to: HorzRelTo::Paper,
+                vert_rel_to: VertRelTo::Paper,
+                text_wrap: TextWrap::InFrontOfText,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )));
+
+    let bbox = first_master_child_bbox(&tree, |node_type| {
+        matches!(node_type, RenderNodeType::Image(_))
+    });
+    assert!((bbox.x - hwpunit_to_px(1_500, DEFAULT_DPI)).abs() < 0.01);
+    assert!((bbox.y - hwpunit_to_px(2_250, DEFAULT_DPI)).abs() < 0.01);
+}
+
+fn first_header_child_bbox<F>(tree: &PageRenderTree, predicate: F) -> BoundingBox
+where
+    F: Fn(&RenderNodeType) -> bool + Copy,
+{
+    fn find<F>(node: &RenderNode, predicate: F) -> Option<BoundingBox>
+    where
+        F: Fn(&RenderNodeType) -> bool + Copy,
+    {
+        if predicate(&node.node_type) {
+            return Some(node.bbox);
+        }
+        node.children
+            .iter()
+            .find_map(|child| find(child, predicate))
+    }
+
+    let header = tree
+        .root
+        .children
+        .iter()
+        .find(|node| matches!(node.node_type, RenderNodeType::Header))
+        .expect("header node should be rendered");
+    find(header, predicate).expect("matching header child should be rendered")
+}
+
+fn render_tree_with_header_control(control: Control) -> PageRenderTree {
+    use crate::model::header_footer::Header;
+    use crate::renderer::pagination::HeaderFooterRef;
+
+    let engine = LayoutEngine::with_default_dpi();
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
+    let paragraphs = vec![Paragraph {
+        controls: vec![Control::Header(Box::new(Header {
+            paragraphs: vec![Paragraph {
+                controls: vec![control],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }))],
+        ..Default::default()
+    }];
+    let page_content = PageContent {
+        page_index: 0,
+        page_number: 1,
+        section_index: 0,
+        layout,
+        column_contents: Vec::new(),
+        active_header: Some(HeaderFooterRef {
+            para_index: 0,
+            control_index: 0,
+            source_section_index: 0,
+        }),
+        active_footer: None,
+        page_number_pos: None,
+        page_hide: None,
+        footnotes: Vec::new(),
+        active_master_page: None,
+        extra_master_pages: Vec::new(),
+    };
+    engine.build_render_tree(
+        &page_content,
+        &paragraphs,
+        &paragraphs,
+        &paragraphs,
+        &[],
+        &ResolvedStyleSet::default(),
+        &FootnoteShape::default(),
+        &[],
+        None,
+        &[],
+        None,
+        0,
+        &[],
+    )
+}
+
+#[test]
+fn header_paper_relative_shape_uses_page_origin() {
+    let tree = render_tree_with_header_control(Control::Shape(Box::new(ShapeObject::Rectangle(
+        RectangleShape {
+            common: CommonObjAttr {
+                width: 7_500,
+                height: 3_000,
+                horizontal_offset: 1_500,
+                vertical_offset: 2_250,
+                horz_rel_to: HorzRelTo::Paper,
+                vert_rel_to: VertRelTo::Paper,
+                text_wrap: TextWrap::InFrontOfText,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ))));
+
+    let bbox = first_header_child_bbox(&tree, |node_type| {
+        matches!(node_type, RenderNodeType::Rectangle(_))
+    });
+    assert!((bbox.x - hwpunit_to_px(1_500, DEFAULT_DPI)).abs() < 0.01);
+    assert!((bbox.y - hwpunit_to_px(2_250, DEFAULT_DPI)).abs() < 0.01);
+}
+
+#[test]
+fn header_paper_relative_picture_uses_page_origin() {
+    let tree =
+        render_tree_with_header_control(Control::Picture(Box::new(crate::model::image::Picture {
+            common: CommonObjAttr {
+                width: 7_500,
+                height: 3_000,
+                horizontal_offset: 1_500,
+                vertical_offset: 2_250,
+                horz_rel_to: HorzRelTo::Paper,
+                vert_rel_to: VertRelTo::Paper,
+                text_wrap: TextWrap::InFrontOfText,
+                ..Default::default()
+            },
+            ..Default::default()
+        })));
+
+    let bbox = first_header_child_bbox(&tree, |node_type| {
+        matches!(node_type, RenderNodeType::Image(_))
+    });
+    assert!((bbox.x - hwpunit_to_px(1_500, DEFAULT_DPI)).abs() < 0.01);
+    assert!((bbox.y - hwpunit_to_px(2_250, DEFAULT_DPI)).abs() < 0.01);
+}
+
+// [Task #2102] 쪽 배경 이미지 채우기는 구역 첫 쪽에만 적용된다.
+// 색 채우기는 첫 쪽 여부와 무관하게 유지된다.
+
+/// 이미지 채우기 + 색 채우기를 가진 쪽 테두리/배경으로 렌더 트리를 만든 뒤
+/// 루트 자식에서 PageBackground 노드를 찾아 (background_color, image 유무) 를 반환.
+fn page_bg_color_and_image_present(is_section_first: bool) -> (bool, bool) {
+    use crate::model::bin_data::BinDataContent;
+    use crate::model::image::ImageEffect;
+    use crate::model::page::PageBorderFill;
+    use crate::model::style::ImageFillMode;
+    use crate::renderer::style_resolver::{ResolvedBorderStyle, ResolvedImageFill};
+
+    let engine = LayoutEngine::with_default_dpi();
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
+    let page_content = PageContent {
+        page_index: 0,
+        page_number: 0,
+        section_index: 0,
+        layout,
+        column_contents: Vec::new(),
+        active_header: None,
+        active_footer: None,
+        page_number_pos: None,
+        page_hide: None,
+        footnotes: Vec::new(),
+        active_master_page: None,
+        extra_master_pages: Vec::new(),
+    };
+
+    let styles = ResolvedStyleSet {
+        border_styles: vec![ResolvedBorderStyle {
+            fill_color: Some(0x00F0F0F0),
+            image_fill: Some(ResolvedImageFill {
+                bin_data_id: 1,
+                fill_mode: ImageFillMode::FitToSize,
+                brightness: 0,
+                contrast: 0,
+                effect: ImageEffect::RealPic,
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let bin_data = vec![BinDataContent {
+        id: 1,
+        data: vec![0xFF, 0xD8, 0xFF, 0xE0], // JPEG magic (내용 무관, 존재만 확인)
+        extension: "jpg".to_string(),
+    }];
+    let page_border_fill = PageBorderFill {
+        border_fill_id: 1,
+        ..Default::default()
+    };
+
+    engine.set_current_page_is_section_first(is_section_first);
+    let tree = engine.build_render_tree(
+        &page_content,
+        &[],
+        &[],
+        &[],
+        &[],
+        &styles,
+        &FootnoteShape::default(),
+        &bin_data,
+        None,
+        &[],
+        Some(&page_border_fill),
+        0,
+        &[],
+    );
+
+    let bg = tree.root.children.iter().find_map(|c| match &c.node_type {
+        RenderNodeType::PageBackground(bg) => Some(bg),
+        _ => None,
+    });
+    let bg = bg.expect("PageBackground 노드가 있어야 함");
+    (bg.background_color.is_some(), bg.image.is_some())
+}
+
+#[test]
+fn page_bg_image_only_on_section_first_page() {
+    // 구역 첫 쪽: 이미지 채우기 적용
+    let (color_first, image_first) = page_bg_color_and_image_present(true);
+    assert!(image_first, "구역 첫 쪽에는 배경 이미지가 있어야 한다");
+    assert!(color_first, "색 채우기는 유지되어야 한다");
+
+    // 구역 첫 쪽 아님: 이미지 채우기 억제, 색 채우기는 유지
+    let (color_rest, image_rest) = page_bg_color_and_image_present(false);
+    assert!(!image_rest, "구역 첫 쪽이 아니면 배경 이미지가 없어야 한다");
+    assert!(color_rest, "이미지가 억제돼도 색 채우기는 유지되어야 한다");
 }

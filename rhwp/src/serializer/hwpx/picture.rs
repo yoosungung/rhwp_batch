@@ -86,7 +86,9 @@ pub fn write_picture<W: Write>(
     write_cur_sz(w, pic)?;
     write_flip(w, &pic.shape_attr)?;
     write_rotation_info(w, &pic.shape_attr)?;
-    write_rendering_info(w)?;
+    // [#1501] 그룹 자식 pic 의 transMatrix(render_tx/sx) 보존 — 종전 identity 고정 출력은
+    // 그룹 내 자식을 원점·고유크기로 붕괴시켰다. shape.rs 의 raw_rendering 디코더 공유.
+    super::shape::write_rendering_info(w, &pic.shape_attr)?;
     write_img_rect(w, pic)?;
     write_img_clip(w, pic)?;
     write_in_margin(w, pic)?;
@@ -127,12 +129,17 @@ fn write_org_sz<W: Write>(
 fn write_cur_sz<W: Write>(w: &mut Writer<W>, p: &Picture) -> Result<(), SerializeError> {
     // [#1389] 현재 크기는 shape_attr.current_width/height (IR 보존). 0 이면 common(sz)
     // 폴백 — 원본도 그 경우 sz=curSz. 종전 common 직출이라 current≠sz 인 pic 변형.
-    let cw = if p.shape_attr.current_width > 0 {
+    // [#2017] 파싱 시 orgSz로 materialize된 dimension 은 원본 `0` sentinel 로 복원.
+    let cw = if p.shape_attr.current_width_was_zero {
+        0
+    } else if p.shape_attr.current_width > 0 {
         p.shape_attr.current_width
     } else {
         p.common.width
     };
-    let ch = if p.shape_attr.current_height > 0 {
+    let ch = if p.shape_attr.current_height_was_zero {
+        0
+    } else if p.shape_attr.current_height > 0 {
         p.shape_attr.current_height
     } else {
         p.common.height
@@ -166,31 +173,6 @@ fn write_rotation_info<W: Write>(
             ("centerX", &cx),
             ("centerY", &cy),
             ("rotateimage", ri),
-        ],
-    )
-}
-
-fn write_rendering_info<W: Write>(w: &mut Writer<W>) -> Result<(), SerializeError> {
-    // 3개 행렬 (transMatrix / scaMatrix / rotMatrix) 을 identity 로 출력.
-    start_tag(w, "hp:renderingInfo")?;
-    write_matrix(w, "hc:transMatrix")?;
-    write_matrix(w, "hc:scaMatrix")?;
-    write_matrix(w, "hc:rotMatrix")?;
-    end_tag(w, "hp:renderingInfo")?;
-    Ok(())
-}
-
-fn write_matrix<W: Write>(w: &mut Writer<W>, name: &str) -> Result<(), SerializeError> {
-    empty_tag(
-        w,
-        name,
-        &[
-            ("e1", "1"),
-            ("e2", "0"),
-            ("e3", "0"),
-            ("e4", "0"),
-            ("e5", "1"),
-            ("e6", "0"),
         ],
     )
 }
@@ -275,12 +257,20 @@ fn write_img<W: Write>(
     ctx: &SerializeContext,
 ) -> Result<(), SerializeError> {
     let bin_id = p.image_attr.bin_data_id;
-    let manifest_id = ctx.resolve_bin_id(bin_id).ok_or_else(|| {
-        SerializeError::XmlError(format!(
-            "<hp:pic> binaryItemIDRef 미등록 bin_data_id={} (BinDataContent 누락)",
-            bin_id
-        ))
-    })?;
+    // #1567: bin_id==0 은 원본 `binaryItemIDRef=""`(이미지 참조 없는 placeholder pic, 표 셀
+    // 등)에 대응한다(파서 `unwrap_or(0)`). resolve 실패해도 빈 ref 를 verbatim 방출해
+    // pic 컨트롤을 보존한다(종전: Err → 호출자 section.rs:701 이 조용히 드롭 → IR_DIFF).
+    // 비-0 미해결은 진짜 BinDataContent 누락이므로 진단(Err)을 유지해 손실 은폐를 막는다.
+    let manifest_id = match ctx.resolve_bin_id(bin_id) {
+        Some(id) => id,
+        None if bin_id == 0 => "",
+        None => {
+            return Err(SerializeError::XmlError(format!(
+                "<hp:pic> binaryItemIDRef 미등록 bin_data_id={} (BinDataContent 누락)",
+                bin_id
+            )))
+        }
+    };
 
     let bright = p.image_attr.brightness.to_string();
     let contrast = p.image_attr.contrast.to_string();
@@ -411,6 +401,7 @@ fn write_pos<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), Seria
     let allow_overlap = bool01(c.allow_overlap);
     let vert_offset = c.vertical_offset.to_string();
     let horz_offset = c.horizontal_offset.to_string();
+    let hold = bool01(c.prevent_page_break != 0); // [#1594] IR 보존
     empty_tag(
         w,
         "hp:pos",
@@ -419,7 +410,7 @@ fn write_pos<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), Seria
             ("affectLSpacing", "0"),
             ("flowWithText", flow_with_text),
             ("allowOverlap", allow_overlap),
-            ("holdAnchorAndSO", "0"),
+            ("holdAnchorAndSO", hold),
             ("vertRelTo", vert_rel_to_str(c.vert_rel_to)),
             ("horzRelTo", horz_rel_to_str(c.horz_rel_to)),
             ("vertAlign", vert_align_str(c.vert_align)),
@@ -700,15 +691,33 @@ mod tests {
 
     #[test]
     fn img_uses_manifest_id() {
+        // [#1891] manifest id 는 `image{bin_data_id}` 숫자 불변식을 따라야 한다.
+        // 파서(section.rs)가 binaryItemIDRef 의 숫자를 그대로 bin_data_id 로 읽으므로,
+        // 종전 순번 명명(id=5 → "image1")은 재파스에서 참조가 1 로 어긋났다.
         let doc = make_doc_with_bin(5, "jpg");
         let mut ctx = SerializeContext::collect_from_document(&doc);
         let pic = make_picture(5);
         let xml = serialize(&pic, &mut ctx);
         assert!(
-            xml.contains(r#"binaryItemIDRef="image1""#),
-            "binaryItemIDRef must resolve to manifest id image1: {}",
+            xml.contains(r#"binaryItemIDRef="image5""#),
+            "binaryItemIDRef must resolve to manifest id image5 (숫자 불변식): {}",
             xml
         );
+    }
+
+    #[test]
+    fn task1567_empty_binary_ref_pic_preserved() {
+        // #1567: bin_data_id==0(원본 binaryItemIDRef="" placeholder)은 BinDataContent 가
+        // 없어 resolve 실패해도 binaryItemIDRef="" 로 보존되어야 한다(드롭 금지).
+        let doc = Document::default(); // bin 미등록
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let pic = make_picture(0);
+        let xml = serialize(&pic, &mut ctx);
+        assert!(
+            xml.contains(r#"binaryItemIDRef="""#),
+            "빈 ref pic 은 binaryItemIDRef=\"\" 로 보존(드롭 금지): {xml}"
+        );
+        assert!(xml.contains("<hp:pic "), "pic 컨트롤 자체 보존: {xml}");
     }
 
     #[test]

@@ -1056,6 +1056,29 @@ fn issue_1470_table_caption_number(doc: &HwpDocument, control_idx: usize) -> Opt
         })
 }
 
+fn issue_1470_picture_caption_number(doc: &HwpDocument, control_idx: usize) -> Option<(u16, u16)> {
+    use crate::model::control::Control;
+
+    let picture = match doc.document.sections[0].paragraphs[0]
+        .controls
+        .get(control_idx)?
+    {
+        Control::Picture(p) => p,
+        _ => return None,
+    };
+    picture
+        .caption
+        .as_ref()?
+        .paragraphs
+        .first()?
+        .controls
+        .iter()
+        .find_map(|c| match c {
+            Control::AutoNumber(an) => Some((an.assigned_number, an.number)),
+            _ => None,
+        })
+}
+
 #[test]
 fn issue_1470_create_table_ex_tac_renders_once() {
     let mut doc = HwpDocument::create_empty();
@@ -1106,6 +1129,176 @@ fn issue_1470_create_table_ex_tac_caption_renders_once() {
         issue_1470_count_rendered_tables(&doc, 0, control_idx),
         1,
         "캡션이 있는 TAC 표도 같은 컨트롤이 한 번만 렌더되어야 한다"
+    );
+}
+
+#[test]
+fn issue_1470_picture_caption_can_be_removed_and_renumbers() {
+    use crate::model::control::Control;
+
+    fn minimal_png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x00, 0x00, 0x00,
+            0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    let mut doc = HwpDocument::create_empty();
+    let image = minimal_png();
+    let first = doc
+        .insert_picture_native(
+            0,
+            0,
+            0,
+            &[],
+            &image,
+            5000,
+            5000,
+            1,
+            1,
+            "png",
+            "first",
+            None,
+            None,
+        )
+        .expect("첫 번째 그림 삽입");
+    let first_idx = issue_1481_json_usize(&first, "controlIdx");
+    let second = doc
+        .insert_picture_native(
+            0,
+            0,
+            0,
+            &[],
+            &image,
+            5000,
+            5000,
+            1,
+            1,
+            "png",
+            "second",
+            None,
+            None,
+        )
+        .expect("두 번째 그림 삽입");
+    let second_idx = issue_1481_json_usize(&second, "controlIdx");
+
+    for control_idx in [first_idx, second_idx] {
+        doc.set_picture_properties_native(0, 0, control_idx, r#"{"hasCaption":true}"#)
+            .expect("그림 캡션 생성");
+    }
+
+    assert_eq!(
+        issue_1470_picture_caption_number(&doc, first_idx),
+        Some((1, 1))
+    );
+    assert_eq!(
+        issue_1470_picture_caption_number(&doc, second_idx),
+        Some((2, 2))
+    );
+
+    doc.set_picture_properties_native(0, 0, first_idx, r#"{"hasCaption":false}"#)
+        .expect("그림 캡션 삭제");
+
+    let first_picture = match &doc.document.sections[0].paragraphs[0].controls[first_idx] {
+        Control::Picture(p) => p,
+        other => panic!("첫 번째 컨트롤이 그림이 아님: {other:?}"),
+    };
+    assert!(
+        first_picture.caption.is_none(),
+        "hasCaption=false는 그림 캡션 슬롯을 삭제해야 한다"
+    );
+    assert_eq!(
+        first_picture.common.attr & (1 << 29),
+        0,
+        "그림 캡션 attr bit도 내려야 한다"
+    );
+    let props: Value = serde_json::from_str(
+        &doc.get_picture_properties_native(0, 0, first_idx)
+            .expect("그림 속성 조회"),
+    )
+    .expect("그림 속성 JSON");
+    assert_eq!(
+        props["hasCaption"], false,
+        "그림 속성창의 중앙 캡션 없음 선택은 hasCaption=false로 되돌아와야 한다"
+    );
+    assert_eq!(
+        issue_1470_picture_caption_number(&doc, second_idx),
+        Some((1, 1)),
+        "앞 그림 캡션 삭제 후 뒤 그림 캡션 번호가 1로 재배정되어야 한다"
+    );
+}
+
+#[test]
+fn issue_1470_picture_caption_path_cursor_and_control_paste() {
+    use crate::model::control::Control;
+
+    fn minimal_png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x00, 0x00, 0x00,
+            0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    let mut doc = HwpDocument::create_empty();
+    let image = minimal_png();
+    let inserted = doc
+        .insert_picture_native(
+            0,
+            0,
+            0,
+            &[],
+            &image,
+            5000,
+            5000,
+            1,
+            1,
+            "png",
+            "caption-path",
+            None,
+            None,
+        )
+        .expect("그림 삽입");
+    let pic_idx = issue_1481_json_usize(&inserted, "controlIdx");
+    doc.set_picture_properties_native(0, 0, pic_idx, r#"{"hasCaption":true}"#)
+        .expect("그림 캡션 생성");
+
+    let path = [(pic_idx, 0usize, 0usize)];
+    let path_json = format!(
+        r#"[{{"controlIndex":{},"cellIndex":0,"cellParaIndex":0}}]"#,
+        pic_idx
+    );
+    let rect = doc.get_cursor_rect_by_path_native(0, 0, &path_json, 0);
+    assert!(
+        rect.is_ok(),
+        "그림 캡션 cellPath도 커서 좌표를 찾아야 한다: {:?}",
+        rect.err()
+    );
+
+    doc.copy_control_native(0, 0, &[], pic_idx)
+        .expect("그림 개체 복사");
+    let pasted = doc.paste_internal_in_cell_by_path_native(0, 0, &path, 0);
+    assert!(
+        pasted.is_ok(),
+        "그림 캡션 위치에도 내부 그림 클립보드를 붙여넣을 수 있어야 한다: {:?}",
+        pasted.err()
+    );
+    let picture = match &doc.document.sections[0].paragraphs[0].controls[pic_idx] {
+        Control::Picture(p) => p,
+        other => panic!("그림 컨트롤이 아님: {other:?}"),
+    };
+    let caption = picture.caption.as_ref().expect("그림 캡션 존재");
+    assert!(
+        caption.paragraphs[0]
+            .controls
+            .iter()
+            .any(|control| matches!(control, Control::Picture(_))),
+        "그림 caption path 붙여넣기는 캡션 문단 안에 그림 컨트롤을 보존해야 한다"
     );
 }
 
@@ -1545,7 +1738,7 @@ fn create_doc_with_table() -> HwpDocument {
         ..Default::default()
     };
 
-    let table = Table {
+    let mut table = Table {
         row_count: 2,
         col_count: 2,
         padding: Padding {
@@ -1638,6 +1831,7 @@ fn create_doc_with_table() -> HwpDocument {
         ],
         ..Default::default()
     };
+    table.rebuild_grid();
 
     let parent_para = Paragraph {
         text: String::new(),
@@ -1690,6 +1884,112 @@ fn test_delete_text_in_cell() {
         assert_eq!(table.cells[1].paragraphs[0].text, "B");
     } else {
         panic!("표 컨트롤을 찾을 수 없음");
+    }
+}
+
+#[test]
+fn test_table_transpose_clipboard_native_api() {
+    let mut doc = create_doc_with_table();
+    assert!(!doc.has_table_transpose_clipboard_native());
+
+    let copy = doc
+        .copy_table_cells_transposed_native(0, 0, 0, 0, 0, 1, 1)
+        .unwrap();
+    let copy_json: Value = serde_json::from_str(&copy).unwrap();
+    assert_eq!(copy_json["ok"], true);
+    assert_eq!(copy_json["sourceRows"], 2);
+    assert_eq!(copy_json["sourceCols"], 2);
+    assert!(doc.has_table_transpose_clipboard_native());
+
+    let paste = doc
+        .paste_table_cells_transposed_native(0, 0, 0, 0, 0)
+        .unwrap();
+    let paste_json: Value = serde_json::from_str(&paste).unwrap();
+    assert_eq!(paste_json["ok"], true);
+    assert_eq!(paste_json["targetRows"], 2);
+    assert_eq!(paste_json["targetCols"], 2);
+
+    if let Some(Control::Table(table)) = doc.document.sections[0].paragraphs[0].controls.first() {
+        assert_eq!(table.cells[0].paragraphs[0].text, "셀A");
+        assert_eq!(table.cells[1].paragraphs[0].text, "셀C");
+        assert_eq!(table.cells[2].paragraphs[0].text, "셀B");
+        assert_eq!(table.cells[3].paragraphs[0].text, "셀D");
+    } else {
+        panic!("표 컨트롤을 찾을 수 없음");
+    }
+    assert!(matches!(
+        doc.event_log.last(),
+        Some(crate::model::event::DocumentEvent::TableCellsTransposed {
+            section: 0,
+            para: 0,
+            ctrl: 0,
+        })
+    ));
+}
+
+#[test]
+fn test_table_transpose_in_place_native_api() {
+    let mut doc = create_doc_with_table();
+
+    let result = doc.transpose_table_cells_in_place_native(0, 0, 0).unwrap();
+    let json: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["sourceRows"], 2);
+    assert_eq!(json["sourceCols"], 2);
+    assert_eq!(json["targetRows"], 2);
+    assert_eq!(json["targetCols"], 2);
+
+    assert_eq!(doc.document.sections[0].paragraphs.len(), 1);
+    if let Some(Control::Table(table)) = doc.document.sections[0].paragraphs[0].controls.first() {
+        assert_eq!(table.row_count, 2);
+        assert_eq!(table.col_count, 2);
+        assert_eq!(table.cells[0].paragraphs[0].text, "셀A");
+        assert_eq!(table.cells[1].paragraphs[0].text, "셀C");
+        assert_eq!(table.cells[2].paragraphs[0].text, "셀B");
+        assert_eq!(table.cells[3].paragraphs[0].text, "셀D");
+    } else {
+        panic!("행/열이 바뀐 기존 표 컨트롤을 찾을 수 없음");
+    }
+}
+
+#[test]
+fn test_table_transpose_paste_as_new_table_native_api() {
+    let mut doc = create_doc_with_table();
+    doc.copy_table_cells_transposed_native(0, 0, 0, 0, 0, 1, 1)
+        .unwrap();
+
+    let paste = doc
+        .paste_table_cells_transposed_as_new_table_native(0, 0, 0)
+        .unwrap();
+    let paste_json: Value = serde_json::from_str(&paste).unwrap();
+    assert_eq!(paste_json["ok"], true);
+    assert_eq!(paste_json["paraIdx"], 1);
+    assert_eq!(paste_json["controlIdx"], 0);
+    assert_eq!(paste_json["targetRows"], 2);
+    assert_eq!(paste_json["targetCols"], 2);
+
+    if let Some(Control::Table(source_table)) =
+        doc.document.sections[0].paragraphs[0].controls.first()
+    {
+        assert_eq!(source_table.cells[0].paragraphs[0].text, "셀A");
+        assert_eq!(source_table.cells[1].paragraphs[0].text, "셀B");
+        assert_eq!(source_table.cells[2].paragraphs[0].text, "셀C");
+        assert_eq!(source_table.cells[3].paragraphs[0].text, "셀D");
+    } else {
+        panic!("원본 표 컨트롤을 찾을 수 없음");
+    }
+
+    if let Some(Control::Table(target_table)) =
+        doc.document.sections[0].paragraphs[1].controls.first()
+    {
+        assert_eq!(target_table.row_count, 2);
+        assert_eq!(target_table.col_count, 2);
+        assert_eq!(target_table.cells[0].paragraphs[0].text, "셀A");
+        assert_eq!(target_table.cells[1].paragraphs[0].text, "셀C");
+        assert_eq!(target_table.cells[2].paragraphs[0].text, "셀B");
+        assert_eq!(target_table.cells[3].paragraphs[0].text, "셀D");
+    } else {
+        panic!("행/열 바꿈 붙여넣기 표 컨트롤을 찾을 수 없음");
     }
 }
 
@@ -14108,7 +14408,9 @@ fn test_save_table_1x1() {
     };
 
     // DocInfo에 실선 테두리 BorderFill 추가 (참조: bf[0])
-    use crate::model::style::{BorderFill, BorderLine, BorderLineType, DiagonalLine, Fill};
+    use crate::model::style::{
+        BorderFill, BorderLine, BorderLineType, CenterLine, DiagonalLine, Fill,
+    };
     let solid_border = BorderLine {
         line_type: BorderLineType::Solid,
         width: 1,
@@ -14123,6 +14425,7 @@ fn test_save_table_1x1() {
             width: 0,
             color: 0,
         },
+        center_line: CenterLine::None,
         fill: Fill::default(),
     };
     doc.document.doc_info.border_fills.push(new_bf);
@@ -16048,7 +16351,9 @@ fn test_save_pic_in_table() {
     });
 
     // 4. DocInfo에 BorderFill 추가 (표 테두리용)
-    use crate::model::style::{BorderFill, BorderLine, BorderLineType, DiagonalLine, Fill};
+    use crate::model::style::{
+        BorderFill, BorderLine, BorderLineType, CenterLine, DiagonalLine, Fill,
+    };
     let solid_border = BorderLine {
         line_type: BorderLineType::Solid,
         width: 1,
@@ -16063,6 +16368,7 @@ fn test_save_pic_in_table() {
             width: 0,
             color: 0,
         },
+        center_line: CenterLine::None,
         fill: Fill::default(),
     };
     doc.document.doc_info.border_fills.push(new_bf);
@@ -23281,6 +23587,53 @@ fn test_reflow_linesegs_empty_document_returns_zero() {
     let mut doc = HwpDocument::create_empty();
     let count = doc.reflow_linesegs();
     assert_eq!(count, 0);
+}
+
+#[test]
+fn test_create_blank_document_clears_previous_hwpx_validation_warnings() {
+    let bytes = std::fs::read("samples/hwpx_sample2.hwpx").expect("HWPX 샘플 읽기");
+    let mut doc = HwpDocument::new(&bytes).expect("HWPX 샘플 로드");
+
+    let before: Value = serde_json::from_str(&doc.get_validation_warnings()).expect("경고 JSON");
+    assert!(
+        before["count"].as_u64().unwrap_or(0) > 0,
+        "재현 샘플은 HWPX validation warning이 있어야 함: {before}"
+    );
+    assert_eq!(doc.get_source_format(), "hwpx");
+
+    doc.create_blank_document_native()
+        .expect("새 문서 생성 성공");
+
+    let after: Value = serde_json::from_str(&doc.get_validation_warnings()).expect("경고 JSON");
+    assert_eq!(
+        after["count"].as_u64(),
+        Some(0),
+        "새 문서는 이전 HWPX warning을 물려받으면 안 됨: {after}"
+    );
+    assert_eq!(doc.get_source_format(), "hwp");
+}
+
+#[test]
+fn test_reflow_linesegs_keeps_hwpx_sample2_page_count_for_textrun_warnings() {
+    let bytes = std::fs::read("samples/hwpx_sample2.hwpx").expect("HWPX 샘플 읽기");
+    let mut doc = HwpDocument::new(&bytes).expect("HWPX 샘플 로드");
+
+    let before_page_count = doc.page_count();
+    let before: Value = serde_json::from_str(&doc.get_validation_warnings()).expect("경고 JSON");
+    assert_eq!(before_page_count, 29);
+    assert_eq!(before["count"].as_u64(), Some(151));
+
+    let reflowed = doc.reflow_linesegs();
+
+    assert_eq!(
+        reflowed, 0,
+        "LinesegTextRunReflow 경고는 페이지 수를 바꿀 수 있어 자동 보정하지 않음"
+    );
+    assert_eq!(
+        doc.page_count(),
+        before_page_count,
+        "권장 보정으로 HWPX 페이지 수가 바뀌면 안 됨"
+    );
 }
 
 // ---------- #1413: insertPictureEx(options object) 동치 ----------

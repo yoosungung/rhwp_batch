@@ -13,7 +13,9 @@ use crate::renderer::layout::{compute_char_positions, split_into_clusters};
 use crate::renderer::render_tree::BoundingBox;
 use crate::renderer::{clamp_tab_leader_end_x, TextStyle};
 
-use super::font_lookup::{match_system_family_style, SystemFontFamilies};
+use super::font_lookup::{
+    legacy_typeface_for_style, match_system_family_style, SystemFontFamilies,
+};
 use super::renderer::colorref_to_skia;
 
 pub(super) struct SkiaTextReplay<'a> {
@@ -115,7 +117,7 @@ impl SkiaTextReplay<'_> {
                             push(&mut chain, &mut seen, tf);
                         }
                     }
-                    if let Some(tf) = self.font_mgr.legacy_make_typeface(None::<&str>, font_style) {
+                    if let Some(tf) = legacy_typeface_for_style(self.font_mgr, font_style) {
                         push(&mut chain, &mut seen, tf);
                     }
                     chain
@@ -693,10 +695,7 @@ impl SkiaTextReplay<'_> {
                     "DejaVu Sans",
                     FontStyle::normal(),
                 )
-                .or_else(|| {
-                    self.font_mgr
-                        .legacy_make_typeface(None::<&str>, FontStyle::normal())
-                })
+                .or_else(|| legacy_typeface_for_style(self.font_mgr, FontStyle::normal()))
                 .map(|tf| Font::new(tf, size))
                 .unwrap_or_else(|| {
                     let mut font = Font::default();

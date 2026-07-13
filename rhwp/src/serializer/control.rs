@@ -386,7 +386,9 @@ fn serialize_footnote_shape(fs: &FootnoteShape) -> Vec<u8> {
     w.write_u16(fs.prefix_char as u16).unwrap();
     w.write_u16(fs.suffix_char as u16).unwrap();
     w.write_u16(fs.start_number).unwrap();
-    w.write_i16(fs.separator_length).unwrap();
+    // HWP5 노트 구분선 길이는 i16 슬롯. 한컴 전폭 sentinel(14692344)은 i16을 넘지만
+    // HWP5 포맷 한계상 하위 16비트로 기록한다(HWPX 경로는 i32 원본을 보존).
+    w.write_i16(fs.separator_length as i16).unwrap();
     w.write_i16(fs.separator_margin_top).unwrap();
     w.write_i16(fs.separator_margin_bottom).unwrap();
     w.write_i16(fs.note_spacing).unwrap();
@@ -469,15 +471,21 @@ fn serialize_column_def(cd: &ColumnDef, level: u16, records: &mut Vec<Record>) {
 fn serialize_table(table: &Table, level: u16, records: &mut Vec<Record>) {
     // CTRL_HEADER: raw_ctrl_data는 CommonObjAttr 전체 (attr 포함)
     // Task 271에서 파싱 변경: ctrl_data 전체 = CommonObjAttr
-    records.push(make_ctrl_record(
-        tags::CTRL_TABLE,
-        level,
-        if !table.raw_ctrl_data.is_empty() {
-            &table.raw_ctrl_data
-        } else {
-            &[]
-        },
-    ));
+    //
+    // [#1916] raw_ctrl_data 부재 시(HWPX 파스 IR·편집기 신설 표 등) 종전에는
+    // 빈 데이터를 방출해 재파스 CommonObjAttr 전체(treat_as_char/wrap/
+    // flowWithText 등)가 기본값으로 붕괴했다. 다른 GSO 컨트롤과 동일하게
+    // IR 의 common 으로 합성한다 (attr=0 이면 pack_common_attr_bits 경유 —
+    // flow_with_text bit 13 포함). HWP5 파스본(raw 보존)·어댑터 경로(Stage 2
+    // 합성)는 raw_ctrl_data 가 채워져 있어 동작 불변.
+    let composed_common;
+    let ctrl_data: &[u8] = if !table.raw_ctrl_data.is_empty() {
+        &table.raw_ctrl_data
+    } else {
+        composed_common = serialize_common_obj_attr(&table.common);
+        &composed_common
+    };
+    records.push(make_ctrl_record(tags::CTRL_TABLE, level, ctrl_data));
 
     // 캡션 (TABLE 이전, level+1)
     if let Some(ref caption) = table.caption {
@@ -535,6 +543,19 @@ fn serialize_table_record(table: &Table) -> Vec<u8> {
 
     w.write_u16(table.border_fill_id).unwrap();
 
+    // 영역 속성: UINT16 nZones + TableZone[nZones].
+    //
+    // `셀 테두리/배경 - 하나의 셀처럼 적용`은 개별 셀이 아니라 TABLE cellzone
+    // overlay로 저장되어야 한컴에서 선택 영역 전체 대각선으로 표시된다.
+    w.write_u16(table.zones.len() as u16).unwrap();
+    for zone in &table.zones {
+        w.write_u16(zone.start_row).unwrap();
+        w.write_u16(zone.start_col).unwrap();
+        w.write_u16(zone.end_row).unwrap();
+        w.write_u16(zone.end_col).unwrap();
+        w.write_u16(zone.border_fill_id).unwrap();
+    }
+
     // 원본 추가 바이트 복원 (라운드트립용)
     if !table.raw_table_record_extra.is_empty() {
         w.write_bytes(&table.raw_table_record_extra).unwrap();
@@ -558,7 +579,12 @@ fn serialize_cell(cell: &Cell, level: u16, records: &mut Vec<Record>) {
     };
     let list_attr: u32 = ((cell.text_direction as u32) << 16) | (v_align_code << 21);
     w.write_u32(list_attr).unwrap();
-    w.write_u16(cell.list_header_width_ref).unwrap();
+    let list_header_width_ref = if cell.list_header_width_ref == 0 {
+        0x0400
+    } else {
+        cell.list_header_width_ref
+    };
+    w.write_u16(list_header_width_ref).unwrap();
 
     // 셀 속성
     w.write_u16(cell.col).unwrap();
@@ -573,9 +599,15 @@ fn serialize_cell(cell: &Cell, level: u16, records: &mut Vec<Record>) {
     w.write_i16(cell.padding.bottom).unwrap();
     w.write_u16(cell.border_fill_id).unwrap();
 
-    // 원본 추가 바이트 복원 (라운드트립용)
-    if !cell.raw_list_extra.is_empty() {
+    // 원본 추가 바이트 복원. HWPX/신규 생성 셀에는 원본이 없으므로
+    // 한컴 저장본의 셀 LIST_HEADER 47바이트 contract에 맞춰 폭 참조를 보강한다.
+    // [#1808] 모델의 field_name 과 raw_list_extra 인코딩이 일치하면 원본 보존,
+    // 불일치(HWPX 출처 셀 필드, 편집기 변경)면 한컴 계약대로 재구성한다.
+    let raw_field = crate::parser::control::parse_cell_field_name(&cell.raw_list_extra);
+    if !cell.raw_list_extra.is_empty() && raw_field.as_deref() == cell.field_name.as_deref() {
         w.write_bytes(&cell.raw_list_extra).unwrap();
+    } else {
+        w.write_bytes(&build_cell_list_extra(cell)).unwrap();
     }
 
     records.push(Record {
@@ -587,6 +619,48 @@ fn serialize_cell(cell: &Cell, level: u16, records: &mut Vec<Record>) {
 
     // 셀 내부 문단 (원본 HWP에서는 LIST_HEADER와 같은 레벨)
     serialize_paragraph_list(&cell.paragraphs, level, records);
+}
+
+/// [#1808] 셀 LIST_HEADER 추가 바이트(34바이트 이후) 재구성 — 한컴 계약.
+///
+/// 필드 없는 셀: width(4) + 0×9 = 13바이트.
+/// 필드 셀 (한컴 원본 admrul_0039/0045 대조로 확정한 레이아웃):
+///   [0..4]   width (u32 LE)
+///   [4..8]   ff 1b 02 01 (필드 속성 마커)
+///   [8..12]  00 ×4
+///   [12..15] 40 01 00
+///   [15..17] name_len (u16 LE)
+///   [17..]   UTF-16LE 필드 이름
+///   [+8]     00 ×8
+/// 파서 대칭: parser::control::parse_cell_field_name (offset 15/17).
+fn build_cell_list_extra(cell: &Cell) -> Vec<u8> {
+    // 원본 extra 가 있으면 선두 4바이트(폭 참조 계약값)를 보존한다.
+    let width_bytes: [u8; 4] = if cell.raw_list_extra.len() >= 4 {
+        cell.raw_list_extra[0..4].try_into().unwrap()
+    } else {
+        cell.width.to_le_bytes()
+    };
+    match cell.field_name.as_deref() {
+        Some(name) if !name.is_empty() => {
+            let utf16: Vec<u16> = name.encode_utf16().collect();
+            let mut v = Vec::with_capacity(25 + utf16.len() * 2);
+            v.extend_from_slice(&width_bytes);
+            v.extend_from_slice(&[0xff, 0x1b, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00]);
+            v.extend_from_slice(&[0x40, 0x01, 0x00]);
+            v.extend_from_slice(&(utf16.len() as u16).to_le_bytes());
+            for cu in &utf16 {
+                v.extend_from_slice(&cu.to_le_bytes());
+            }
+            v.extend_from_slice(&[0u8; 8]);
+            v
+        }
+        _ => {
+            let mut v = Vec::with_capacity(13);
+            v.extend_from_slice(&width_bytes);
+            v.extend_from_slice(&[0u8; 9]);
+            v
+        }
+    }
 }
 
 fn serialize_caption(caption: &Caption, level: u16, records: &mut Vec<Record>) {
@@ -1003,8 +1077,15 @@ fn serialize_picture_data(pic: &Picture) -> Vec<u8> {
         w.write_u32(pic.instance_id).unwrap();
         w.write_u32(0).unwrap(); // image_effect_extra
                                  // 원본 이미지 크기(HWPUNIT) + 플래그(1): 한컴 호환 추가 9바이트
-        w.write_u32(pic.crop.right as u32).unwrap(); // original width in HWPUNIT
-        w.write_u32(pic.crop.bottom as u32).unwrap(); // original height in HWPUNIT
+                                 // [#1929] IR img_dim(HWPX hp:imgDim 대응)이 있으면 우선 기록 —
+                                 // 종전 crop 폴백만으로는 HWPX→HWP5 왕복에서 imgDim 소실.
+        let (dim_w, dim_h) = if pic.img_dim != (0, 0) {
+            pic.img_dim
+        } else {
+            (pic.crop.right as u32, pic.crop.bottom as u32)
+        };
+        w.write_u32(dim_w).unwrap(); // original width
+        w.write_u32(dim_h).unwrap(); // original height
         w.write_u8(pic.image_attr.transparency_alpha_byte())
             .unwrap();
     }
@@ -1331,43 +1412,12 @@ fn serialize_shape_control(
             ));
             emit_top_level_synthesized_ctrl_data(records);
             // 그룹 컨테이너: SHAPE_COMPONENT + 자식 수 + 자식 ctrl_id 목록 (한컴 호환)
-            {
-                let mut data = serialize_shape_component(0x24636f6e, &group.shape_attr, true); // '$con'
-                                                                                               // 자식 수 (u16)
-                let mut w = ByteWriter::new();
-                w.write_u16(group.children.len() as u16).unwrap();
-                // 각 자식의 ctrl_id (u32)
-                for child in &group.children {
-                    let child_ctrl_id = match child {
-                        ShapeObject::Line(_) => tags::SHAPE_LINE_ID,
-                        ShapeObject::Rectangle(_) => tags::SHAPE_RECT_ID,
-                        ShapeObject::Ellipse(_) => tags::SHAPE_ELLIPSE_ID,
-                        ShapeObject::Arc(_) => tags::SHAPE_ARC_ID,
-                        ShapeObject::Polygon(_) => tags::SHAPE_POLYGON_ID,
-                        ShapeObject::Curve(_) => tags::SHAPE_CURVE_ID,
-                        ShapeObject::Group(_) => tags::CTRL_GEN_SHAPE,
-                        ShapeObject::Picture(_) => tags::SHAPE_PICTURE_ID,
-                        ShapeObject::Chart(c) => c.drawing.shape_attr.ctrl_id,
-                        ShapeObject::Ole(o) => {
-                            if o.drawing.shape_attr.ctrl_id != 0 {
-                                o.drawing.shape_attr.ctrl_id
-                            } else {
-                                tags::SHAPE_OLE_ID
-                            }
-                        }
-                    };
-                    w.write_u32(child_ctrl_id).unwrap();
-                }
-                // instance_id (한컴 호환)
-                w.write_u32(group.common.instance_id).unwrap();
-                data.extend_from_slice(&w.into_bytes());
-                records.push(Record {
-                    tag_id: tags::HWPTAG_SHAPE_COMPONENT,
-                    level: level + 1,
-                    size: 0,
-                    data,
-                });
-            }
+            records.push(Record {
+                tag_id: tags::HWPTAG_SHAPE_COMPONENT,
+                level: level + 1,
+                size: 0,
+                data: group_container_component_data(group, true),
+            });
             emit_ctrl_data(records);
             // 자식 개체 직렬화 (CTRL_HEADER 없이 SHAPE_COMPONENT + 도형별 태그)
             let child_comp_level = level + 2;
@@ -1425,6 +1475,44 @@ fn serialize_shape_control(
             });
         }
     }
+}
+
+/// 그룹('$con') SHAPE_COMPONENT 데이터: 공통 component + 자식 수(u16) +
+/// 자식 ctrl_id 목록(u32[]) + instance_id (한컴 호환). 최상위/중첩 그룹 공용.
+fn group_container_component_data(
+    group: &crate::model::shape::GroupShape,
+    top_level: bool,
+) -> Vec<u8> {
+    use crate::parser::tags;
+
+    let mut data =
+        serialize_shape_component(tags::SHAPE_CONTAINER_ID, &group.shape_attr, top_level); // '$con'
+    let mut w = ByteWriter::new();
+    w.write_u16(group.children.len() as u16).unwrap();
+    for child in &group.children {
+        let child_ctrl_id = match child {
+            ShapeObject::Line(_) => tags::SHAPE_LINE_ID,
+            ShapeObject::Rectangle(_) => tags::SHAPE_RECT_ID,
+            ShapeObject::Ellipse(_) => tags::SHAPE_ELLIPSE_ID,
+            ShapeObject::Arc(_) => tags::SHAPE_ARC_ID,
+            ShapeObject::Polygon(_) => tags::SHAPE_POLYGON_ID,
+            ShapeObject::Curve(_) => tags::SHAPE_CURVE_ID,
+            ShapeObject::Group(_) => tags::CTRL_GEN_SHAPE,
+            ShapeObject::Picture(_) => tags::SHAPE_PICTURE_ID,
+            ShapeObject::Chart(c) => c.drawing.shape_attr.ctrl_id,
+            ShapeObject::Ole(o) => {
+                if o.drawing.shape_attr.ctrl_id != 0 {
+                    o.drawing.shape_attr.ctrl_id
+                } else {
+                    tags::SHAPE_OLE_ID
+                }
+            }
+        };
+        w.write_u32(child_ctrl_id).unwrap();
+    }
+    w.write_u32(group.common.instance_id).unwrap();
+    data.extend_from_slice(&w.into_bytes());
+    data
 }
 
 /// 그룹 자식 개체 직렬화 (CTRL_HEADER 없이 SHAPE_COMPONENT + 도형별 태그)
@@ -1618,12 +1706,15 @@ fn serialize_group_child(
             });
         }
         ShapeObject::Group(group) => {
-            // 중첩 그룹
+            // [Task #1771] 중첩 그룹: 파서(parse_container_children)·한컴 계약은
+            // "자식 경계 = SHAPE_COMPONENT @ child_level ('$con') + 손자들이 더 깊은
+            // level" 이다. 기존 CONTAINER(0x56) 단독 방출은 경계로 인식되지 않아
+            // 재파스 시 하위 전체가 소실됐다 (3067999: children 710→12).
             records.push(Record {
-                tag_id: tags::HWPTAG_SHAPE_COMPONENT_CONTAINER,
+                tag_id: tags::HWPTAG_SHAPE_COMPONENT,
                 level: comp_level,
                 size: 0,
-                data: serialize_shape_component(tags::CTRL_GEN_SHAPE, &group.shape_attr, false),
+                data: group_container_component_data(group, false),
             });
             for nested_child in &group.children {
                 serialize_group_child(nested_child, comp_level + 1, comp_level + 2, records);
@@ -1930,15 +2021,21 @@ fn write_shape_component_base(
         let is_group_child = attr.group_level > 0;
         let cnt: u16 = if is_group_child { 2 } else { 1 };
         w.write_u16(cnt).unwrap();
-        // translation matrix [1, 0, tx, 0, 1, ty]
+        // translation matrix = identity [1, 0, 0, 0, 1, 0].
+        // 그룹 자식 위치의 단일 권위는 render_tx/ty 다 (렌더러 layout_group_child_*,
+        // object_ops 그룹 생성 모두 render_tx 기준). 위치를 의도한 작성자는 항상
+        // render_tx 를 명시하므로(그 경우 explicit 경로로 감), 이 폴백에 오는
+        // offset_x/y 는 위치가 아닌 메타데이터다(HWP3 relative_pos 등). 종전처럼
+        // offset 을 tx/ty 로 승격하면 재파스에서 render_tx 가 생겨 그룹 자식이
+        // offset 만큼 이동한다 (#1892 대법원 서식 최대 10485px 라운드트립 변위).
         w.write_f64(1.0).unwrap();
         w.write_f64(0.0).unwrap();
-        w.write_f64(attr.offset_x as f64).unwrap(); // tx (그룹 자식: 로컬 offset)
+        w.write_f64(0.0).unwrap(); // tx
         w.write_f64(0.0).unwrap();
         w.write_f64(1.0).unwrap();
-        w.write_f64(attr.offset_y as f64).unwrap(); // ty
-                                                    // scale matrix = identity [1, 0, 0, 0, 1, 0]
-                                                    // (스케일은 current_width/original_width 값으로 표현 — 행렬에 중복 기록하면 이중 적용됨)
+        w.write_f64(0.0).unwrap(); // ty
+                                   // scale matrix = identity [1, 0, 0, 0, 1, 0]
+                                   // (스케일은 current_width/original_width 값으로 표현 — 행렬에 중복 기록하면 이중 적용됨)
         w.write_f64(1.0).unwrap();
         w.write_f64(0.0).unwrap();
         w.write_f64(0.0).unwrap();
@@ -2146,6 +2243,7 @@ fn serialize_shape_fill(w: &mut ByteWriter, fill: &Fill) {
                 ImageFillMode::TileHorzBottom => 2,
                 ImageFillMode::TileVertLeft => 3,
                 ImageFillMode::TileVertRight => 4,
+                ImageFillMode::Total => 0,
                 ImageFillMode::FitToSize => 5,
                 ImageFillMode::Center => 6,
                 ImageFillMode::CenterTop => 7,

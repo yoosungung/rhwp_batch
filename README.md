@@ -6,7 +6,7 @@
 > 1. **변환**: HWP/HWPX → JSON (텍스트·표·이미지 포함)
 > 2. **생성**: 양식(template) HWP + JSON → 채워진 HWP (배치 모드 1급 시민)
 
-> ⚠️ **v0.7.17** — upstream [`rhwp` v0.7.17](https://github.com/edwardkim/rhwp/releases/tag/v0.7.17) 추적.
+> ⚠️ **v0.7.18** — upstream [`rhwp` v0.7.18](https://github.com/edwardkim/rhwp/releases/tag/v0.7.18) 추적.
 > Linux·macOS 바이너리는 [GitHub Releases](https://github.com/yoosungung/rhwp_batch/releases)에서 받을 수 있다.
 > 진척 상황은 [ROADMAP.md](ROADMAP.md), 기술 설계는 [DESIGN.md](DESIGN.md),
 > 기여자 작업 규칙은 [CLAUDE.md](CLAUDE.md) 참조.
@@ -37,19 +37,19 @@
 
 ### 바이너리 (GitHub Releases)
 
-[`v0.7.17` 릴리즈](https://github.com/yoosungung/rhwp_batch/releases/tag/v0.7.17)에서 플랫폼에 맞는 tarball을 받는다.
+[`v0.7.18` 릴리즈](https://github.com/yoosungung/rhwp_batch/releases/tag/v0.7.18)에서 플랫폼에 맞는 tarball을 받는다.
 
 | 파일 | 대상 |
 |------|------|
-| `rhwp-batch-v0.7.17-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 (glibc) |
-| `rhwp-batch-v0.7.17-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
+| `rhwp-batch-v0.7.18-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 (glibc) |
+| `rhwp-batch-v0.7.18-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
 
 ```bash
 # 예: Linux
-curl -LO https://github.com/yoosungung/rhwp_batch/releases/download/v0.7.17/rhwp-batch-v0.7.17-x86_64-unknown-linux-gnu.tar.gz
-curl -LO https://github.com/yoosungung/rhwp_batch/releases/download/v0.7.17/rhwp-batch-v0.7.17-x86_64-unknown-linux-gnu.tar.gz.sha256
-shasum -a 256 -c rhwp-batch-v0.7.17-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf rhwp-batch-v0.7.17-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/yoosungung/rhwp_batch/releases/download/v0.7.18/rhwp-batch-v0.7.18-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/yoosungung/rhwp_batch/releases/download/v0.7.18/rhwp-batch-v0.7.18-x86_64-unknown-linux-gnu.tar.gz.sha256
+shasum -a 256 -c rhwp-batch-v0.7.18-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf rhwp-batch-v0.7.18-x86_64-unknown-linux-gnu.tar.gz
 ./rhwp-batch --version
 ```
 
@@ -103,7 +103,7 @@ rhwp-batch --version
 ### 컨테이너 이미지 (운영 권장)
 
 ```bash
-docker pull registry.local/rhwp-batch:0.7.17
+docker pull registry.local/rhwp-batch:0.7.18
 ```
 
 직접 이미지를 빌드할 때 (먼저 Linux 릴리즈 바이너리를 `dist/`에 둔다):
