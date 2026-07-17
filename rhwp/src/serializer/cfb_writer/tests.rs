@@ -134,6 +134,9 @@ fn test_full_roundtrip_uncompressed() {
         raw_data: None,
         name: "함초롬바탕".to_string(),
         alt_type: 0,
+        is_embedded: false,
+        bin_item_id_ref: String::new(),
+        resolved_bin_data_id: None,
         alt_name: None,
         type_info: None,
         default_name: None,
@@ -1676,7 +1679,7 @@ fn test_ole_storage_size_prefix_restored() {
         preview: None,
         bin_data_content: vec![BinDataContent {
             id: 1,
-            data: ole_cfb.clone(),
+            data: ole_cfb.clone().into(),
             extension: "OLE".to_string(),
         }],
         extra_streams: Vec::new(),
@@ -1762,7 +1765,7 @@ fn test_compressed_ole_storage_payload_is_deflated() {
         preview: None,
         bin_data_content: vec![BinDataContent {
             id: 1,
-            data: ole_cfb.clone(),
+            data: ole_cfb.clone().into(),
             extension: "OLE".to_string(),
         }],
         extra_streams: Vec::new(),

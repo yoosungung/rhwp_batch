@@ -638,7 +638,23 @@ impl DocumentCore {
                 new_chars,
             );
 
+            // [Task #2299] 리셋 판별용 — reflow 이전 저장 흐름 end 캡처.
+            let stored_end_for_reset = crate::renderer::composer::paragraph_flow_end(
+                &self.document.sections[section_idx].paragraphs[para_idx],
+            );
             self.reflow_paragraph(section_idx, para_idx);
+            // [Task #2299] 붙여넣기로 문단 높이가 변했으므로 하류 vpos 를 재연결한다.
+            // 생략하면 후속 문단 first < 커진 end 세임이 저장돼 이후 편집의 리셋
+            // 보존이 이를 단/쪽 경계로 오인한다.
+            crate::renderer::composer::recalculate_section_vpos(
+                &mut self.document.sections[section_idx].paragraphs,
+                para_idx,
+                None,
+                stored_end_for_reset,
+                &self.styles,
+                self.dpi,
+                self.document.is_hwp3_variant,
+            );
             self.recompose_paragraph(section_idx, para_idx);
             self.paginate_if_needed();
 
@@ -688,6 +704,19 @@ impl DocumentCore {
         for i in para_idx..=last_para_idx {
             self.reflow_paragraph(section_idx, i);
         }
+
+        // [Task #2299] 삽입 문단들의 vpos 를 흐름에 연결한다. 클립보드 클론의
+        // 원본 좌표/placeholder 를 방치하면 이후 편집의 vpos 재계산이 이를 저장
+        // 단/쪽 리셋으로 오인해 영구 고착시킨다 — 신규 구간은 리셋 보존에서 제외.
+        crate::renderer::composer::recalculate_section_vpos(
+            &mut self.document.sections[section_idx].paragraphs,
+            para_idx,
+            Some(para_idx + 1..last_para_idx + 1),
+            None,
+            &self.styles,
+            self.dpi,
+            self.document.is_hwp3_variant,
+        );
 
         // 6. 선택적 재구성: 삽입된 문단 composed 추가 + 영향 문단 재구성
         self.recompose_paragraph(section_idx, para_idx);
@@ -1036,6 +1065,8 @@ impl DocumentCore {
         let is_empty_para = para.text.is_empty() && para.controls.is_empty();
 
         let insert_para_idx;
+        // [Task #2299] 분할 삽입이면 우측 절반까지 신규 구간에 포함해야 한다.
+        let mut did_split_for_control = false;
         if is_empty_para && char_offset == 0 {
             self.document.sections[section_idx].paragraphs[para_idx] = clip_para;
             insert_para_idx = para_idx;
@@ -1046,6 +1077,7 @@ impl DocumentCore {
             insert_para_idx = para_idx;
         } else {
             if char_offset > 0 && !para.text.is_empty() {
+                did_split_for_control = true;
                 let new_para =
                     self.document.sections[section_idx].paragraphs[para_idx].split_at(char_offset);
                 self.document.sections[section_idx]
@@ -1121,6 +1153,27 @@ impl DocumentCore {
         self.document.sections[section_idx]
             .paragraphs
             .insert(insert_para_idx + 1, empty_para);
+
+        // [Task #2299] 신규 문단들(컨트롤 host·이웃 빈 문단·분할 우측)의 placeholder
+        // vpos 를 흐름에 연결한다 — 방치하면 이후 편집의 vpos 재계산이 저장 단/쪽
+        // 리셋으로 오인해 영구 고착시킨다. 분할 좌측은 높이가 바뀌어 reflow 한다.
+        let fresh_end = insert_para_idx + 2 + usize::from(did_split_for_control);
+        if did_split_for_control {
+            // [Task #2299] 리셋 판별용 — reflow 이전 저장 흐름 end 캡처.
+            let stored_end_for_reset = crate::renderer::composer::paragraph_flow_end(
+                &self.document.sections[section_idx].paragraphs[para_idx],
+            );
+            self.reflow_paragraph(section_idx, para_idx);
+        }
+        crate::renderer::composer::recalculate_section_vpos(
+            &mut self.document.sections[section_idx].paragraphs,
+            para_idx,
+            Some(insert_para_idx..fresh_end),
+            None,
+            &self.styles,
+            self.dpi,
+            self.document.is_hwp3_variant,
+        );
 
         // 리플로우 + 페이지네이션
         self.recompose_section(section_idx);
@@ -1569,8 +1622,9 @@ impl DocumentCore {
         };
 
         if let Some(bdc) = image_data {
-            let base64_data = base64::engine::general_purpose::STANDARD.encode(&bdc.data);
-            let mime_type = detect_clipboard_image_mime(&bdc.data);
+            let bytes = bdc.data.load();
+            let base64_data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let mime_type = detect_clipboard_image_mime(&bytes);
 
             // 크기 계산 (HWPUNIT → px)
             let w = crate::renderer::hwpunit_to_px(pic.common.width as i32, self.dpi);
@@ -1625,7 +1679,7 @@ impl DocumentCore {
                 HwpError::RenderError(format!("바이너리 데이터 {} 범위 초과", bin_data_id))
             })?;
 
-        Ok(bdc.data.clone())
+        Ok(bdc.data.load())
     }
 
     /// 컨트롤의 이미지 MIME 타입을 반환한다.
@@ -1667,7 +1721,7 @@ impl DocumentCore {
                 HwpError::RenderError(format!("바이너리 데이터 {} 범위 초과", bin_data_id))
             })?;
 
-        Ok(detect_clipboard_image_mime(&bdc.data).to_string())
+        Ok(detect_clipboard_image_mime(&bdc.data.load()).to_string())
     }
 
     /// BinData ID(1-based)로 이미지 바이너리 데이터를 반환한다.
@@ -1684,7 +1738,7 @@ impl DocumentCore {
             .ok_or_else(|| {
                 HwpError::RenderError(format!("바이너리 데이터 {} 범위 초과", bin_data_id))
             })?;
-        Ok(bdc.data.clone())
+        Ok(bdc.data.load())
     }
 
     /// BinData ID(1-based)로 이미지 MIME 타입을 반환한다.
@@ -1701,7 +1755,7 @@ impl DocumentCore {
             .ok_or_else(|| {
                 HwpError::RenderError(format!("바이너리 데이터 {} 범위 초과", bin_data_id))
             })?;
-        Ok(detect_clipboard_image_mime(&bdc.data).to_string())
+        Ok(detect_clipboard_image_mime(&bdc.data.load()).to_string())
     }
 
     // === 클립보드 HTML 붙여넣기 ===

@@ -31,7 +31,7 @@ use crate::model::style::UnderlineType;
 use crate::paint::replay_order::layer_node_has_replay_plane;
 use crate::paint::{
     paint_op_replay_plane_with_layer, render_layer_replay_plane, ClipKind, GroupKind, LayerNode,
-    LayerNodeKind, PageLayerTree, PaintOp, PaintReplayPlane,
+    LayerNodeKind, PageLayerTree, PaintOp, PaintReplayPlane, RenderProfile,
 };
 
 const TEXT_MARK_CLIP_RIGHT_PAD: f64 = 48.0;
@@ -327,6 +327,7 @@ pub struct WebCanvasRenderer {
     /// `LayerFilter::All` renders the layer tree in logical replay-plane order,
     /// independent of raw tree child order.
     active_replay_plane: Option<PaintReplayPlane>,
+    render_profile: RenderProfile,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -348,6 +349,7 @@ impl WebCanvasRenderer {
             layer_filter: LayerFilter::All,
             transparent_page_background: false,
             active_replay_plane: None,
+            render_profile: RenderProfile::Screen,
         })
     }
 
@@ -1082,6 +1084,56 @@ impl WebCanvasRenderer {
     }
 
     fn render_placeholder(&mut self, bbox: &BoundingBox, ph: &PlaceholderNode) {
+        // [Task #2225] 그림 미지정 placeholder — 한컴 편집기식 표시:
+        // 개체 영역 점선 테두리 + 중앙의 작은 그림-없음 아이콘(사선 그어진
+        // 그림 픽토그램). 편집자 정보 제공용이며 인쇄 등가 profile에서는 미출력한다.
+        if ph.kind == crate::renderer::render_tree::PlaceholderKind::MissingPicture {
+            if !self.render_profile.shows_editor_visuals() {
+                return;
+            }
+            self.set_line_dash(&StrokeDash::Dash);
+            self.ctx.set_stroke_style_str("#999999");
+            self.ctx.set_line_width(1.0);
+            self.ctx
+                .stroke_rect(bbox.x, bbox.y, bbox.width, bbox.height);
+            let _ = self.ctx.set_line_dash(&js_sys::Array::new());
+
+            // 중앙 아이콘: 작은 실선 박스 + 산/해 픽토그램 + 사선
+            let icon = (bbox.width.min(bbox.height) * 0.4).clamp(14.0, 36.0);
+            let ix = bbox.x + (bbox.width - icon) / 2.0;
+            let iy = bbox.y + (bbox.height - icon) / 2.0;
+            self.ctx.set_fill_style_str("#ffffff");
+            self.ctx.fill_rect(ix, iy, icon, icon * 0.75);
+            self.ctx.set_stroke_style_str("#888888");
+            self.ctx.stroke_rect(ix, iy, icon, icon * 0.75);
+            // 산 두 개
+            self.ctx.begin_path();
+            self.ctx.move_to(ix + icon * 0.08, iy + icon * 0.62);
+            self.ctx.line_to(ix + icon * 0.32, iy + icon * 0.30);
+            self.ctx.line_to(ix + icon * 0.52, iy + icon * 0.62);
+            self.ctx.line_to(ix + icon * 0.68, iy + icon * 0.42);
+            self.ctx.line_to(ix + icon * 0.92, iy + icon * 0.62);
+            self.ctx.stroke();
+            // 해
+            self.ctx.begin_path();
+            let _ = self.ctx.arc(
+                ix + icon * 0.72,
+                iy + icon * 0.20,
+                icon * 0.07,
+                0.0,
+                std::f64::consts::TAU,
+            );
+            self.ctx.stroke();
+            // 사선 (그림 없음)
+            self.ctx.set_stroke_style_str("#cc4444");
+            self.ctx.set_line_width(1.5);
+            self.ctx.begin_path();
+            self.ctx.move_to(ix, iy + icon * 0.75);
+            self.ctx.line_to(ix + icon, iy);
+            self.ctx.stroke();
+            self.ctx.set_line_width(1.0);
+            return;
+        }
         self.ctx.set_fill_style_str(&color_to_css(ph.fill_color));
         self.ctx.fill_rect(bbox.x, bbox.y, bbox.width, bbox.height);
         self.set_line_dash(&StrokeDash::Dash);
@@ -2035,6 +2087,7 @@ impl WebCanvasRenderer {
 #[cfg(target_arch = "wasm32")]
 impl LayerRenderer for WebCanvasRenderer {
     fn render_page(&mut self, tree: &PageLayerTree) -> LayerRenderResult<()> {
+        self.render_profile = tree.profile;
         self.render_layer_tree(tree);
         Ok(())
     }

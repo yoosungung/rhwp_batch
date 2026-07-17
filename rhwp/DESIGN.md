@@ -23,11 +23,11 @@
 
 | 항목 | 내용 |
 |------|------|
-| 언어 | Rust 2021 (`rhwp` v0.7.18) |
+| 언어 | Rust 2021 (`rhwp` v0.7.19) |
 | 빌드 산출물 | `cdylib` + `rlib` (네이티브 lib + WASM lib) + `rhwp` CLI |
 | 핵심 의존성 | `cfb` (OLE), `flate2`, `zip`, `quick-xml`, `encoding_rs`, `image`, `wasm-bindgen` |
 | 네이티브 전용 | `svg2pdf`, `usvg`, `pdf-writer`, `subsetter`, `ttf-parser` |
-| **serde / serde_json** | **미포함** (어떤 IR도 JSON 직렬화 불가 — rhwp-batch에서 DTO 레이어로 해결) |
+| **serde / serde_json** | **포함** (v0.7.19 기준; IR JSON 스키마는 여전히 rhwp-batch DTO가 담당) |
 | HTTP 프레임워크 | 없음 — rhwp-batch CLI가 잡 러너에 의해 직접 실행됨 |
 
 이 crate는 본질적으로 **HWP 포맷 처리 라이브러리 + 웹/데스크톱 뷰어/에디터**다.

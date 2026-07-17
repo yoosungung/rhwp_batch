@@ -7,7 +7,10 @@ use crate::model::control::Control;
 use crate::model::document::{Document, Section};
 use crate::model::page::ColumnDef;
 use crate::model::paragraph::{ColumnBreakType, Paragraph};
-use crate::paint::{LayerBuilder, LayerOutputOptions, PageLayerTree, RenderProfile};
+use crate::paint::{
+    resolve_embedded_font_face_index, EmbeddedFontFace, LayerBuilder, LayerOutputOptions,
+    PageLayerTree, RenderProfile,
+};
 use crate::renderer::canvas::CanvasRenderer;
 use crate::renderer::composer::{compose_paragraph, compose_section, ComposedParagraph};
 use crate::renderer::height_measurer::{HeightMeasurer, MeasuredSection, MeasuredTable};
@@ -447,7 +450,14 @@ impl DocumentCore {
 
     /// 페이지 레이어 트리를 생성하여 반환한다 (native bridge / backend replay용).
     pub fn build_page_layer_tree(&self, page_num: u32) -> Result<PageLayerTree, HwpError> {
-        let tree = self.build_page_tree_cached(page_num)?;
+        self.build_page_layer_tree_with_profile(page_num, RenderProfile::Screen)
+    }
+
+    pub fn build_page_layer_tree_with_profile(
+        &self,
+        page_num: u32,
+        profile: RenderProfile,
+    ) -> Result<PageLayerTree, HwpError> {
         let _overflows = self.layout_engine.take_overflows();
         let output_options = LayerOutputOptions {
             show_paragraph_marks: self.show_paragraph_marks,
@@ -456,17 +466,143 @@ impl DocumentCore {
             clip_enabled: self.clip_enabled,
             debug_overlay: self.debug_overlay,
         };
-        let mut builder =
-            LayerBuilder::new(RenderProfile::Screen).with_output_options(output_options);
-        Ok(builder.build(&tree))
+        self.with_page_tree_cached(page_num, |tree| {
+            let mut used_font_slots = Vec::new();
+            let mut nodes = vec![&tree.root];
+            while let Some(node) = nodes.pop() {
+                if !node.visible {
+                    continue;
+                }
+                nodes.extend(node.children.iter());
+                let crate::renderer::render_tree::RenderNodeType::TextRun(run) = &node.node_type
+                else {
+                    continue;
+                };
+                let mut characters = run.text.chars();
+                let (Some(character), None, Some(char_shape_id)) =
+                    (characters.next(), characters.next(), run.char_shape_id)
+                else {
+                    continue;
+                };
+                let language_index =
+                    crate::renderer::style_resolver::detect_lang_category(character);
+                let slot = (char_shape_id, language_index);
+                if !used_font_slots.contains(&slot) {
+                    used_font_slots.push(slot);
+                }
+            }
+
+            let load_font_bytes = |id: u16| {
+                self.document
+                    .bin_data_content
+                    .iter()
+                    .find(|content| content.id == id)
+                    .map(|content| content.data.load())
+                    .unwrap_or_default()
+            };
+            let mut font_bytes_by_id = std::collections::HashMap::<u16, Vec<u8>>::new();
+            let mut resolved_fonts = Vec::new();
+            for (char_shape_id, language_index) in used_font_slots {
+                let Some(font_id) = self
+                    .document
+                    .doc_info
+                    .char_shapes
+                    .get(char_shape_id as usize)
+                    .and_then(|shape| shape.font_ids.get(language_index))
+                    .copied()
+                else {
+                    continue;
+                };
+                let Some(font) = self
+                    .document
+                    .doc_info
+                    .font_faces
+                    .get(language_index)
+                    .and_then(|fonts| fonts.get(font_id as usize))
+                else {
+                    continue;
+                };
+
+                let mut resolved = None;
+                if font.is_embedded {
+                    if let Some(bin_data_id) = font.resolved_bin_data_id {
+                        let bytes = font_bytes_by_id
+                            .entry(bin_data_id)
+                            .or_insert_with(|| load_font_bytes(bin_data_id));
+                        if !bytes.is_empty() {
+                            resolved = resolve_embedded_font_face_index(bytes, &font.name, None)
+                                .map(|face_index| (bin_data_id, None, face_index));
+                        }
+                    }
+                }
+                if resolved.is_none() {
+                    if let Some(substitute) = font
+                        .subst_font
+                        .as_ref()
+                        .filter(|substitute| substitute.is_embedded)
+                    {
+                        if let Some(bin_data_id) = substitute.resolved_bin_data_id {
+                            let bytes = font_bytes_by_id
+                                .entry(bin_data_id)
+                                .or_insert_with(|| load_font_bytes(bin_data_id));
+                            if !bytes.is_empty() {
+                                resolved = resolve_embedded_font_face_index(
+                                    bytes,
+                                    substitute.face.as_str(),
+                                    None,
+                                )
+                                .map(|face_index| {
+                                    (bin_data_id, Some(substitute.face.as_str()), face_index)
+                                });
+                            }
+                        }
+                    }
+                }
+                if let Some((bin_data_id, alternate_family, face_index)) = resolved {
+                    resolved_fonts.push((
+                        char_shape_id,
+                        language_index,
+                        font.name.as_str(),
+                        alternate_family,
+                        bin_data_id,
+                        face_index,
+                    ));
+                }
+            }
+            let embedded_fonts = resolved_fonts
+                .iter()
+                .filter_map(
+                    |&(
+                        char_shape_id,
+                        language_index,
+                        family,
+                        alternate_family,
+                        bin_data_id,
+                        face_index,
+                    )| {
+                        Some(EmbeddedFontFace {
+                            char_shape_id,
+                            language_index,
+                            family,
+                            alternate_family,
+                            bytes: font_bytes_by_id.get(&bin_data_id)?.as_slice(),
+                            face_index,
+                        })
+                    },
+                )
+                .collect::<Vec<_>>();
+            let mut builder = LayerBuilder::new(profile).with_output_options(output_options);
+            Ok(builder.build_with_embedded_fonts(tree, &embedded_fonts))
+        })
     }
 
     /// 바이너리 데이터를 0-based `bin_data_content` 인덱스로 반환한다.
-    pub fn get_bin_data(&self, index: usize) -> Option<&[u8]> {
+    /// [Task #2263] 지연 로딩 도입으로 바이트를 빌려줄 수 없어 소유값을 반환한다.
+    pub fn get_bin_data(&self, index: usize) -> Option<Vec<u8>> {
         self.document
             .bin_data_content
             .get(index)
-            .map(|b| b.data.as_slice())
+            .map(|b| b.data.load())
     }
 
     pub fn render_page_svg_native(&self, page_num: u32) -> Result<String, HwpError> {
@@ -491,7 +627,15 @@ impl DocumentCore {
     }
 
     pub fn render_page_svg_layer_native(&self, page_num: u32) -> Result<String, HwpError> {
-        let layer_tree = self.build_page_layer_tree(page_num)?;
+        self.render_page_svg_layer_with_profile_native(page_num, RenderProfile::Screen)
+    }
+
+    pub fn render_page_svg_layer_with_profile_native(
+        &self,
+        page_num: u32,
+        profile: RenderProfile,
+    ) -> Result<String, HwpError> {
+        let layer_tree = self.build_page_layer_tree_with_profile(page_num, profile)?;
         let mut renderer = SvgLayerRenderer::new();
         renderer.inner_mut().show_paragraph_marks = self.show_paragraph_marks;
         renderer.inner_mut().show_control_codes = self.show_control_codes;
@@ -536,6 +680,28 @@ impl DocumentCore {
         let mut svg_pages = Vec::with_capacity(page_nums.len());
         for &page_num in page_nums {
             svg_pages.push(self.render_page_svg_native(page_num)?);
+        }
+        crate::renderer::pdf::svgs_to_pdf_with_options(&svg_pages, options)
+            .map_err(HwpError::RenderError)
+    }
+
+    /// PDF export using the layered SVG compatibility path for an explicit output profile.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn render_pages_pdf_native_with_profile_and_options(
+        &self,
+        page_nums: &[u32],
+        profile: RenderProfile,
+        options: &crate::renderer::pdf::PdfExportOptions,
+    ) -> Result<Vec<u8>, HwpError> {
+        if page_nums.is_empty() {
+            return Err(HwpError::RenderError(
+                "PDF export requires at least one page".to_string(),
+            ));
+        }
+
+        let mut svg_pages = Vec::with_capacity(page_nums.len());
+        for &page_num in page_nums {
+            svg_pages.push(self.render_page_svg_layer_with_profile_native(page_num, profile)?);
         }
         crate::renderer::pdf::svgs_to_pdf_with_options(&svg_pages, options)
             .map_err(HwpError::RenderError)
@@ -623,6 +789,15 @@ impl DocumentCore {
         page_num: u32,
         mode: &str,
     ) -> Result<String, HwpError> {
+        self.get_canvaskit_replay_plan_with_profile_native(page_num, mode, RenderProfile::Screen)
+    }
+
+    pub fn get_canvaskit_replay_plan_with_profile_native(
+        &self,
+        page_num: u32,
+        mode: &str,
+        profile: RenderProfile,
+    ) -> Result<String, HwpError> {
         use crate::renderer::canvaskit_policy::{
             analyze_canvaskit_replay_plan, CanvasKitReplayMode,
         };
@@ -632,7 +807,7 @@ impl DocumentCore {
                 "지원하지 않는 CanvasKit replay mode입니다: {mode}. allowed modes: default, compat"
             ))
         })?;
-        let tree = self.build_page_layer_tree(page_num)?;
+        let tree = self.build_page_layer_tree_with_profile(page_num, profile)?;
         let plan = analyze_canvaskit_replay_plan(&tree, mode);
         serde_json::to_string(&plan).map_err(|error| {
             HwpError::RenderError(format!(
@@ -675,10 +850,24 @@ impl DocumentCore {
         page_num: u32,
         options: &PngExportOptions,
     ) -> Result<Vec<u8>, HwpError> {
+        self.render_page_png_native_with_profile_and_export_options(
+            page_num,
+            RenderProfile::Screen,
+            options,
+        )
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+    pub fn render_page_png_native_with_profile_and_export_options(
+        &self,
+        page_num: u32,
+        profile: RenderProfile,
+        options: &PngExportOptions,
+    ) -> Result<Vec<u8>, HwpError> {
         use crate::renderer::layer_renderer::{LayerRasterRenderer, RasterRenderOptions};
         use crate::renderer::skia::SkiaLayerRenderer;
 
-        let layer_tree = self.build_page_layer_tree(page_num)?;
+        let layer_tree = self.build_page_layer_tree_with_profile(page_num, profile)?;
 
         // 페이지 크기에서 effective scale + max_dimension 결정
         let mut raster_options = RasterRenderOptions::default();
@@ -887,7 +1076,58 @@ impl VlmTarget {
 
 impl DocumentCore {
     pub fn get_page_layer_tree_native(&self, page_num: u32) -> Result<String, HwpError> {
-        Ok(self.build_page_layer_tree(page_num)?.to_json())
+        self.get_page_layer_tree_with_profile_native(page_num, RenderProfile::Screen)
+    }
+
+    pub fn get_page_layer_tree_with_profile_native(
+        &self,
+        page_num: u32,
+        profile: RenderProfile,
+    ) -> Result<String, HwpError> {
+        // [Task #2222] 직렬화 JSON 캐시 — 트리 캐시(#2227 with_page_tree_cached)가
+        // 있어도 1MB 급 재직렬화가 renderPage 마다 렌더 비용과 맞먹게 반복된다
+        // (주보 p2 실측: 15.2ms/회, JSON 1.05MB). 출력옵션 지문이 다르면 미스.
+        let idx = page_num as usize;
+        let fp = self.layer_output_options_fingerprint(profile);
+        if let Some(variants) = self.layer_tree_json_cache.borrow().get(idx) {
+            if let Some((_, json)) = variants.iter().find(|(f, _)| *f == fp) {
+                return Ok(json.clone());
+            }
+        }
+        let json = self
+            .build_page_layer_tree_with_profile(page_num, profile)?
+            .to_json();
+        {
+            // 토글(투명선/잘림보기 등) 왕복이 매번 미스가 되지 않도록 페이지당
+            // 옵션 변형 4개까지 보관 (초과 시 가장 오래된 변형 제거).
+            let mut cache = self.layer_tree_json_cache.borrow_mut();
+            if cache.len() <= idx {
+                cache.resize_with(idx + 1, Vec::new);
+            }
+            let variants = &mut cache[idx];
+            variants.retain(|(f, _)| *f != fp);
+            if variants.len() >= 4 {
+                variants.remove(0);
+            }
+            variants.push((fp, json.clone()));
+        }
+        Ok(json)
+    }
+
+    /// [Task #2222] 레이어 출력옵션 5종과 profile의 비트 지문 — JSON 캐시 키.
+    fn layer_output_options_fingerprint(&self, profile: RenderProfile) -> u8 {
+        let profile_bits = match profile {
+            RenderProfile::FastPreview => 0,
+            RenderProfile::Screen => 1,
+            RenderProfile::Print => 2,
+            RenderProfile::HighQuality => 3,
+        };
+        u8::from(self.show_paragraph_marks)
+            | (u8::from(self.show_control_codes) << 1)
+            | (u8::from(self.show_transparent_borders) << 2)
+            | (u8::from(self.clip_enabled) << 3)
+            | (u8::from(self.debug_overlay) << 4)
+            | (profile_bits << 5)
     }
 
     /// 페이지 overlay 이미지와 replay-plane summary만 작은 JSON으로 반환한다.
@@ -2078,6 +2318,59 @@ impl DocumentCore {
                         ));
                         return;
                     }
+                    // [Task #2230] 그림 미지정 placeholder(kind="picture") 를
+                    // image 컨트롤로 방출 — findPictureAtClick 가 기존 image
+                    // 로직으로 hit 해 클릭 선택이 성립한다. missing 마커는
+                    // studio 가 더블클릭 시 그림 지정 진입을 분기하는 근거.
+                    // cellIdx/cellParaIdx/cellPath 는 Image 분기와 동일 포맷.
+                    if let Some(control_ref) = placeholder_node
+                        .control_ref
+                        .as_ref()
+                        .filter(|control_ref| control_ref.kind == "picture")
+                    {
+                        let (cell_str, cell_path_str) = match &placeholder_node.cell_context {
+                            Some(ctx) => {
+                                let (cei, cpi, _) = ctx.last_image_indices();
+                                let cell_str = match (cei, cpi) {
+                                    (Some(cei), Some(cpi)) => {
+                                        format!(",\"cellIdx\":{},\"cellParaIdx\":{}", cei, cpi)
+                                    }
+                                    _ => String::new(),
+                                };
+                                let entries: Vec<String> = ctx
+                                    .path
+                                    .iter()
+                                    .map(|e| {
+                                        format!(
+                                            "{{\"controlIndex\":{},\"cellIndex\":{},\"cellParaIndex\":{}}}",
+                                            e.control_index, e.cell_index, e.cell_para_index
+                                        )
+                                    })
+                                    .collect();
+                                let cell_path_str = format!(
+                                    ",\"parentParaIdx\":{},\"cellPath\":[{}]",
+                                    ctx.parent_para_index,
+                                    entries.join(",")
+                                );
+                                (cell_str, cell_path_str)
+                            }
+                            None => (String::new(), String::new()),
+                        };
+                        controls.push(format!(
+                            "{{\"type\":\"image\",\"missing\":true,\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"secIdx\":{},\"paraIdx\":{},\"controlIdx\":{}{}{}{}}}",
+                            node.bbox.x,
+                            node.bbox.y,
+                            node.bbox.width,
+                            node.bbox.height,
+                            control_ref.section_index,
+                            control_ref.para_index,
+                            control_ref.control_index,
+                            cell_str,
+                            cell_path_str,
+                            layer_str
+                        ));
+                        return;
+                    }
                 }
                 RenderNodeType::Group(group_node) => {
                     if let (Some(si), Some(pi), Some(ci)) = (
@@ -3206,7 +3499,28 @@ impl DocumentCore {
                     _ => false,
                 })
             });
-            if matches.is_empty() && !has_cell_stack {
+            // [#2195] 중첩 표 스트레치 대상 검출 — 한글은 내부 표를 부모 셀
+            // 전폭으로 확장 배치한다 (76076 표325 근거설명 셀 오라클 + pad 사다리).
+            // 렌더 전용 사본에서 폭을 확장해 measure/cut/render 전 경로 일원 정합.
+            let has_nested_stretch = section.paragraphs.iter().any(|p| {
+                p.controls.iter().any(|ctrl| match ctrl {
+                    Control::Table(table) => table.cells.iter().any(|cell| {
+                        cell.width < 0x8000_0000
+                            && cell.paragraphs.iter().any(|cp| {
+                                cp.controls.iter().any(|c2| match c2 {
+                                    Control::Table(nested) => {
+                                        !nested.common.treat_as_char
+                                            && nested.common.width > 0
+                                            && (nested.common.width as u64) < cell.width as u64
+                                    }
+                                    _ => false,
+                                })
+                            })
+                    }),
+                    _ => false,
+                })
+            });
+            if matches.is_empty() && !has_cell_stack && !has_nested_stretch {
                 out.push(None);
                 continue;
             }
@@ -3214,6 +3528,11 @@ impl DocumentCore {
             if has_cell_stack {
                 for p in np.iter_mut() {
                     reclassify_cell_floating_stacks(p, min_height_hu);
+                }
+            }
+            if has_nested_stretch {
+                for p in np.iter_mut() {
+                    stretch_nested_tables_to_parent_cell(p);
                 }
             }
             for &i in &matches {
@@ -3262,6 +3581,89 @@ impl DocumentCore {
             out.push(Some((np, nc)));
         }
         self.render_normalized = out;
+    }
+
+    /// [#2214/#2195] deferred 셀 편집 뒤 render 전용 정규화본의 동일 문단을 갱신한다.
+    ///
+    /// `render_normalized`는 pagination 시 원본 문단을 복제하므로 pagination을 지연하는
+    /// 편집에서는 별도 coherence가 필요하다. 상위 문단/소유 표/셀의 주소는 보존하고
+    /// 편집된 내부 문단만 교체해 unrelated cell cache를 유지한다. 새 문단에 포함된
+    /// 비-TAC 중첩 표에는 #2195 stretch를 다시 적용한다.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn refresh_render_normalized_cell_paragraph_after_edit(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        cell_para_idx: usize,
+        source_para: Paragraph,
+        local_contribution_before: bool,
+        local_contribution_after: bool,
+    ) {
+        let Some(Some((paragraphs, _))) = self.render_normalized.get_mut(section_idx) else {
+            return;
+        };
+        let Some(parent_para) = paragraphs.get_mut(parent_para_idx) else {
+            return;
+        };
+        let Some(control) = parent_para.controls.get_mut(control_idx) else {
+            return;
+        };
+
+        match control {
+            Control::Table(table) if cell_idx == 65534 => {
+                let Some(caption) = table.caption.as_mut() else {
+                    return;
+                };
+                let Some(target_para) = caption.paragraphs.get_mut(cell_para_idx) else {
+                    return;
+                };
+                *target_para = source_para;
+            }
+            Control::Table(table) => {
+                {
+                    let Some(cell) = table.cells.get_mut(cell_idx) else {
+                        return;
+                    };
+                    let Some(target_para) = cell.paragraphs.get_mut(cell_para_idx) else {
+                        return;
+                    };
+                    *target_para = source_para;
+                }
+                let cell = &table.cells[cell_idx];
+                self.layout_engine.invalidate_cell_units_after_text_insert(
+                    cell,
+                    table,
+                    local_contribution_before,
+                    local_contribution_after,
+                );
+            }
+            Control::Shape(shape) => {
+                let Some(textbox) = super::super::helpers::get_textbox_from_shape_mut(shape) else {
+                    return;
+                };
+                let Some(target_para) = textbox.paragraphs.get_mut(cell_para_idx) else {
+                    return;
+                };
+                *target_para = source_para;
+            }
+            Control::Picture(picture) => {
+                let Some(caption) = picture.caption.as_mut() else {
+                    return;
+                };
+                let Some(target_para) = caption.paragraphs.get_mut(cell_para_idx) else {
+                    return;
+                };
+                *target_para = source_para;
+            }
+            _ => return,
+        }
+
+        // 교체한 원본 문단 안의 nested table은 아직 저장 폭이므로 정규화본의 나머지와
+        // 동일하게 #2195 비-TAC stretch를 재적용한다. 이미 stretch된 sibling은 폭 비교
+        // 가드로 그대로 유지된다.
+        stretch_nested_tables_to_parent_cell(parent_para);
     }
 
     pub(crate) fn find_page(
@@ -3774,11 +4176,16 @@ impl DocumentCore {
         for i in from..cache.len() {
             cache[i] = None;
         }
+        let mut json_cache = self.layer_tree_json_cache.borrow_mut();
+        for i in from..json_cache.len() {
+            json_cache[i].clear();
+        }
     }
 
     /// 페이지 렌더 트리 캐시 전체 무효화.
     pub(crate) fn invalidate_page_tree_cache(&self) {
         self.page_tree_cache.borrow_mut().clear();
+        self.layer_tree_json_cache.borrow_mut().clear();
         // [Task #1949] IR 이 바뀌는 재조판 경계에서 셀 단위 레이아웃 캐시(포인터 키)도
         // 함께 비워 다른 IR 의 셀 포인터 재사용으로 인한 오재사용을 방지한다.
         self.layout_engine.clear_layout_caches();
@@ -3812,6 +4219,38 @@ impl DocumentCore {
         }
 
         Ok(tree)
+    }
+
+    /// 캐시된 페이지 렌더 트리를 참조로 사용한다.
+    ///
+    /// 레이어 tree 생성은 페이지 tree를 소유할 필요가 없다. Canvas2D의 layer summary와
+    /// 실제 재생은 같은 페이지를 연속 조회하므로, 캐시 히트마다 큰 tree를 복제하지 않는다.
+    pub(crate) fn with_page_tree_cached<T>(
+        &self,
+        page_num: u32,
+        build: impl FnOnce(&PageRenderTree) -> Result<T, HwpError>,
+    ) -> Result<T, HwpError> {
+        let idx = page_num as usize;
+        let cached = self
+            .page_tree_cache
+            .borrow()
+            .get(idx)
+            .is_some_and(Option::is_some);
+
+        if !cached {
+            let tree = self.build_page_tree(page_num)?;
+            let mut cache = self.page_tree_cache.borrow_mut();
+            if cache.len() <= idx {
+                cache.resize_with(idx + 1, || None);
+            }
+            cache[idx] = Some(tree);
+        }
+
+        let cache = self.page_tree_cache.borrow();
+        let tree = cache[idx]
+            .as_ref()
+            .expect("페이지 tree cache는 채운 뒤에 참조해야 한다");
+        build(tree)
     }
 
     /// 페이지 렌더 트리를 빌드한다.
@@ -4631,6 +5070,45 @@ fn format_line_seg_brief(para: Option<&Paragraph>) -> String {
     }
 }
 
+/// [#2195] 중첩 표를 부모 셀 전폭으로 스트레치 (렌더 전용 사본에서만 호출).
+/// 한글은 내부 표의 저장 폭이 부모 셀보다 좁아도 부모 셀 전폭 기준으로 재래핑한다.
+fn stretch_nested_tables_to_parent_cell(p: &mut Paragraph) {
+    for ctrl in p.controls.iter_mut() {
+        if let Control::Table(table) = ctrl {
+            for cell in table.cells.iter_mut() {
+                if cell.width >= 0x8000_0000 {
+                    continue;
+                }
+                let parent_w = cell.width as u64;
+                for cp in cell.paragraphs.iter_mut() {
+                    for c2 in cp.controls.iter_mut() {
+                        if let Control::Table(nested) = c2 {
+                            // [#2195 stage60] TAC(글자처럼) 중첩 표는 인라인 개체 —
+                            // 스트레치 제외. hcar-001 4x1 동의 표 한컴 PDF 590.7px
+                            // = 원폭 유지(#1195 rect 오라클); 스트레치 대상(근거설명
+                            // 계열)은 비-TAC.
+                            if nested.common.treat_as_char {
+                                continue;
+                            }
+                            let nw = nested.common.width as u64;
+                            if nw == 0 || nw >= parent_w {
+                                continue;
+                            }
+                            let scale = parent_w as f64 / nw as f64;
+                            nested.common.width = parent_w as u32;
+                            for nc in nested.cells.iter_mut() {
+                                if nc.width < 0x8000_0000 {
+                                    nc.width = (nc.width as f64 * scale).round() as u32;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4698,6 +5176,148 @@ mod tests {
             }
             other => panic!("root should be Page node, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn normal_page_layer_export_selects_verified_embedded_bitmap_glyph_sidecar() {
+        use crate::model::bin_data::{BinDataBytes, BinDataResolver};
+        use crate::model::document::{Document, Section, SectionDef};
+        use crate::model::page::PageDef;
+        use crate::model::paragraph::{CharShapeRef, LineSeg, Paragraph};
+        use crate::model::style::{CharShape, Font};
+        use crate::renderer::canvaskit_policy::{
+            analyze_canvaskit_replay_plan, CanvasKitReplayMode,
+        };
+
+        #[derive(Debug)]
+        struct UnexpectedFontResolver;
+
+        impl BinDataResolver for UnexpectedFontResolver {
+            fn resolve(&self, key: &str) -> Vec<u8> {
+                panic!("unused embedded font must remain lazy: {key}")
+            }
+        }
+
+        let mut document = Document::default();
+        document.doc_info.font_faces = vec![Vec::new(); 7];
+        document.doc_info.font_faces[0].push(Font {
+            name: "RHWP Bitmap SVG Glyph Smoke".to_string(),
+            alt_type: 1,
+            is_embedded: true,
+            bin_item_id_ref: "font-smoke".to_string(),
+            resolved_bin_data_id: Some(1),
+            ..Default::default()
+        });
+        document.doc_info.font_faces[0].push(Font {
+            name: "Unused embedded font".to_string(),
+            alt_type: 1,
+            is_embedded: true,
+            bin_item_id_ref: "font-unused".to_string(),
+            resolved_bin_data_id: Some(2),
+            ..Default::default()
+        });
+        document.doc_info.char_shapes.push(CharShape {
+            font_ids: [0; 7],
+            ratios: [100; 7],
+            relative_sizes: [100; 7],
+            base_size: 1200,
+            text_color: 0x0000_0000,
+            shade_color: 0x00FF_FFFF,
+            ..Default::default()
+        });
+        document.bin_data_content.push(BinDataContent {
+            id: 1,
+            data: include_bytes!("../../../tests/fixtures/fonts/RHWPBitmapSvgGlyphSmoke.ttf")
+                .to_vec()
+                .into(),
+            extension: "ttf".to_string(),
+        });
+        document.bin_data_content.push(BinDataContent {
+            id: 2,
+            data: BinDataBytes::Lazy {
+                resolver: std::sync::Arc::new(UnexpectedFontResolver),
+                key: "font-unused".to_string(),
+            },
+            extension: "ttf".to_string(),
+        });
+        document.sections.push(Section {
+            section_def: SectionDef {
+                page_def: PageDef {
+                    width: 59_528,
+                    height: 84_188,
+                    margin_left: 8_504,
+                    margin_right: 8_504,
+                    margin_top: 5_668,
+                    margin_bottom: 4_252,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            paragraphs: vec![Paragraph {
+                char_count: 2,
+                text: "\u{E100}".to_string(),
+                char_offsets: vec![0],
+                char_shapes: vec![CharShapeRef {
+                    start_pos: 0,
+                    char_shape_id: 0,
+                }],
+                line_segs: vec![LineSeg {
+                    text_start: 0,
+                    line_height: 1_500,
+                    text_height: 1_200,
+                    baseline_distance: 1_200,
+                    segment_width: 40_000,
+                    ..Default::default()
+                }],
+                has_para_text: true,
+                ..Default::default()
+            }],
+            raw_stream: None,
+        });
+
+        let mut core = DocumentCore::new_empty();
+        core.set_document(document);
+        let tree = core
+            .build_page_layer_tree_with_profile(0, RenderProfile::Screen)
+            .expect("normal page layer export succeeds");
+        let json = tree.to_json();
+        assert!(json.contains("\"type\":\"textRun\""));
+        assert!(json.contains("\"payloadKind\":\"bitmapGlyph\""));
+        assert!(json.contains("\"imageKeys\":[\"img:blake3:"));
+
+        let plan = analyze_canvaskit_replay_plan(&tree, CanvasKitReplayMode::Default);
+        assert_eq!(plan.text_variants.len(), 1);
+        assert_eq!(
+            plan.text_variants[0].selected_variant_kind,
+            Some("glyphOutline")
+        );
+        assert!(!plan.text_variants[0].fallback_required);
+    }
+
+    #[test]
+    fn hwpx_font_native_fixture_reaches_public_layer_export() {
+        use crate::renderer::canvaskit_policy::{
+            analyze_canvaskit_replay_plan, CanvasKitReplayMode,
+        };
+
+        let bytes = include_bytes!("../../../samples/render-p35-font-native-bitmap.hwpx");
+        let mut core = DocumentCore::from_bytes(bytes).expect("font-native HWPX fixture parses");
+        core.paginate();
+
+        let tree = core
+            .build_page_layer_tree_with_profile(0, RenderProfile::Screen)
+            .expect("public layer export succeeds");
+        let json = tree.to_json();
+        assert!(json.contains("\"payloadKind\":\"bitmapGlyph\""));
+        assert!(json.contains("\"imageKeys\":[\"img:blake3:"));
+
+        let plan = analyze_canvaskit_replay_plan(&tree, CanvasKitReplayMode::Default);
+        assert_eq!(plan.text_variants.len(), 1);
+        assert_eq!(
+            plan.text_variants[0].selected_variant_kind,
+            Some("glyphOutline")
+        );
+        assert!(!plan.text_variants[0].fallback_required);
     }
 
     /// [Task #1280 v2] 레이아웃 쿼리가 컨트롤별 plane/zOrder/stableIndex 를 노출하고,
@@ -4791,17 +5411,17 @@ mod tests {
         let mut core = DocumentCore::new_empty();
         core.document.bin_data_content.push(BinDataContent {
             id: 1,
-            data: vec![0x01, 0x02, 0x03],
+            data: vec![0x01, 0x02, 0x03].into(),
             extension: "png".to_string(),
         });
         core.document.bin_data_content.push(BinDataContent {
             id: 2,
-            data: vec![0xAA, 0xBB],
+            data: vec![0xAA, 0xBB].into(),
             extension: "jpg".to_string(),
         });
 
-        assert_eq!(core.get_bin_data(0), Some(&[0x01, 0x02, 0x03][..]));
-        assert_eq!(core.get_bin_data(1), Some(&[0xAA, 0xBB][..]));
+        assert_eq!(core.get_bin_data(0), Some(vec![0x01, 0x02, 0x03]));
+        assert_eq!(core.get_bin_data(1), Some(vec![0xAA, 0xBB]));
         assert_eq!(core.get_bin_data(2), None);
     }
 

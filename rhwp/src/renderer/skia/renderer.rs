@@ -427,6 +427,7 @@ impl SkiaLayerRenderer {
                 &tree.resources,
                 replay_plane,
                 None,
+                tree.profile.shows_editor_visuals(),
                 &mut next_text_source_id,
             );
         }
@@ -460,6 +461,7 @@ impl SkiaLayerRenderer {
         resources: &ResourceArena,
         replay_plane: PaintReplayPlane,
         inherited_layer: Option<RenderLayerInfo>,
+        show_editor_placeholders: bool,
         next_text_source_id: &mut u32,
     ) {
         let active_layer = node.layer.or(inherited_layer);
@@ -610,6 +612,7 @@ impl SkiaLayerRenderer {
                         resources,
                         replay_plane,
                         active_layer,
+                        show_editor_placeholders,
                         next_text_source_id,
                     );
                 }
@@ -623,6 +626,7 @@ impl SkiaLayerRenderer {
                         resources,
                         replay_plane,
                         active_layer,
+                        show_editor_placeholders,
                         next_text_source_id,
                     );
                     return;
@@ -645,6 +649,7 @@ impl SkiaLayerRenderer {
                     resources,
                     replay_plane,
                     active_layer,
+                    show_editor_placeholders,
                     next_text_source_id,
                 );
                 canvas.restore();
@@ -1102,7 +1107,13 @@ impl SkiaLayerRenderer {
                             self.draw_form_control(canvas, *bbox, form);
                         }
                         PaintOp::Placeholder { bbox, placeholder } => {
-                            draw_placeholder(*bbox, placeholder.label.as_str());
+                            // [Task #2225] 그림 미지정 placeholder 는 편집 profile에서만 표시.
+                            if placeholder.kind
+                                != crate::renderer::render_tree::PlaceholderKind::MissingPicture
+                                || show_editor_placeholders
+                            {
+                                draw_placeholder(*bbox, placeholder.label.as_str());
+                            }
                         }
                         PaintOp::RawSvg { bbox, raw } => {
                             if !draw_svg_fragment(
@@ -1417,8 +1428,8 @@ mod tests {
         CacheHint, FontBlobKey, FontBlobResource, FontDigest, FontFaceKey, FontFaceResource,
         FontFallbackPolicyId, FontInstanceKey, FontPortability, FontResourceSource, GlyphCluster,
         GlyphRange, GroupKind, LayerAffineTransform, LayerNode, LayerOutputOptions, LayerPoint,
-        PaintTextStyle, PaintVariantMeta, ScriptTag, ShapeKey, ShapingEngineId, TextDirection,
-        TextSourceId, TextSourceRange, TextSourceSpan, TextVariantKind, WritingMode,
+        PaintTextStyle, PaintVariantMeta, RenderProfile, ScriptTag, ShapeKey, ShapingEngineId,
+        TextDirection, TextSourceId, TextSourceRange, TextSourceSpan, TextVariantKind, WritingMode,
     };
     use crate::renderer::composer::CharOverlapInfo;
     use crate::renderer::equation::ast::EqNode;
@@ -2947,6 +2958,31 @@ mod tests {
         let image = decode_rgba(&output.bytes);
 
         assert!(count_ink(&image) > 40);
+    }
+
+    #[test]
+    fn missing_picture_placeholder_follows_render_profile() {
+        let root = LayerNode::leaf(
+            BoundingBox::new(0.0, 0.0, 32.0, 24.0),
+            None,
+            vec![PaintOp::placeholder(
+                BoundingBox::new(4.0, 4.0, 20.0, 14.0),
+                PlaceholderNode::missing_picture(None, None, None, None),
+            )],
+        );
+        let screen_tree =
+            PageLayerTree::with_profile(32.0, 24.0, root.clone(), RenderProfile::Screen);
+        let print_tree = PageLayerTree::with_profile(32.0, 24.0, root, RenderProfile::Print);
+        let renderer = SkiaLayerRenderer::new();
+        let screen = renderer
+            .render_raster_with_options(&screen_tree, RasterRenderOptions::default())
+            .expect("render screen placeholder");
+        let print = renderer
+            .render_raster_with_options(&print_tree, RasterRenderOptions::default())
+            .expect("render print placeholder");
+
+        assert!(count_ink(&decode_rgba(&screen.bytes)) > 40);
+        assert_eq!(count_ink(&decode_rgba(&print.bytes)), 0);
     }
 
     #[test]

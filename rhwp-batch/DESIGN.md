@@ -125,6 +125,7 @@ AssetJson { mime, path?, data_base64?, sha256, byte_size }   # D4: extract 기�
 pic.image_attr.bin_data_id  (1-based)
   → doc_info.bin_data_list[id-1].storage_id
     → doc.bin_data_content.iter().find(|c| c.id == storage_id)
+      → content.data.load()  // v0.7.19+ BinDataBytes (Lazy|Loaded)
 ```
 
 **heading 레벨 휴리스틱 (D23)**:

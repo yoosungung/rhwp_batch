@@ -230,6 +230,25 @@ impl HeightCursor {
                 .text
                 .chars()
                 .any(|c| c > '\u{001F}' && c != '\u{FFFC}');
+            // [#2243] 직전 문단이 **빈 앵커 자리차지(TopAndBottom, 비-TAC) 표 host** 면
+            // prev_end→curr 저장 vpos 갭은 표의 흐름 공간 인코딩이다. sequential y 는
+            // 표 소비를 이미 포함하므로 lazy 역산이 이 갭을 재가산하면 표 높이만큼
+            // 이중 계상된다 (36382819 pi=31: lazy_base 역산 +12971HU → 페이지3
+            // +184.9px → 4쪽 sliver, 한글 3쪽). 보정 없이 sequential 을 신뢰한다.
+            // page_base 경로(절대 좌표)는 정상 동작하므로 lazy 역산 한정.
+            let prev_is_empty_float_table_host = !prev_has_text
+                && prev_para.controls.iter().any(|c| {
+                    matches!(c, Control::Table(t)
+                        if !t.common.treat_as_char
+                            && matches!(t.common.text_wrap, TextWrap::TopAndBottom))
+                });
+            // 전방 재가산 형상(저장 갭 존재 = curr_v0 > prev_end)만 차단 — 갭이
+            // 없으면 정상 lazy 역산을 유지해 sequential 과대의 역방향 보정을
+            // 살린다 (156631374: 무차별 차단 시 1→2쪽 회귀).
+            let stored_gap_exists = matches!(curr_first_vpos, Some(v) if v > prev_vpos_end);
+            if prev_is_empty_float_table_host && stored_gap_exists {
+                return y_offset;
+            }
             // [Issue #1898] 직전 문단이 "실텍스트 + 인라인(tac) 그림 호스트" 이면, 저장
             // vpos gap 이 현재 문단 spacing_before 이하일 때 연속으로 본다. 이 gap 은 sb
             // 인코딩이며 sb 는 vpos_corrected_end_y 가 별도로 사전 차감하므로 이미 계상된
@@ -753,6 +772,10 @@ impl HeightCursor {
             && y_offset <= self.col_area_y + 48.0;
         let current_vpos_far_from_prev =
             matches!(curr_first_vpos, Some(v) if v - prev_vpos_end > 3200);
+        let previous_has_stale_hwpx_line_metrics = self.suppress_hwpx_stale_forward
+            && crate::renderer::paragraph_source_line_metrics_need_reflow(
+                prev_para, styles, self.dpi,
+            );
         let hwpx_page_start_stale_forward = self.suppress_hwpx_stale_forward
             && is_page_path
             && applied
@@ -762,7 +785,11 @@ impl HeightCursor {
             && ((prev_is_initial_empty_reset
                 && current_has_visible_text
                 && current_vpos_far_from_prev)
-                || (current_is_tac_table_host && end_y > y_offset + 180.0));
+                || (current_is_tac_table_host && end_y > y_offset + 180.0)
+                // 손상된 단일 줄의 저장 높이가 이후 문단의 절대 vpos까지 밀어 둔
+                // HWPX는 순차 조판 위치를 유지한다. 그렇지 않으면 앞 줄을 재조판해도
+                // 다음 문단에서 동일한 빈 공간이 다시 복원된다.
+                || (previous_has_stale_hwpx_line_metrics && current_has_visible_text));
         let compact_endnote_large_gap_body_stale_forward = self.suppress_large_forward_jump
             && !is_page_path
             && !vpos_rewind
@@ -1361,6 +1388,7 @@ mod tests {
 
     fn styles(spacing_before: f64) -> ResolvedStyleSet {
         ResolvedStyleSet {
+            hwp3_variant: false,
             para_styles: vec![ResolvedParaStyle {
                 spacing_before,
                 ..Default::default()

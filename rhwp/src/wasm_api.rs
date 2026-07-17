@@ -246,6 +246,96 @@ impl HwpDocument {
     }
 }
 
+fn hml_warning_code(code: crate::parser::hml::HmlWarningCode) -> &'static str {
+    use crate::parser::hml::HmlWarningCode;
+
+    match code {
+        HmlWarningCode::UnsupportedElement => "UnsupportedElement",
+        HmlWarningCode::UnsupportedAttribute => "UnsupportedAttribute",
+        HmlWarningCode::UnsupportedEquationSemantics => "UnsupportedEquationSemantics",
+        HmlWarningCode::MissingResource => "MissingResource",
+        HmlWarningCode::ExternalResourceBlocked => "ExternalResourceBlocked",
+        HmlWarningCode::InvalidReference => "InvalidReference",
+        HmlWarningCode::LossyConversion => "LossyConversion",
+    }
+}
+
+fn hml_warning_json(warning: &crate::parser::hml::HmlWarning) -> serde_json::Value {
+    serde_json::json!({
+        "code": hml_warning_code(warning.code),
+        "xmlPath": warning.xml_path,
+        "message": warning.message,
+        "preserved": warning.preserved,
+    })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HmlSaveState {
+    source_format: &'static str,
+    hml_savable: bool,
+    blockers: Vec<HmlSaveBlockerDto>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HmlSaveBlockerDto {
+    code: String,
+    xml_path: String,
+    message: String,
+    preserved: bool,
+}
+
+fn hml_save_state(core: &DocumentCore) -> HmlSaveState {
+    let source_format = source_format_name(core.source_format);
+    match core.hml_export_preflight() {
+        Ok(()) => HmlSaveState {
+            source_format,
+            hml_savable: true,
+            blockers: Vec::new(),
+        },
+        Err(error) => {
+            let blockers = error
+                .blockers()
+                .iter()
+                .map(|blocker| HmlSaveBlockerDto {
+                    code: blocker.code.to_string(),
+                    xml_path: blocker.xml_path.clone(),
+                    message: blocker.message.clone(),
+                    preserved: false,
+                })
+                .collect();
+            HmlSaveState {
+                source_format,
+                hml_savable: false,
+                blockers,
+            }
+        }
+    }
+}
+
+fn source_format_name(format: crate::parser::FileFormat) -> &'static str {
+    match format {
+        crate::parser::FileFormat::Hwpx => "hwpx",
+        crate::parser::FileFormat::Hml => "hml",
+        _ => "hwp",
+    }
+}
+
+fn format_hml_export_error(error: &crate::serializer::hml::HmlExportError) -> String {
+    use std::fmt::Write;
+
+    let mut message = error.to_string();
+    for blocker in error.blockers() {
+        let _ = write!(
+            message,
+            "\n[{}] {}: {}",
+            blocker.code, blocker.xml_path, blocker.message
+        );
+    }
+    message
+}
+
 #[wasm_bindgen]
 impl HwpDocument {
     /// HWP 파일 바이트를 로드하여 문서 객체를 생성한다.
@@ -433,7 +523,23 @@ impl HwpDocument {
         scale: f64,
         layer_kind: &str,
     ) -> Result<(), JsValue> {
+        self.render_page_to_canvas_filtered_with_profile(
+            page_num, canvas, scale, layer_kind, "screen",
+        )
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = renderPageToCanvasFilteredWithProfile)]
+    pub fn render_page_to_canvas_filtered_with_profile(
+        &self,
+        page_num: u32,
+        canvas: &HtmlCanvasElement,
+        scale: f64,
+        layer_kind: &str,
+        profile: &str,
+    ) -> Result<(), JsValue> {
         use crate::model::shape::TextWrap;
+        use crate::paint::RenderProfile;
         use crate::renderer::layer_renderer::LayerRenderer;
         use crate::renderer::web_canvas::{LayerFilter, WebCanvasRenderer};
 
@@ -452,8 +558,10 @@ impl HwpDocument {
             }
         };
 
+        let profile = RenderProfile::parse(profile)
+            .ok_or_else(|| JsValue::from_str(&format!("unsupported render profile: {profile}")))?;
         let tree = self
-            .build_page_layer_tree(page_num)
+            .build_page_layer_tree_with_profile(page_num, profile)
             .map_err(JsValue::from)?;
 
         let scale = normalize_canvas_scale(tree.page_width, tree.page_height, scale)
@@ -517,6 +625,18 @@ impl HwpDocument {
             .map_err(|e| e.into())
     }
 
+    #[wasm_bindgen(js_name = getPageLayerTreeWithProfile)]
+    pub fn get_page_layer_tree_with_profile(
+        &self,
+        page_num: u32,
+        profile: &str,
+    ) -> Result<String, JsValue> {
+        let profile = crate::paint::RenderProfile::parse(profile)
+            .ok_or_else(|| JsValue::from_str(&format!("unsupported render profile: {profile}")))?;
+        self.get_page_layer_tree_with_profile_native(page_num, profile)
+            .map_err(|error| error.into())
+    }
+
     /// CanvasKit direct replay 정책 진단을 JSON 문자열로 반환한다.
     ///
     /// `mode` 는 `"default"` 또는 `"compat"` 를 받는다. 빈 문자열은 `"default"` 로 처리한다.
@@ -526,6 +646,19 @@ impl HwpDocument {
     pub fn get_canvaskit_replay_plan(&self, page_num: u32, mode: &str) -> Result<String, JsValue> {
         self.get_canvaskit_replay_plan_native(page_num, mode)
             .map_err(|e| e.into())
+    }
+
+    #[wasm_bindgen(js_name = getCanvasKitReplayPlanWithProfile)]
+    pub fn get_canvaskit_replay_plan_with_profile(
+        &self,
+        page_num: u32,
+        mode: &str,
+        profile: &str,
+    ) -> Result<String, JsValue> {
+        let profile = crate::paint::RenderProfile::parse(profile)
+            .ok_or_else(|| JsValue::from_str(&format!("unsupported render profile: {profile}")))?;
+        self.get_canvaskit_replay_plan_with_profile_native(page_num, mode, profile)
+            .map_err(|error| error.into())
     }
 
     /// 페이지 overlay 이미지 정보만 JSON 문자열로 반환한다.
@@ -830,6 +963,7 @@ impl HwpDocument {
     ///
     /// Studio의 page-local 단일 입력처럼 현재 페이지를 먼저 갱신하고 idle 시점에
     /// 전체 페이지네이션을 한 번만 수행하는 경로에서 사용한다.
+    /// 결과 JSON은 `charOffset`과 상대 cell-flow 변화 신호 `cellFlowChanged`를 포함한다.
     #[wasm_bindgen(js_name = insertTextInCellDeferredPagination)]
     pub fn insert_text_in_cell_deferred_pagination(
         &mut self,
@@ -2768,6 +2902,47 @@ impl HwpDocument {
             &description,
             paper_offset_x_hu,
             paper_offset_y_hu,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// [Task #2230] 기존 Picture 컨트롤에 이미지를 지정한다 — 그림 미지정
+    /// placeholder(missing image 컨트롤)의 편집 뷰 그림 삽입.
+    ///
+    /// `cell_path_json` 이 빈 문자열 또는 `"[]"` 면 본문 문단의 컨트롤,
+    /// 그 외에는 셀/글상자 안 문단의 컨트롤을 대상으로 한다. 개체 틀 크기는
+    /// 유지되고(한컴 placeholder 는 틀에 그림을 맞춤) BinData 등록 규칙은
+    /// insertPicture 와 공유한다.
+    ///
+    /// 반환: `{"ok":true,"binDataId":<N>}`
+    #[wasm_bindgen(js_name = assignPictureImage)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn assign_picture_image(
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        cell_path_json: &str,
+        control_idx: u32,
+        image_data: &[u8],
+        natural_width_px: u32,
+        natural_height_px: u32,
+        extension: &str,
+    ) -> Result<String, JsValue> {
+        let cell_path: Vec<(usize, usize, usize)> =
+            if cell_path_json.is_empty() || cell_path_json == "[]" {
+                Vec::new()
+            } else {
+                DocumentCore::parse_cell_path(cell_path_json).map_err(JsValue::from)?
+            };
+        self.assign_picture_image_native(
+            section_idx as usize,
+            parent_para_idx as usize,
+            &cell_path,
+            control_idx as usize,
+            image_data,
+            natural_width_px,
+            natural_height_px,
+            extension,
         )
         .map_err(|e| e.into())
     }
@@ -5077,6 +5252,13 @@ impl HwpDocument {
         self.export_hwpx_native().map_err(|e| e.into())
     }
 
+    /// HML 원본의 공통 IR을 HWPML 2.91 XML로 직렬화하여 반환한다.
+    #[wasm_bindgen(js_name = exportHml)]
+    pub fn export_hml(&self) -> Result<Vec<u8>, JsValue> {
+        self.export_hml_native()
+            .map_err(|error| JsValue::from_str(&format_hml_export_error(&error)))
+    }
+
     /// 어댑터 적용 + HWP 직렬화 + 자기 재로드 검증을 수행하고 결과를 JSON 으로 반환한다 (#178).
     ///
     /// 반환 JSON:
@@ -5100,13 +5282,47 @@ impl HwpDocument {
         ))
     }
 
-    /// 원본 파일 형식을 반환한다 ("hwp" 또는 "hwpx").
+    /// 원본 파일 형식을 반환한다 ("hwp", "hwpx", 또는 "hml").
     #[wasm_bindgen(js_name = getSourceFormat)]
     pub fn get_source_format(&self) -> String {
-        match self.core.source_format {
-            crate::parser::FileFormat::Hwpx => "hwpx".to_string(),
-            _ => "hwp".to_string(),
-        }
+        source_format_name(self.core.source_format).to_string()
+    }
+
+    /// HML 열기 메타데이터와 손실 진단을 JSON으로 반환한다.
+    /// 다른 입력 포맷에서는 `null`을 반환한다.
+    #[wasm_bindgen(js_name = getHmlOpenMetadata)]
+    pub fn get_hml_open_metadata(&self) -> String {
+        let Some(metadata) = self.core.hml_metadata() else {
+            return "null".to_string();
+        };
+        let encoding = match metadata.encoding {
+            crate::parser::hml::HmlEncoding::Utf8 => "utf-8",
+            crate::parser::hml::HmlEncoding::Utf16Le => "utf-16le",
+            crate::parser::hml::HmlEncoding::Utf16Be => "utf-16be",
+        };
+        let warnings = metadata
+            .warnings
+            .iter()
+            .map(hml_warning_json)
+            .collect::<Vec<_>>();
+        let save_state = hml_save_state(&self.core);
+        serde_json::json!({
+            "format": "hml",
+            "hwpmlVersion": metadata.hwpml_version,
+            "encoding": encoding,
+            "resourceCount": metadata.resource_count,
+            "warnings": warnings,
+            "hmlSavable": save_state.hml_savable,
+            "saveBlockers": save_state.blockers,
+        })
+        .to_string()
+    }
+
+    /// HML 저장 가능 여부와 모든 차단 진단을 canonical JSON DTO로 반환한다.
+    #[wasm_bindgen(js_name = getHmlSaveState)]
+    pub fn get_hml_save_state(&self) -> String {
+        serde_json::to_string(&hml_save_state(&self.core))
+            .expect("HML save-state DTO serialization cannot fail")
     }
 
     /// HWPX 비표준 감지 경고를 JSON 문자열로 반환한다 (#177).

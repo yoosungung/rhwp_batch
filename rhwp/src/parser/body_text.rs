@@ -451,6 +451,19 @@ fn parse_para_line_seg(data: &[u8]) -> Vec<LineSeg> {
         });
     }
 
+    // [#2070] 전부 0 높이(lh=0, th=0)인 PARA_LINE_SEG 는 부재로 정규화한다.
+    // 생성계 문서(80168 등 규제영향분석서)는 lineseg 를 0 으로 채워 저장하는데,
+    // 0 높이 lineseg 는 배치 권위가 없고(한글은 열 때 재계산) 실저장 취급 시
+    // NO_LS 성장 경로가 죽어 셀/문단 높이가 선언값으로 붕괴한다
+    // (hwpx section.rs parse_paragraph 와 동일 규칙).
+    if !segs.is_empty()
+        && segs
+            .iter()
+            .all(|s| s.line_height == 0 && s.text_height == 0)
+    {
+        return Vec::new();
+    }
+
     segs
 }
 

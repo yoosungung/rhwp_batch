@@ -106,6 +106,10 @@ pub struct DocumentCore {
     pub(crate) para_column_map: Vec<Vec<u16>>,
     /// 페이지별 렌더 트리 캐시 (지연 구축, 부분 무효화)
     pub(crate) page_tree_cache: RefCell<Vec<Option<PageRenderTree>>>,
+    /// [Task #2222] 페이지 레이어 트리 JSON 캐시 — (출력옵션 지문, 직렬화 결과).
+    /// 이미지 base64 인라인으로 페이지당 1MB 급이라 재직렬화(실측 15ms/회)가
+    /// 렌더 자체와 맞먹는다. 편집 무효화는 page_tree_cache 와 동일 지점에서.
+    pub(crate) layer_tree_json_cache: RefCell<Vec<Vec<(u8, String)>>>,
     /// Batch 모드 플래그 — true이면 paginate() 스킵
     pub(crate) batch_mode: bool,
     /// 이벤트 로그 (Command 실행 시 누적)
@@ -127,8 +131,10 @@ pub struct DocumentCore {
     /// 구역별 문단 인덱스 오프셋 (삽입=+N, 삭제=-N, 페이지네이션 수렴 감지용)
     /// paginate() 후 리셋.
     pub(crate) para_offset: Vec<i32>,
-    /// 원본 파일 형식 (HWP/HWPX) — 저장 시 형식 분기용
+    /// 원본 파일 형식 — 저장 시 형식 분기용
     pub(crate) source_format: crate::parser::FileFormat,
+    /// HML 입력에서만 유지되는 버전·인코딩·손실 진단.
+    pub(crate) hml_metadata: Option<crate::parser::HmlImportMetadata>,
     /// HWPX 비표준 감지 등 문서 검증 경고.
     /// `from_bytes` 에서 자동 생성되며, 사용자 고지·선택적 reflow 에 사용 (#177).
     pub(crate) validation_report: validation::ValidationReport,
@@ -267,6 +273,7 @@ impl DocumentCore {
             dirty_paragraphs: Vec::new(),
             para_column_map: Vec::new(),
             page_tree_cache: RefCell::new(Vec::new()),
+            layer_tree_json_cache: RefCell::new(Vec::new()),
             batch_mode: false,
             event_log: Vec::new(),
             overflow_links_cache: RefCell::new(HashMap::new()),
@@ -277,8 +284,14 @@ impl DocumentCore {
             active_field: None,
             para_offset: Vec::new(),
             source_format: crate::parser::FileFormat::Hwp,
+            hml_metadata: None,
             validation_report: validation::ValidationReport::new(),
         }
+    }
+
+    /// HML 열기 메타데이터. 다른 입력 포맷은 `None`이다.
+    pub fn hml_metadata(&self) -> Option<&crate::parser::HmlImportMetadata> {
+        self.hml_metadata.as_ref()
     }
 
     /// 문서 검증 리포트에 대한 참조를 반환한다.

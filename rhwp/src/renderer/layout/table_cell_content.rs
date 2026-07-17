@@ -466,7 +466,7 @@ impl LayoutEngine {
         }
 
         // 행 높이 계산 (layout_table과 동일한 resolve_row_heights 사용)
-        let row_heights = self.resolve_row_heights(table, col_count, row_count, None, styles);
+        let row_heights = self.resolve_row_heights(table, col_count, row_count, None, styles, true);
 
         // 누적 위치 계산
         let mut col_x = vec![0.0f64; col_count + 1];
@@ -759,7 +759,7 @@ impl LayoutEngine {
 
                             let bin_id = pic.image_attr.bin_data_id;
                             let img_data =
-                                find_bin_data(bin_data_content, bin_id).map(|bd| bd.data.clone());
+                                find_bin_data(bin_data_content, bin_id).map(|bd| bd.data.load());
                             let img_node_id = tree.next_id();
                             // [Task #1151 v4] 셀 안 inline picture 의 cell context + outer
                             // 정보 보존. rendering.rs:1495 의 Image JSON 직렬화 에 cellIdx/

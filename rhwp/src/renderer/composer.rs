@@ -291,11 +291,8 @@ pub fn compose_paragraph(para: &Paragraph) -> ComposedParagraph {
                 Control::Form(f) => Some((pos, f.width as i32, i)),
                 Control::Table(t)
                     if t.common.treat_as_char
-                        && super::height_measurer::is_tac_table_inline(
-                            t,
-                            seg_width,
-                            &para.text,
-                            &para.controls,
+                        && super::height_measurer::is_tac_table_inline_in_para(
+                            t, seg_width, para,
                         ) =>
                 {
                     let table_width: u32 = t.get_column_widths().iter().sum();
@@ -515,6 +512,12 @@ fn compose_lines(para: &Paragraph) -> Vec<ComposedLine> {
             }
             let line_text: String = chars[offset..end].iter().collect();
             let is_last_line = end >= total;
+            // [#2279] 주의: 이 폴백은 문단의 CharShapeRef 를 무시하고 단일
+            // default_style run 을 만든다(혼합 크기 문단이 전 줄 최대 크기로
+            // 측정·렌더). 본문 경로는 recompose_for_body_width 가
+            // restyle_fallback_runs_by_char_shapes 로 정합한다 — 셀 경로는 기존
+            // 폭 보정망(#2070 사다리)이 이 단일 스타일 위에서 교정돼 있어
+            // 전면 교체 시 80168 pi=1056/1245 급 회귀(#2279 실측).
             lines.push(ComposedLine {
                 runs: split_runs_by_lang(vec![ComposedTextRun {
                     text: line_text,
@@ -1380,6 +1383,85 @@ pub(crate) fn no_ls_short_label_cell(
 /// - ComposedLine 전체 측정 폭이 `cell_inner_width_px` 초과
 ///
 /// 분할 전략: 단어 경계 (공백) 우선, 단어가 셀 너비 초과 시 글자 단위 break.
+/// [#2279] NO_LS 폴백 줄들의 단일-스타일 run 을 CharShapeRef 경계로 재분할한다.
+///
+/// compose_lines 폴백은 문단 글자모양을 무시한 단일 default_style run 을 만든다
+/// (86712 pi=20: "ㅇ "=15pt + 본문 14pt 가 전 줄 15pt 로 측정·렌더 → 폭 +7% 과대
+/// 래핑, pitch 32.0 vs 한글 29.9, 측정/렌더 줄수 불일치로 렌더 꼬리 텍스트 소실).
+/// 본문(column) 경로에서만 호출한다 — 셀 측정은 기존 폭 보정망(#2070 사다리)이
+/// 단일 스타일 전제 위에서 교정돼 있어 전면 적용 시 80168 157→156 회귀(실측).
+pub(crate) fn restyle_fallback_runs_by_char_shapes(
+    composed: &mut ComposedParagraph,
+    para: &Paragraph,
+) {
+    if para.char_shapes.is_empty() || !para.line_segs.is_empty() {
+        return;
+    }
+    for line in composed.lines.iter_mut() {
+        let text: String = line.runs.iter().map(|r| r.text.as_str()).collect();
+        if text.is_empty() {
+            continue;
+        }
+        let start = line.char_start;
+        let end = start + text.chars().count();
+        let restyled =
+            split_by_char_shapes(&text, start, end, &para.char_offsets, &para.char_shapes);
+        if !restyled.is_empty() {
+            line.runs = restyled;
+        }
+    }
+}
+
+/// [#2279] 본문(column) 폭 재래핑 — 글자모양 재분할 후 recompose.
+///
+/// typeset(format_paragraph)·render(layout_partial_paragraph) 의 본문 NO_LS
+/// 문단 전용. 셀 경로는 recompose_for_cell_width 를 그대로 사용한다.
+pub fn recompose_for_body_width(
+    composed: &mut ComposedParagraph,
+    para: &Paragraph,
+    column_inner_width_px: f64,
+    styles: &ResolvedStyleSet,
+) {
+    restyle_fallback_runs_by_char_shapes(composed, para);
+    recompose_for_cell_width(composed, para, column_inner_width_px, styles);
+}
+
+/// [#2291/#2287] 부실 저장 예외 — 기계생성 문서는 다줄 문단에도 저장 lineseg 를
+/// 1개만 남기는 관례가 있어(연결맵 s5 244×10 r183 c8: 76자 문단 ls 1개 → 1줄
+/// 렌더 + "…실천 계획 세" 절단), 셀 재래핑의 "저장 lineseg 신뢰" 가드가 이런
+/// 문단의 텍스트를 segment_width 클립으로 절단한다. 저장 ls==1 이고 그 줄의
+/// 추정 실폭이 셀 내폭을 명백히 초과(×1.05)하면 저장을 불신하고 fresh
+/// 재래핑한다. **가로쓰기 셀 전용** — 세로쓰기 셀은 글자를 세로로 쌓아 가로
+/// 실폭 판정이 무의미하므로 호출부(셀 방향을 아는 곳)에서 걸러야 한다
+/// (task81 세로쓰기 회귀 실측). 정상 1줄(실폭 ≤ 내폭)·다줄 저장(ls≥2)은 불변.
+pub fn recompose_stored_single_line_if_overflowing(
+    composed: &mut ComposedParagraph,
+    para: &Paragraph,
+    cell_inner_width_px: f64,
+    styles: &ResolvedStyleSet,
+) {
+    let stored_single = para.line_segs.len() == 1
+        && para
+            .line_segs
+            .iter()
+            .all(|seg| seg.tag & LineSeg::TAG_IMPLEMENTATION_PROPERTY == 0);
+    if !stored_single || composed.lines.len() != 1 || cell_inner_width_px <= 0.0 {
+        return;
+    }
+    let over = composed
+        .lines
+        .first()
+        .map(|l| estimate_composed_line_width(l, styles) > cell_inner_width_px * 1.05)
+        .unwrap_or(false);
+    if !over {
+        return;
+    }
+    // 저장 seg 를 일시적으로 무시하고 NO_LS 폴백과 동일 경로로 재분할한다.
+    let mut para_no_ls = para.clone();
+    para_no_ls.line_segs.clear();
+    recompose_for_cell_width(composed, &para_no_ls, cell_inner_width_px, styles);
+}
+
 pub fn recompose_for_cell_width(
     composed: &mut ComposedParagraph,
     para: &Paragraph,
@@ -1407,67 +1489,309 @@ pub fn recompose_for_cell_width(
     if cell_inner_width_px <= 0.0 {
         return;
     }
-    let text_width_px = if has_synthetic_line_segs {
-        styles
-            .para_styles
-            .get(para.para_shape_id as usize)
-            .map(|ps| {
-                let continuation_left = if ps.indent < 0.0 {
-                    ps.margin_left + ps.indent.abs()
-                } else {
-                    ps.margin_left
-                };
-                let first_left = if ps.indent > 0.0 {
-                    ps.margin_left + ps.indent
-                } else {
-                    ps.margin_left
-                };
-                let effective_left = first_left.max(continuation_left).max(0.0);
-                (cell_inner_width_px - effective_left - ps.margin_right).max(0.0)
-            })
-            .unwrap_or(cell_inner_width_px)
-    } else {
-        // lineSeg 자체가 없는 HWP/HWP3-origin fallback 은 기존 Task #671 폭 기준을
-        // 유지한다. HWP3-origin legacy bullet 은 별도 1.04 tolerance 로 정합한다.
-        cell_inner_width_px
-    };
+    // [#2070] lineSeg 부재 fallback 도 문단 여백/들여쓰기 반영 폭을 쓰되,
+    // 내어쓰기(intent<0)의 본질대로 **첫 줄 폭과 연속 줄 폭을 분리**한다.
+    // 종전 전체 폭 단일 사용은 조문 문단(80168 pi=362, ps intent=-3120)에서
+    // 연속 줄 폭 41.6px 과대 → 줄수 과소; 반대로 연속 폭 단일 사용은 첫 줄
+    // 과소로 +1줄 광역 팽창 (165쪽 회귀). HWP3-origin legacy bullet 은
+    // 종전대로 별도 1.04 tolerance 로 정합한다.
+    // [#2070 정밀화] 이중 폭은 검증 영역(내어쓰기 intent<0, 80168 계열 사다리·오라클)
+    // 에 한정한다. intent>=0 의 no-lineseg 폴백과 HWP3-origin legacy bullet
+    // (is_hwp3_hwp5_missing_lineseg_legacy_bullet, sample16-hwp5 = 64쪽 게이트)은
+    // 종전 Task #671 전체 폭 유지 (이중 폭 적용 시 65 over-split, git bisect 0e21ec08).
+    let hwp3_legacy_bullet =
+        styles.hwp3_variant || is_hwp3_hwp5_missing_lineseg_legacy_bullet(para, composed, styles);
+    let (first_width_px, cont_width_px) = styles
+        .para_styles
+        .get(para.para_shape_id as usize)
+        .map(|ps| {
+            if ps.indent < 0.0 && !hwp3_legacy_bullet {
+                let continuation_left = ps.margin_left + ps.indent.abs();
+                let first_left = ps.margin_left;
+                (
+                    (cell_inner_width_px - first_left.max(0.0) - ps.margin_right).max(0.0),
+                    (cell_inner_width_px - continuation_left.max(0.0) - ps.margin_right).max(0.0),
+                )
+            } else {
+                (cell_inner_width_px, cell_inner_width_px)
+            }
+        })
+        .unwrap_or((cell_inner_width_px, cell_inner_width_px));
+    let text_width_px = first_width_px.max(cont_width_px);
     if text_width_px <= 0.0 {
         return;
     }
     // Some HWP3-origin HWP5 files omit PARA_LINE_SEG for legacy bullet paragraphs.
     // HY신명조's embedded metrics are slightly wider than Hancom's converted reflow here,
     // so use a small tolerance only for the tight leading-body style pattern.
-    let effective_width_px = if is_hwp3_hwp5_missing_lineseg_legacy_bullet(para, composed, styles) {
-        text_width_px * 1.04
+    let width_tolerance = if is_hwp3_hwp5_missing_lineseg_legacy_bullet(para, composed, styles) {
+        1.04
     } else {
-        text_width_px
+        1.0
     };
+    let eff_first_px = first_width_px * width_tolerance;
+    let eff_cont_px = cont_width_px * width_tolerance;
     // [Task #1042 Stage 6a] multi-line 지원 — compose_lines fallback 의 CHARS_PER_LINE=45
-    // heuristic 결과가 cell width 와 일치 안 할 수 있음. 모든 lines 의 runs 를 합쳐서
-    // 단일 line 으로 만든 후 cell width 기반 re-split.
-    let template = composed.lines[0].clone();
-    let combined_runs: Vec<_> = composed
-        .lines
-        .iter()
-        .flat_map(|l| l.runs.iter().cloned())
+    // heuristic 결과가 cell width 와 일치 안 할 수 있음. lines 의 runs 를 합쳐서
+    // cell width 기반 re-split.
+    // [#2169] 줄나눔 기준 '글자' 문단은 글자 단위 분할. 통제 사다리 실측:
+    // 한글은 breakNonLatinWord=KEEP_WORD(bit7=1)를 **글자 채움**으로,
+    // BREAK_WORD(bit7=0)를 **어절 유지**로 렌더 — 코드 규약(1=어절)과 정반대
+    // (kbu_ladder.hwpx: KEEP_WORD 2줄/BREAK_WORD 3줄; 80168 r10 "또/는" 분리).
+    // 본문 라인브레이커의 광역 반전은 별도 과제 — 셀 재래핑만 우선 정합.
+    // [정식화 보류] 글자 채움은 kbu 단독 조건으로는 문서별 실동작 차(21761835
+    // -82.9 과소, recount WOR5)를 설명 못해 실험 브랜치에 보존 — 조건 정밀화
+    // 후 재적용 (#2169 stage9~10).
+    // [#2070 실험] 글자 채움(kbu==1) 재적용 (5축 전면).
+    let char_break = styles
+        .para_styles
+        .get(para.para_shape_id as usize)
+        .map(|ps| ps.korean_break_unit == 1)
+        .unwrap_or(false);
+    // [#2070] 공백 압축(condense) — 사다리 v4: R(cnd25) vs N(cnd0) 마크 분리 실측.
+    let space_condense = styles
+        .para_styles
+        .get(para.para_shape_id as usize)
+        .map(|ps| ps.condense_min_space as f64 / 100.0)
+        .unwrap_or(0.0);
+    // [#2070] 강제 줄바꿈(\n, has_line_break) 경계는 병합·재분할에서 보존한다.
+    // 종전에는 전 줄을 한 줄로 합쳐 폭 기준 재분할 → \n 경계 소실로 생성계
+    // NO_LS 셀이 과소 (80168 pi=362 조문 표: 한글 11줄 vs 8줄, -58px).
+    // \n 으로 닫히는 그룹 단위로 합쳐 각 그룹을 독립 재래핑한다.
+    let src_lines = std::mem::take(&mut composed.lines);
+    let mut groups: Vec<(ComposedLine, bool)> = Vec::new();
+    let mut cur: Option<ComposedLine> = None;
+    // [#2070] 그룹 경계는 para.text 의 **실제 '\n'** 로만 판정한다.
+    // CHARS_PER_LINE 폴백은 휴리스틱 줄에도 has_line_break=true 를 달므로
+    // (#994 Justify 억제용) 그대로 믿으면 45자 단위 꼬마 줄이 생긴다
+    // (80168 개정안 셀 per-para 대조: +13줄, 43위치 2~5자 줄).
+    let text_chars: Vec<char> = para.text.chars().collect();
+    let next_starts: Vec<Option<usize>> = (0..src_lines.len())
+        .map(|i| src_lines.get(i + 1).map(|nl| nl.char_start))
         .collect();
-    let combined_line = ComposedLine {
-        runs: combined_runs,
-        line_height: template.line_height,
-        baseline_distance: template.baseline_distance,
-        segment_width: template.segment_width,
-        column_start: template.column_start,
-        line_spacing: template.line_spacing,
-        has_line_break: false,
-        char_start: 0,
-    };
-    composed.lines.clear();
-    let total_width = estimate_composed_line_width(&combined_line, styles);
-    if total_width <= effective_width_px + 0.5 {
-        composed.lines.push(combined_line);
-        return;
+    for (i, l) in src_lines.into_iter().enumerate() {
+        let brk = l.has_line_break
+            && match next_starts[i] {
+                // 다음 줄 시작 직전 문자가 실제 개행일 때만 하드 경계
+                Some(b) => b > 0 && text_chars.get(b - 1) == Some(&'\n'),
+                // 마지막 줄의 has_line_break 는 텍스트 끝 '\n'
+                None => text_chars.last() == Some(&'\n'),
+            };
+        match cur.as_mut() {
+            None => cur = Some(l),
+            Some(acc) => acc.runs.extend(l.runs),
+        }
+        if brk {
+            let mut g = cur.take().expect("group line");
+            g.has_line_break = false;
+            groups.push((g, true));
+        }
     }
-    composed.lines = split_composed_line_by_width(&combined_line, effective_width_px, styles);
+    if let Some(mut g) = cur.take() {
+        g.has_line_break = false;
+        groups.push((g, false));
+    }
+    for (gi, (combined_line, ends_with_break)) in groups.into_iter().enumerate() {
+        // 내어쓰기 첫 줄 폭은 문단의 첫 줄에만 적용 — \n 이후 그룹은 전부 연속 폭.
+        let g_first = if gi == 0 { eff_first_px } else { eff_cont_px };
+        let start = composed.lines.len();
+        let total_width = estimate_composed_line_width(&combined_line, styles);
+        // [#2070] 행미 공백 hanging — 한글은 줄 끝 공백을 폭 판정에서 제외한다.
+        // trailing 공백 포함 폭으로 분할하면 공백만의 유령 둘째 줄이 생겨
+        // NO_LS 셀 행높이가 배가된다 (시장구조조사 "100.0␣␣" 22→50.4px,
+        // 2195행 × 4표 → +291쪽의 본류).
+        let trailing_space_w: f64 = {
+            let mut w = 0.0;
+            'outer: for run in combined_line.runs.iter().rev() {
+                let ts = resolved_to_text_style(styles, run.char_style_id, run.lang_index);
+                for ch in run.text.chars().rev() {
+                    if ch == ' ' {
+                        w += estimate_text_width(" ", &ts);
+                    } else {
+                        break 'outer;
+                    }
+                }
+            }
+            w
+        };
+        if total_width - trailing_space_w <= g_first + 0.5 {
+            composed.lines.push(combined_line);
+        } else {
+            let mut frags = split_composed_line_by_width(
+                &combined_line,
+                g_first,
+                eff_cont_px,
+                styles,
+                char_break,
+                space_condense,
+            );
+            // 분할 결과의 공백-단독 조각도 hanging — 직전 조각에 흡수한다.
+            let mut folded: Vec<ComposedLine> = Vec::with_capacity(frags.len());
+            for frag in frags.drain(..) {
+                let ws_only = !frag.runs.is_empty()
+                    && frag.runs.iter().all(|r| r.text.chars().all(|c| c == ' '));
+                if ws_only {
+                    if let Some(prev) = folded.last_mut() {
+                        prev.runs.extend(frag.runs);
+                        continue;
+                    }
+                }
+                folded.push(frag);
+            }
+            composed.lines.extend(folded);
+        }
+        if composed.lines.len() > start && ends_with_break {
+            if let Some(last) = composed.lines.last_mut() {
+                last.has_line_break = true;
+            }
+        }
+        // [#2279] 분할 줄의 줄높이 per-line 재산정 — 한글은 줄마다 **그 줄의 최대
+        // 글자 크기**로 pitch 를 정한다. 종전에는 분할 줄이 원본 압축줄의 lh/ls
+        // (= 문단 최대 fs 기준)를 상속해, 큰 글자가 첫 줄에만 있는 문단(86712
+        // pi=20: "ㅇ "=15pt + 본문 14pt)에서 후속 줄 pitch 가 +2.1px/줄 과대
+        // (rhwp 32.0 vs 한글 실측 29.9 = 14pt×4/3×160%). 페이지당 ~20줄 누적 시
+        // -40px 급 fit 오차(86712 p10 pi=30 밀림)의 본체. Percent 줄간격 한정,
+        // lh/ls/bl 을 줄 최대 fs 비율로 축소(확대 없음 — 원본 상속이 상한).
+        if composed.lines.len() > start {
+            let is_percent = styles
+                .para_styles
+                .get(para.para_shape_id as usize)
+                .map(|ps| {
+                    matches!(
+                        ps.line_spacing_type,
+                        crate::model::style::LineSpacingType::Percent
+                    )
+                })
+                .unwrap_or(false);
+            if is_percent {
+                let group_max_fs = composed.lines[start..]
+                    .iter()
+                    .flat_map(|l| l.runs.iter())
+                    .map(|r| {
+                        resolved_to_text_style(styles, r.char_style_id, r.lang_index).font_size
+                    })
+                    .fold(0.0f64, f64::max);
+                if group_max_fs > 0.0 {
+                    for line in composed.lines[start..].iter_mut() {
+                        let line_max_fs = line
+                            .runs
+                            .iter()
+                            .map(|r| {
+                                resolved_to_text_style(styles, r.char_style_id, r.lang_index)
+                                    .font_size
+                            })
+                            .fold(0.0f64, f64::max);
+                        if line_max_fs > 0.0 && line_max_fs < group_max_fs - 0.01 {
+                            let factor = line_max_fs / group_max_fs;
+                            line.line_height = ((line.line_height as f64) * factor).round() as i32;
+                            line.line_spacing =
+                                ((line.line_spacing as f64) * factor).round() as i32;
+                            line.baseline_distance =
+                                ((line.baseline_distance as f64) * factor).round() as i32;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // [#2279 진단] 측정/렌더 경로별 재래핑 폭·줄수 대조 — 동작 불변.
+    if let Ok(pat) = std::env::var("RHWP_DIAG_RECOMP") {
+        if para.text.contains(&pat) {
+            eprintln!(
+                "DIAG_RECOMP width={:.2} first={:.2} cont={:.2} lines={} text={:?}",
+                cell_inner_width_px,
+                first_width_px,
+                cont_width_px,
+                composed.lines.len(),
+                para.text.chars().take(20).collect::<String>(),
+            );
+        }
+    }
+}
+
+/// [#2279 axis B] 셀 텍스트 오버플로 시 좌우 패딩 축소 — 렌더/측정 공용 코어.
+///
+/// 렌더(`layout_table_cells`)는 단일줄 오버플로 셀의 좌우 패딩을 축소한 뒤
+/// `recompose_for_cell_width` 로 재래핑한다. 측정(cut `cell_units` / mt
+/// `HeightMeasurer`)이 원 패딩 폭(더 좁음)으로 래핑하면 같은 문단이
+/// 렌더 4줄/측정 5줄로 갈라져 행높이가 과대해진다 (86712 pi=172 산식 셀
+/// 106.5px vs 한글 86.3px, #2237 axis B). 규칙 본체를 단일 출처로 공유한다.
+/// 의미는 종전 `LayoutEngine::shrink_cell_padding_for_overflow` 와 동일.
+pub(crate) fn shrunk_cell_horizontal_padding(
+    pad_left: f64,
+    pad_right: f64,
+    cell_w: f64,
+    composed_paras: &[ComposedParagraph],
+    paragraphs: &[Paragraph],
+    styles: &ResolvedStyleSet,
+    preserve_cell_padding: bool,
+) -> (f64, f64) {
+    if preserve_cell_padding {
+        return (pad_left, pad_right);
+    }
+
+    // [Task #617] 다중 줄(2 줄 이상) 단락이 line_segs 로 분배 완료된 경우,
+    // HWP 가 가용 폭에 맞춰 자간을 분배하고 줄바꿈을 확정한 상태이므로
+    // 자연 폭 추정으로 다시 깎으면 오버 페인팅. 단일 줄 셀(좁은 수치 셀
+    // 등에서 오버플로우 가능성 있음) 은 종전 휴리스틱으로 보호한다.
+    let any_multiline_distributed = paragraphs.iter().any(|p| p.line_segs.len() >= 2);
+    if any_multiline_distributed {
+        return (pad_left, pad_right);
+    }
+
+    let mut max_line_w = 0.0f64;
+    for comp in composed_paras {
+        for line in &comp.lines {
+            let mut w = 0.0;
+            for run in &line.runs {
+                let mut ts = resolved_to_text_style(styles, run.char_style_id, run.lang_index);
+                if run.char_overlap.is_some() {
+                    let fs = if ts.font_size > 0.0 {
+                        ts.font_size
+                    } else {
+                        12.0
+                    };
+                    let chars: Vec<char> = run.text.chars().collect();
+                    w += fs * char_overlap_advance_units(&chars) as f64;
+                    continue;
+                }
+                // 자연 폭 측정: 음수 자간을 제거하여 글리프가 서로 겹치지 않는 최소 폭을 얻음
+                if ts.letter_spacing < 0.0 {
+                    ts.letter_spacing = 0.0;
+                }
+                // [Task #555] PUA 옛한글 변환 후 자모 시퀀스 폭 사용.
+                // (estimate_text_width 는 ts.ratio 를 자체 반영함.)
+                w += estimate_text_width(effective_text_for_metrics(run), &ts);
+            }
+            if w > max_line_w {
+                max_line_w = w;
+            }
+        }
+    }
+    let available = (cell_w - pad_left - pad_right).max(0.0);
+    // Task #347: estimate_text_width는 영어 본문(Times New Roman 등) 자연 폭을
+    // 5~15%까지 과대 추정할 수 있어, HWP가 이미 줄바꿈한 본문에서도
+    // padding 축소가 잘못 트리거됨. 15% 이내 초과는 정상으로 보고 미축소.
+    let overflow_threshold = available * 1.15;
+    if max_line_w <= overflow_threshold || cell_w <= 2.0 {
+        return (pad_left, pad_right);
+    }
+    let min_pad = 1.0;
+    let total_pad = pad_left + pad_right;
+    let max_reducible = (total_pad - 2.0 * min_pad).max(0.0);
+    if max_reducible <= 0.0 {
+        return (pad_left, pad_right);
+    }
+    let deficit = max_line_w - available;
+    let reduction = deficit.min(max_reducible);
+    let new_total = total_pad - reduction;
+    let new_left = if total_pad > 0.0 {
+        pad_left * new_total / total_pad
+    } else {
+        new_total / 2.0
+    };
+    let new_right = new_total - new_left;
+    (new_left, new_right)
 }
 
 fn is_hwp3_hwp5_missing_lineseg_legacy_bullet(
@@ -1507,12 +1831,29 @@ fn is_hwp3_hwp5_missing_lineseg_legacy_bullet(
 /// 각 분할 줄의 메타데이터 (line_height/baseline/segment_width 등) 는 원본 보존.
 fn split_composed_line_by_width(
     src: &ComposedLine,
-    max_width_px: f64,
+    first_width_px: f64,
+    cont_width_px: f64,
     styles: &ResolvedStyleSet,
+    char_break: bool,
+    space_condense: f64,
 ) -> Vec<ComposedLine> {
     let mut result: Vec<ComposedLine> = Vec::new();
+    // [#2070] 내어쓰기(intent<0) 이중 폭: 첫 출력 줄은 first_width, 이후 연속
+    // 줄은 cont_width 로 판정한다 (80168 조문 문단 첫줄 넓게/연속 좁게).
+    let limit = |res: &Vec<ComposedLine>| -> f64 {
+        if res.is_empty() {
+            first_width_px
+        } else {
+            cont_width_px
+        }
+    };
     let mut current_runs: Vec<ComposedTextRun> = Vec::new();
     let mut current_width = 0.0;
+    // [#2070] 한양신명조 사다리 v3/v4 확정 규칙: (a) 줄 채움 판정은 공백 폭을
+    // 문단 condense% 만큼 압축해 계산(공백 압축), (b) 줄끝 초과 공백 1개는
+    // 다음 줄로 넘기지 않고 현재 줄에 매달림(hang).
+    let mut space_w = 0.0;
+    let mut hung = false;
     let mut current_char_start = src.char_start;
     let mut chars_in_line = 0usize;
     let mut current_run_text = String::new();
@@ -1573,15 +1914,95 @@ fn split_composed_line_by_width(
             );
             current_run_template = Some(run.clone());
         }
+        // [#2169] 줄나눔 기준 '글자'(korean_break_unit==0) — 글자 단위 채움.
+        // 한글은 이 모드에서 어절 경계 무시하고 줄을 채운다 (80168 r10:
+        // "또/는", "필요/한" 글자 분리, 한글 5줄 vs 어절 래핑 6줄).
+        if char_break {
+            for ch in run.text.chars() {
+                let ch_str: String = std::iter::once(ch).collect();
+                let ch_width = crate::renderer::layout::estimate_text_width_unrounded(&ch_str, &ts);
+                if std::env::var("RHWP_RAZOR").is_ok()
+                    && src.runs.iter().any(|r| r.text.contains("도조례로 정하는"))
+                {
+                    eprintln!(
+                        "RZ: ch={:?} w={:.2} cur={:.2} spw={:.2} cnd={:.2} limit={:.2} fam={:?}",
+                        ch,
+                        ch_width,
+                        current_width,
+                        space_w,
+                        space_condense,
+                        limit(&result),
+                        ts.font_family.split(',').next().unwrap_or("")
+                    );
+                }
+                let eff = current_width - space_w * space_condense;
+                let over = eff + ch_width > limit(&result) && chars_in_line > 0;
+                if over && ch == ' ' && !hung {
+                    // 줄끝 초과 공백 1개 hang — 줄바꿈 없이 현재 줄에 계상.
+                    hung = true;
+                } else if over {
+                    // [#2244] 행두 금칙: 새 줄이 금칙 문자(마침표 등)로 시작하지
+                    // 않도록 직전 글자를 함께 다음 줄로 이월한다 — 한컴 2024 저장
+                    // 오라클 정합 ("적용한 | 다.111…", LINE_SEG [...,128]).
+                    // 직전 글자가 같은 run 안에 있고(스타일 경계 아님) 공백이
+                    // 아니며 줄에 2자 이상 남을 때만 1자 retraction.
+                    let carried: Option<(char, f64)> = if is_line_start_forbidden(ch)
+                        && chars_in_line > 1
+                        && current_run_text
+                            .chars()
+                            .last()
+                            .is_some_and(|p| p != ' ' && !is_line_start_forbidden(p))
+                    {
+                        current_run_text.pop().map(|prev| {
+                            let prev_str: String = std::iter::once(prev).collect();
+                            let prev_w = crate::renderer::layout::estimate_text_width_unrounded(
+                                &prev_str, &ts,
+                            );
+                            current_width -= prev_w;
+                            chars_in_line -= 1;
+                            (prev, prev_w)
+                        })
+                    } else {
+                        None
+                    };
+                    flush_run(
+                        &mut current_runs,
+                        &mut current_run_text,
+                        &current_run_template,
+                    );
+                    push_line(
+                        &mut result,
+                        &mut current_runs,
+                        &mut current_char_start,
+                        &mut chars_in_line,
+                        &mut current_width,
+                    );
+                    space_w = 0.0;
+                    hung = false;
+                    if let Some((pch, pw)) = carried {
+                        current_run_text.push(pch);
+                        current_width += pw;
+                        chars_in_line += 1;
+                    }
+                }
+                current_run_text.push(ch);
+                current_width += ch_width;
+                if ch == ' ' {
+                    space_w += ch_width;
+                }
+                chars_in_line += 1;
+            }
+            continue;
+        }
         // run 텍스트를 단어 단위로 분할 (공백 포함)
         let mut word = String::new();
         for ch in run.text.chars() {
             word.push(ch);
             // 공백 또는 마지막 글자 직전이 단어 경계
             if ch == ' ' || ch == '\t' {
-                let word_width = estimate_text_width(&word, &ts);
+                let word_width = crate::renderer::layout::estimate_text_width_unrounded(&word, &ts);
                 // 현재 단어가 추가되면 max_width 초과하는지 검사
-                if current_width + word_width > max_width_px
+                if current_width - space_w * space_condense + word_width > limit(&result)
                     && (chars_in_line > 0 || !current_run_text.is_empty())
                 {
                     // 현재 줄을 flush 후 새 줄 시작
@@ -1597,13 +2018,18 @@ fn split_composed_line_by_width(
                         &mut chars_in_line,
                         &mut current_width,
                     );
+                    space_w = 0.0;
+                    hung = false;
                 }
                 // 단어 자체가 max_width 초과 시 글자 단위 break
-                if word_width > max_width_px && current_width == 0.0 {
+                if word_width > limit(&result) && current_width == 0.0 {
                     for wch in word.chars() {
                         let wch_str: String = std::iter::once(wch).collect();
-                        let wch_width = estimate_text_width(&wch_str, &ts);
-                        if current_width + wch_width > max_width_px && chars_in_line > 0 {
+                        let wch_width =
+                            crate::renderer::layout::estimate_text_width_unrounded(&wch_str, &ts);
+                        if current_width - space_w * space_condense + wch_width > limit(&result)
+                            && chars_in_line > 0
+                        {
                             flush_run(
                                 &mut current_runs,
                                 &mut current_run_text,
@@ -1616,6 +2042,8 @@ fn split_composed_line_by_width(
                                 &mut chars_in_line,
                                 &mut current_width,
                             );
+                            space_w = 0.0;
+                            hung = false;
                         }
                         current_run_text.push(wch);
                         current_width += wch_width;
@@ -1624,6 +2052,8 @@ fn split_composed_line_by_width(
                 } else {
                     current_run_text.push_str(&word);
                     current_width += word_width;
+                    space_w += crate::renderer::layout::estimate_text_width_unrounded(" ", &ts)
+                        * word.matches(' ').count() as f64;
                     chars_in_line += word.chars().count();
                 }
                 word.clear();
@@ -1631,8 +2061,8 @@ fn split_composed_line_by_width(
         }
         // run 끝에 남은 단어 처리
         if !word.is_empty() {
-            let word_width = estimate_text_width(&word, &ts);
-            if current_width + word_width > max_width_px
+            let word_width = crate::renderer::layout::estimate_text_width_unrounded(&word, &ts);
+            if current_width - space_w * space_condense + word_width > limit(&result)
                 && (chars_in_line > 0 || !current_run_text.is_empty())
             {
                 flush_run(
@@ -1647,13 +2077,18 @@ fn split_composed_line_by_width(
                     &mut chars_in_line,
                     &mut current_width,
                 );
+                space_w = 0.0;
+                hung = false;
             }
             // 단어 자체가 max_width 초과 시 글자 단위 break
-            if word_width > max_width_px && current_width == 0.0 {
+            if word_width > limit(&result) && current_width == 0.0 {
                 for wch in word.chars() {
                     let wch_str: String = std::iter::once(wch).collect();
-                    let wch_width = estimate_text_width(&wch_str, &ts);
-                    if current_width + wch_width > max_width_px && chars_in_line > 0 {
+                    let wch_width =
+                        crate::renderer::layout::estimate_text_width_unrounded(&wch_str, &ts);
+                    if current_width - space_w * space_condense + wch_width > limit(&result)
+                        && chars_in_line > 0
+                    {
                         flush_run(
                             &mut current_runs,
                             &mut current_run_text,
@@ -1666,6 +2101,8 @@ fn split_composed_line_by_width(
                             &mut chars_in_line,
                             &mut current_width,
                         );
+                        space_w = 0.0;
+                        hung = false;
                     }
                     current_run_text.push(wch);
                     current_width += wch_width;
@@ -1691,6 +2128,8 @@ fn split_composed_line_by_width(
         &mut chars_in_line,
         &mut current_width,
     );
+    space_w = 0.0;
+    hung = false;
 
     if result.is_empty() {
         // 안전장치: 절대 빈 결과 반환하지 않음
@@ -1972,8 +2411,8 @@ mod line_breaking;
 pub mod lineseg_compare;
 
 pub(crate) use line_breaking::{
-    is_line_end_forbidden, is_line_start_forbidden, recalculate_section_vpos, reflow_line_segs,
-    tokenize_paragraph, BreakToken,
+    is_line_end_forbidden, is_line_start_forbidden, paragraph_flow_end, recalculate_section_vpos,
+    reflow_line_segs, tokenize_paragraph, BreakToken,
 };
 
 #[cfg(test)]

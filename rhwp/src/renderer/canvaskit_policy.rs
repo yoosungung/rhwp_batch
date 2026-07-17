@@ -6,8 +6,13 @@ use crate::model::shape::TextWrap;
 use crate::model::style::{ImageFillMode, UnderlineType};
 use crate::paint::{
     paint_op_replay_plane_with_layer, CacheHint, ClipKind, LayerNode, LayerNodeKind, PageLayerTree,
-    PaintOp, PaintReplayPlane, ResolvedImageKind, ResolvedImagePayload, TextDecorationKind,
-    TextVariantKind,
+    PaintOp, PaintReplayPlane, RenderProfile, ResolvedImageKind, ResolvedImagePayload,
+    TextDecorationKind, TextVariantKind,
+};
+use crate::renderer::composer::expand_pua_display_text;
+use crate::renderer::equation::{
+    layout::{LayoutBox, LayoutKind},
+    symbols::{DecoKind, FontStyleKind},
 };
 use crate::renderer::layer_renderer::{
     analyze_text_variant_selection, TextVariantSelectionOptions, VariantSelectedReason,
@@ -170,6 +175,8 @@ pub fn analyze_canvaskit_replay_plan(
         TextVariantSelectionOptions {
             backend: VariantSelectionBackend::CanvasKit,
             allow_colrv1_stage1_color_graph: true,
+            allow_bitmap_glyph: true,
+            allow_svg_glyph: true,
             ..TextVariantSelectionOptions::canvaskit()
         },
     );
@@ -188,7 +195,7 @@ pub fn analyze_canvaskit_replay_plan(
             ))
         })
         .collect::<BTreeMap<_, _>>();
-    let mut builder = CanvasKitReplayPlanBuilder::new(mode, selected_variants);
+    let mut builder = CanvasKitReplayPlanBuilder::new(mode, tree.profile, selected_variants);
     builder.visit_node(&tree.root, "root", None);
     let text_variants = variant_reports
         .into_iter()
@@ -226,6 +233,7 @@ struct SelectedTextVariant {
 struct CanvasKitReplayPlanBuilder {
     mode: CanvasKitReplayMode,
     policy: CanvasKitReplayPolicy,
+    profile: RenderProfile,
     selected_variants: BTreeMap<String, SelectedTextVariant>,
     summary: CanvasKitReplaySummary,
     items: Vec<CanvasKitReplayItem>,
@@ -234,11 +242,13 @@ struct CanvasKitReplayPlanBuilder {
 impl CanvasKitReplayPlanBuilder {
     fn new(
         mode: CanvasKitReplayMode,
+        profile: RenderProfile,
         selected_variants: BTreeMap<String, SelectedTextVariant>,
     ) -> Self {
         Self {
             mode,
             policy: mode.policy(),
+            profile,
             selected_variants,
             summary: CanvasKitReplaySummary::default(),
             items: Vec::new(),
@@ -354,13 +364,20 @@ impl CanvasKitReplayPlanBuilder {
             PaintOp::Image {
                 image, resolved, ..
             } => self.image_item(path, image, resolved.as_deref()),
+            PaintOp::Equation { equation, .. }
+                if canvaskit_equation_layout_is_supported(&equation.layout_box) =>
+            {
+                let mut item = direct_item(path, "equation", CanvasKitReplayFeature::Equation);
+                item.detail = Some("boundedSemanticLayout".to_string());
+                item
+            }
             PaintOp::Equation { .. } => {
                 let mut item = self.transition_overlay_item(
                     path,
                     "equation",
                     CanvasKitReplayFeature::Equation,
                 );
-                item.detail = Some("unsupportedDirectReplay".to_string());
+                item.detail = Some("unsupportedSemanticLayout".to_string());
                 item
             }
             PaintOp::FormObject { .. } => {
@@ -377,10 +394,25 @@ impl CanvasKitReplayPlanBuilder {
                 item.detail = Some("unsupportedDirectReplay".to_string());
                 item
             }
-            PaintOp::Placeholder { .. } => {
+            PaintOp::Placeholder { placeholder, .. } => {
                 let mut item =
                     direct_item(path, "placeholder", CanvasKitReplayFeature::Placeholder);
-                item.detail = Some("basicStaticReplay".to_string());
+                item.detail = Some(match placeholder.kind {
+                    crate::renderer::render_tree::PlaceholderKind::Ole => {
+                        "basicStaticReplay".to_string()
+                    }
+                    crate::renderer::render_tree::PlaceholderKind::MissingPicture
+                        if matches!(
+                            self.profile,
+                            RenderProfile::Print | RenderProfile::HighQuality
+                        ) =>
+                    {
+                        "missingPictureSuppressedPrintEquivalent".to_string()
+                    }
+                    crate::renderer::render_tree::PlaceholderKind::MissingPicture => {
+                        "missingPictureEditorVisual".to_string()
+                    }
+                });
                 item
             }
             PaintOp::TextRun { run, .. } => self.text_run_item(path, run),
@@ -572,6 +604,131 @@ fn direct_item(
     }
 }
 
+fn canvaskit_equation_layout_is_supported(layout: &LayoutBox) -> bool {
+    const MAX_DEPTH: usize = 64;
+    const MAX_NODES: usize = 4096;
+    const MAX_TEXT_UTF16_UNITS: usize = 4096;
+
+    fn visit(
+        layout: &LayoutBox,
+        depth: usize,
+        remaining_nodes: &mut usize,
+        max_text_utf16_units: usize,
+    ) -> bool {
+        if depth > MAX_DEPTH
+            || *remaining_nodes == 0
+            || ![
+                layout.x,
+                layout.y,
+                layout.width,
+                layout.height,
+                layout.baseline,
+            ]
+            .into_iter()
+            .all(f64::is_finite)
+            || layout.width < 0.0
+            || layout.height < 0.0
+        {
+            return false;
+        }
+        *remaining_nodes -= 1;
+
+        let text_supported =
+            |text: &str| !text.is_empty() && text.encode_utf16().count() <= max_text_utf16_units;
+        let child = |child: &LayoutBox, remaining_nodes: &mut usize| {
+            visit(child, depth + 1, remaining_nodes, max_text_utf16_units)
+        };
+        match &layout.kind {
+            LayoutKind::Row(children) => children.iter().all(|item| child(item, remaining_nodes)),
+            LayoutKind::Text(text)
+            | LayoutKind::Number(text)
+            | LayoutKind::Symbol(text)
+            | LayoutKind::MathSymbol(text)
+            | LayoutKind::Function(text) => text_supported(text),
+            LayoutKind::Fraction { numer, denom } => {
+                child(numer, remaining_nodes) && child(denom, remaining_nodes)
+            }
+            LayoutKind::Atop { top, bottom } => {
+                child(top, remaining_nodes) && child(bottom, remaining_nodes)
+            }
+            LayoutKind::Sqrt { index, body } => {
+                index
+                    .as_deref()
+                    .is_none_or(|item| child(item, remaining_nodes))
+                    && child(body, remaining_nodes)
+            }
+            LayoutKind::Superscript { base, sup } => {
+                child(base, remaining_nodes) && child(sup, remaining_nodes)
+            }
+            LayoutKind::Subscript { base, sub } => {
+                child(base, remaining_nodes) && child(sub, remaining_nodes)
+            }
+            LayoutKind::SubSup { base, sub, sup } => {
+                child(base, remaining_nodes)
+                    && child(sub, remaining_nodes)
+                    && child(sup, remaining_nodes)
+            }
+            LayoutKind::BigOp { symbol, sub, sup } => {
+                text_supported(symbol)
+                    && sub
+                        .as_deref()
+                        .is_none_or(|item| child(item, remaining_nodes))
+                    && sup
+                        .as_deref()
+                        .is_none_or(|item| child(item, remaining_nodes))
+            }
+            LayoutKind::Limit { sub, .. } => sub
+                .as_deref()
+                .is_none_or(|item| child(item, remaining_nodes)),
+            LayoutKind::Matrix { cells, .. } => cells
+                .iter()
+                .flatten()
+                .all(|item| child(item, remaining_nodes)),
+            LayoutKind::Rel { arrow, over, under } => {
+                child(over, remaining_nodes)
+                    && child(arrow, remaining_nodes)
+                    && under
+                        .as_deref()
+                        .is_none_or(|item| child(item, remaining_nodes))
+            }
+            LayoutKind::EqAlign { rows } => rows
+                .iter()
+                .all(|(left, right)| child(left, remaining_nodes) && child(right, remaining_nodes)),
+            LayoutKind::Paren { left, right, body } => {
+                (left.is_empty() || text_supported(left))
+                    && (right.is_empty() || text_supported(right))
+                    && child(body, remaining_nodes)
+            }
+            LayoutKind::Decoration { kind, body } => {
+                matches!(
+                    kind,
+                    DecoKind::Hat
+                        | DecoKind::Dot
+                        | DecoKind::DDot
+                        | DecoKind::Bar
+                        | DecoKind::Vec
+                        | DecoKind::Dyad
+                        | DecoKind::Under
+                        | DecoKind::Underline
+                        | DecoKind::Overline
+                        | DecoKind::StrikeThrough
+                ) && child(body, remaining_nodes)
+            }
+            LayoutKind::FontStyle { style, body } => {
+                matches!(
+                    style,
+                    FontStyleKind::Roman | FontStyleKind::Italic | FontStyleKind::Bold
+                ) && child(body, remaining_nodes)
+            }
+            LayoutKind::Space(width) => width.is_finite(),
+            LayoutKind::Newline | LayoutKind::Empty => true,
+        }
+    }
+
+    let mut remaining_nodes = MAX_NODES;
+    visit(layout, 0, &mut remaining_nodes, MAX_TEXT_UTF16_UNITS)
+}
+
 fn paint_op_type(op: &PaintOp) -> &'static str {
     match op {
         PaintOp::PageBackground { .. } => "pageBackground",
@@ -646,17 +803,20 @@ fn text_run_transition_detail(run: &TextRunNode) -> Option<&'static str> {
     if run.style.engrave {
         return Some("engraveTextEffect");
     }
-    if run.style.superscript {
-        return Some("superscriptTextEffect");
-    }
-    if run.style.subscript {
-        return Some("subscriptTextEffect");
-    }
     if run.style.shade_color != 0x00FF_FFFF {
         return Some("shadeTextEffect");
     }
     if (run.style.ratio - 1.0).abs() > f64::EPSILON {
         return Some("ratioTextEffect");
+    }
+    if run.style.superscript || run.style.subscript {
+        let display_text = expand_pua_display_text(&run.text);
+        if !display_text
+            .bytes()
+            .all(|byte| (0x20..=0x7e).contains(&byte))
+        {
+            return Some("scriptTextRequiresShaping");
+        }
     }
     None
 }
@@ -790,6 +950,7 @@ mod tests {
     use crate::model::control::FormType;
     use crate::model::style::ImageFillMode;
     use crate::paint::{GroupKind, LayerNode, ResolvedImageKind, ResolvedImagePayload};
+    use crate::renderer::composer::CharOverlapInfo;
     use crate::renderer::equation::layout::{LayoutBox, LayoutKind};
     use crate::renderer::render_tree::{
         BoundingBox, EquationNode, FootnoteMarkerNode, FormObjectNode, ImageNode,
@@ -1129,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    fn object_fragment_replay_gaps_use_runtime_diagnostic_detail() {
+    fn equation_layout_is_direct_while_raw_svg_remains_a_replay_gap() {
         let tree = tree_with_ops(vec![
             PaintOp::equation(bbox(), equation_node()),
             PaintOp::raw_svg(
@@ -1140,12 +1301,13 @@ mod tests {
 
         let plan = analyze_canvaskit_replay_plan(&tree, CanvasKitReplayMode::Default);
 
-        assert_eq!(plan.summary.direct_required_items, 2);
+        assert_eq!(plan.summary.direct_items, 1);
+        assert_eq!(plan.summary.direct_required_items, 1);
         assert_eq!(plan.items[0].op_type, "equation");
         assert_eq!(plan.items[0].feature, CanvasKitReplayFeature::Equation);
         assert_eq!(
             plan.items[0].detail.as_deref(),
-            Some("unsupportedDirectReplay")
+            Some("boundedSemanticLayout")
         );
         assert_eq!(plan.items[1].op_type, "rawSvg");
         assert_eq!(
@@ -1155,6 +1317,33 @@ mod tests {
         assert_eq!(
             plan.items[1].detail.as_deref(),
             Some("unsupportedDirectReplay")
+        );
+    }
+
+    #[test]
+    fn unsupported_equation_styles_are_not_reported_as_direct() {
+        let mut equation = equation_node();
+        equation.layout_box.kind = LayoutKind::FontStyle {
+            style: FontStyleKind::Blackboard,
+            body: Box::new(LayoutBox {
+                x: 0.0,
+                y: 0.0,
+                width: 8.0,
+                height: 12.0,
+                baseline: 10.0,
+                kind: LayoutKind::Text("x".to_string()),
+            }),
+        };
+        let tree = tree_with_ops(vec![PaintOp::equation(bbox(), equation)]);
+
+        let plan = analyze_canvaskit_replay_plan(&tree, CanvasKitReplayMode::Default);
+
+        assert_eq!(plan.summary.direct_items, 0);
+        assert_eq!(plan.summary.direct_required_items, 1);
+        assert_eq!(plan.summary.hidden_overlay_violations, 1);
+        assert_eq!(
+            plan.items[0].detail.as_deref(),
+            Some("unsupportedSemanticLayout")
         );
     }
 
@@ -1177,34 +1366,64 @@ mod tests {
         ]);
 
         let default_plan = analyze_canvaskit_replay_plan(&tree, CanvasKitReplayMode::Default);
-        assert_eq!(default_plan.summary.direct_items, 2);
-        assert_eq!(default_plan.summary.direct_required_items, 3);
+        assert_eq!(default_plan.summary.direct_items, 4);
+        assert_eq!(default_plan.summary.direct_required_items, 1);
         assert_eq!(
             default_plan.items[2].detail.as_deref(),
             Some("verticalText")
         );
-        assert_eq!(
-            default_plan.items[3].detail.as_deref(),
-            Some("superscriptTextEffect")
-        );
-        assert_eq!(
-            default_plan.items[4].detail.as_deref(),
-            Some("subscriptTextEffect")
-        );
+        assert_eq!(default_plan.items[3].status, CanvasKitReplayStatus::Direct);
+        assert_eq!(default_plan.items[4].status, CanvasKitReplayStatus::Direct);
 
         let compat_plan = analyze_canvaskit_replay_plan(&tree, CanvasKitReplayMode::Compat);
-        assert_eq!(compat_plan.summary.direct_items, 2);
-        assert_eq!(compat_plan.summary.direct_required_items, 3);
+        assert_eq!(compat_plan.summary.direct_items, 4);
+        assert_eq!(compat_plan.summary.direct_required_items, 1);
         assert_eq!(compat_plan.summary.compat_overlay_items, 0);
         assert_eq!(compat_plan.items[2].detail.as_deref(), Some("verticalText"));
-        assert_eq!(
-            compat_plan.items[3].detail.as_deref(),
-            Some("superscriptTextEffect")
-        );
-        assert_eq!(
-            compat_plan.items[4].detail.as_deref(),
-            Some("subscriptTextEffect")
-        );
+        assert_eq!(compat_plan.items[3].status, CanvasKitReplayStatus::Direct);
+        assert_eq!(compat_plan.items[4].status, CanvasKitReplayStatus::Direct);
+    }
+
+    #[test]
+    fn superscript_with_char_overlap_stays_policy_visible() {
+        let mut superscript = text_run("AB");
+        superscript.style.superscript = true;
+        superscript.char_overlap = Some(CharOverlapInfo {
+            border_type: 0,
+            inner_char_size: 100,
+        });
+        let tree = tree_with_ops(vec![PaintOp::text_run(bbox(), superscript)]);
+
+        for mode in [CanvasKitReplayMode::Default, CanvasKitReplayMode::Compat] {
+            let plan = analyze_canvaskit_replay_plan(&tree, mode);
+            assert_eq!(plan.summary.direct_required_items, 1);
+            assert_eq!(plan.items[0].status, CanvasKitReplayStatus::DirectRequired);
+            assert_eq!(plan.items[0].detail.as_deref(), Some("charOverlap"));
+        }
+    }
+
+    #[test]
+    fn shaped_script_text_stays_policy_visible() {
+        for text in ["가", "e\u{0301}", "\u{F012B}"] {
+            let mut superscript = text_run(text);
+            superscript.style.superscript = true;
+            let tree = tree_with_ops(vec![PaintOp::text_run(bbox(), superscript)]);
+
+            for mode in [CanvasKitReplayMode::Default, CanvasKitReplayMode::Compat] {
+                let plan = analyze_canvaskit_replay_plan(&tree, mode);
+                assert_eq!(plan.summary.direct_required_items, 1, "text={text:?}");
+                assert_eq!(
+                    plan.items[0].status,
+                    CanvasKitReplayStatus::DirectRequired,
+                    "text={text:?}"
+                );
+                assert_eq!(
+                    plan.items[0].detail.as_deref(),
+                    Some("scriptTextRequiresShaping"),
+                    "text={text:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1284,6 +1503,34 @@ mod tests {
                 .map(|item| item.detail.as_deref())
                 .collect::<Vec<_>>(),
             vec![Some("basicStaticReplay"), Some("basicStaticReplay")]
+        );
+    }
+
+    #[test]
+    fn missing_picture_policy_tracks_editor_and_print_equivalent_profiles() {
+        let op = PaintOp::placeholder(
+            bbox(),
+            PlaceholderNode::missing_picture(None, None, None, None),
+        );
+        let screen = analyze_canvaskit_replay_plan(
+            &tree_with_ops(vec![op.clone()]),
+            CanvasKitReplayMode::Default,
+        );
+        let print_tree = PageLayerTree::with_profile(
+            100.0,
+            100.0,
+            LayerNode::leaf(bbox(), None, vec![op]),
+            RenderProfile::Print,
+        );
+        let print = analyze_canvaskit_replay_plan(&print_tree, CanvasKitReplayMode::Default);
+
+        assert_eq!(
+            screen.items[0].detail.as_deref(),
+            Some("missingPictureEditorVisual")
+        );
+        assert_eq!(
+            print.items[0].detail.as_deref(),
+            Some("missingPictureSuppressedPrintEquivalent")
         );
     }
 
