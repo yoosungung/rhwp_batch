@@ -357,12 +357,13 @@ impl<'a> Converter<'a> {
         let height_mm = hwp_unit_to_mm(pic.common.height);
 
         // 이미지 데이터 추출 및 asset 등록
+        // rhwp v0.7.19+: BinDataBytes는 Lazy/Loaded — load()로 바이트를 한 번만 확보한다.
         if !self.assets.contains_key(&asset_ref) {
             if let Some(content) = self.find_bin_content(bin_data_id) {
                 let mime = mime_from_ext(&content.extension).to_string();
-                let sha256 = sha256_hex(&content.data);
-                let byte_size = content.data.len();
-                let data = content.data.clone();
+                let data = content.data.load();
+                let sha256 = sha256_hex(&data);
+                let byte_size = data.len();
                 let ext = content.extension.clone();
 
                 let asset = match self.opts.image_mode {

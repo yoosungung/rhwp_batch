@@ -1,7 +1,7 @@
 use super::*;
 use crate::model::document::{Document, Section};
 use crate::model::paragraph::{LineSeg, Paragraph};
-use crate::paint::LAYER_TREE_SCHEMA;
+use crate::paint::{RenderProfile, LAYER_TREE_SCHEMA};
 use crate::parser::control::parse_common_obj_attr;
 use serde_json::Value;
 
@@ -1497,6 +1497,23 @@ fn test_page_layer_tree_export_uses_schema_contract() {
 }
 
 #[test]
+fn test_page_layer_tree_export_uses_requested_profile() {
+    let doc = HwpDocument::create_empty();
+    for (profile, expected) in [
+        (RenderProfile::FastPreview, "fastPreview"),
+        (RenderProfile::Screen, "screen"),
+        (RenderProfile::Print, "print"),
+        (RenderProfile::HighQuality, "highQuality"),
+    ] {
+        let json = doc
+            .get_page_layer_tree_with_profile_native(0, profile)
+            .expect("profiled layer tree should export");
+        let parsed: Value = serde_json::from_str(&json).expect("PageLayerTree JSON");
+        assert_eq!(parsed["profile"].as_str(), Some(expected));
+    }
+}
+
+#[test]
 fn test_page_layer_tree_export_preserves_output_options() {
     let mut doc = HwpDocument::create_empty();
     doc.set_show_paragraph_marks(true);
@@ -1864,12 +1881,137 @@ fn test_insert_text_in_cell() {
     let json = result.unwrap();
     assert!(json.contains("\"ok\":true"));
     assert!(json.contains("\"charOffset\":3"));
+    assert!(
+        !json.contains("cellFlowChanged"),
+        "immediate insert response schema must remain unchanged"
+    );
 
     if let Some(Control::Table(table)) = doc.document.sections[0].paragraphs[0].controls.first() {
         assert_eq!(table.cells[0].paragraphs[0].text, "셀추가A");
     } else {
         panic!("표 컨트롤을 찾을 수 없음");
     }
+}
+
+#[test]
+fn issue2214_deferred_table_caption_reports_flow_change() {
+    use crate::model::shape::{Caption, CaptionDirection};
+
+    fn caption_paragraph(doc: &HwpDocument) -> &Paragraph {
+        match &doc.document.sections[0].paragraphs[0].controls[0] {
+            Control::Table(table) => &table.caption.as_ref().expect("table caption").paragraphs[0],
+            other => panic!("table control expected: {other:?}"),
+        }
+    }
+
+    fn relative_flow(paragraph: &Paragraph) -> Option<i64> {
+        let first = paragraph.line_segs.first()?;
+        let last = paragraph.line_segs.last()?;
+        Some(
+            i64::from(last.vertical_pos)
+                + i64::from(last.line_height)
+                + i64::from(last.line_spacing)
+                - i64::from(first.vertical_pos),
+        )
+    }
+
+    let mut doc = create_doc_with_table();
+    match &mut doc.document.sections[0].paragraphs[0].controls[0] {
+        Control::Table(table) => {
+            table.caption = Some(Caption {
+                direction: CaptionDirection::Bottom,
+                width: 2_000,
+                max_width: 2_000,
+                paragraphs: vec![Paragraph {
+                    text: "가".to_string(),
+                    char_count: 1,
+                    char_offsets: make_char_offsets("가"),
+                    line_segs: vec![LineSeg {
+                        line_height: 400,
+                        baseline_distance: 320,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        }
+        other => panic!("table control expected: {other:?}"),
+    }
+    doc.reflow_cell_paragraph(0, 0, 0, 65534, 0);
+
+    let mut saw_boundary = false;
+    for inserted in 0..32 {
+        let before = relative_flow(caption_paragraph(&doc));
+        let raw = doc
+            .insert_text_in_cell_native_deferred_pagination(0, 0, 0, 65534, 0, 1 + inserted, "가")
+            .expect("deferred caption insert");
+        let after = relative_flow(caption_paragraph(&doc));
+        let result: Value = serde_json::from_str(&raw).expect("caption edit result json");
+        let reported = result["cellFlowChanged"]
+            .as_bool()
+            .expect("caption flow result");
+        assert_eq!(
+            reported,
+            before != after,
+            "caption input {} flow signal",
+            inserted + 1
+        );
+        if reported {
+            saw_boundary = true;
+            assert!(
+                caption_paragraph(&doc).line_segs.len() > 1,
+                "caption flow boundary must add a line"
+            );
+            break;
+        }
+    }
+    assert!(
+        saw_boundary,
+        "caption deferred input must report a wrapping flow boundary"
+    );
+}
+
+#[test]
+fn issue2214_invalid_shape_cell_index_does_not_mutate_text() {
+    let mut doc = HwpDocument::create_empty();
+    let inserted = doc
+        .create_shape_control_native(
+            0,
+            0,
+            0,
+            21_600,
+            7_200,
+            0,
+            0,
+            true,
+            "TopAndBottom",
+            "textbox",
+            false,
+            false,
+            &[],
+        )
+        .expect("create textbox shape");
+    let inserted: Value = serde_json::from_str(&inserted).expect("shape result json");
+    let para_idx = inserted["paraIdx"].as_u64().expect("shape paraIdx") as usize;
+    let control_idx = inserted["controlIdx"].as_u64().expect("shape controlIdx") as usize;
+    let before = doc
+        .get_cell_paragraph_ref(0, para_idx, control_idx, 0, 0)
+        .expect("textbox paragraph")
+        .text
+        .clone();
+
+    let result =
+        doc.insert_text_in_cell_native_deferred_pagination(0, para_idx, control_idx, 1, 0, 0, "x");
+
+    assert!(result.is_err(), "nonzero Shape cell index must fail");
+    assert_eq!(
+        doc.get_cell_paragraph_ref(0, para_idx, control_idx, 0, 0)
+            .expect("textbox paragraph after invalid call")
+            .text,
+        before,
+        "invalid Shape cell index must fail before mutation"
+    );
 }
 
 #[test]
@@ -3343,7 +3485,7 @@ fn test_web_saved_vs_original_detailed() {
         let saved_bc = saved_doc.bin_data_content.iter().find(|c| c.id == bc.id);
         match saved_bc {
             Some(sbc) => {
-                if bc.data.len() == sbc.data.len() && bc.data == sbc.data {
+                if bc.data.len() == sbc.data.len() && bc.data.load() == sbc.data.load() {
                     eprintln!(
                         "  ID {}: 동일 ({}B, ext={})",
                         bc.id,
@@ -14885,7 +15027,7 @@ fn test_analyze_reference_picture() {
             bc.data.len()
         );
         if bc.data.len() >= 8 {
-            let sig = &bc.data[..8];
+            let sig = &bc.data.load()[..8];
             let format = if sig[0..2] == [0xFF, 0xD8] {
                 "JPEG"
             } else if sig[0..4] == [0x89, 0x50, 0x4E, 0x47] {
@@ -23507,12 +23649,8 @@ fn test_create_inline_tac_table() {
     // is_tac_table_inline 확인
     let seg_w = para.line_segs.first().map(|s| s.segment_width).unwrap_or(0);
     if let crate::model::control::Control::Table(t) = &para.controls[0] {
-        let is_inline = crate::renderer::height_measurer::is_tac_table_inline(
-            t,
-            seg_w,
-            &para.text,
-            &para.controls,
-        );
+        let is_inline =
+            crate::renderer::height_measurer::is_tac_table_inline_in_para(t, seg_w, para);
         eprintln!("  is_tac_table_inline: {} (seg_w={})", is_inline, seg_w);
         assert!(is_inline, "인라인 TAC 표로 판별되어야 함");
     }
@@ -23611,6 +23749,260 @@ fn test_create_blank_document_clears_previous_hwpx_validation_warnings() {
         "새 문서는 이전 HWPX warning을 물려받으면 안 됨: {after}"
     );
     assert_eq!(doc.get_source_format(), "hwp");
+}
+
+#[test]
+fn test_hml_source_format_is_reported_without_reusing_hwp_save_path() {
+    let bytes = br#"<?xml version="1.0" encoding="UTF-8"?>
+<HWPML Style="embed" SubVersion="9.0.1.0" Version="2.9">
+  <HEAD SecCnt="1" />
+  <BODY><SECTION Id="0"><P ParaShape="0" Style="0"><TEXT CharShape="0"><CHAR>HML</CHAR></TEXT></P></SECTION></BODY>
+  <TAIL />
+</HWPML>"#;
+    let doc = HwpDocument::new(bytes).expect("HML 문서를 열어야 한다");
+
+    assert_eq!(doc.get_source_format(), "hml");
+}
+
+#[test]
+fn test_hml_save_state_is_one_canonical_dto_for_hml_non_hml_and_unknown_equation() {
+    let lawful = br#"<HWPML Version="2.91"><HEAD/><BODY><SECTION><P><TEXT><CHAR>ok</CHAR></TEXT></P></SECTION></BODY><TAIL/></HWPML>"#;
+    let mut doc = HwpDocument::new(lawful).expect("lawful HML");
+    let state: Value = serde_json::from_str(&doc.get_hml_save_state()).expect("save state JSON");
+    assert_eq!(
+        state,
+        serde_json::json!({
+            "sourceFormat": "hml",
+            "hmlSavable": true,
+            "blockers": [],
+        })
+    );
+
+    doc.create_blank_document_native()
+        .expect("non-HML blank document");
+    let state: Value = serde_json::from_str(&doc.get_hml_save_state()).expect("save state JSON");
+    assert_eq!(
+        state,
+        serde_json::json!({
+            "sourceFormat": "hwp",
+            "hmlSavable": false,
+            "blockers": [{
+                "code": "HML_SOURCE_REQUIRED",
+                "xmlPath": "/HWPML",
+                "message": "HML 원본 문서만 HML로 저장할 수 있습니다",
+                "preserved": false,
+            }],
+        })
+    );
+
+    let unknown = br#"<HWPML Version="2.91"><HEAD/><BODY><SECTION><P><TEXT><EQUATION FutureAttr="1"><SCRIPT>x</SCRIPT><FUTURE/></EQUATION></TEXT></P></SECTION></BODY><TAIL/></HWPML>"#;
+    let doc = HwpDocument::new(unknown).expect("unknown equation semantics remain readable");
+    let state: Value = serde_json::from_str(&doc.get_hml_save_state()).expect("save state JSON");
+    assert_eq!(state["hmlSavable"], false);
+    assert_eq!(state["sourceFormat"], "hml");
+    assert_eq!(state["blockers"].as_array().map(Vec::len), Some(2));
+    for blocker in state["blockers"].as_array().unwrap() {
+        assert_eq!(blocker["code"], "HML_UNSUPPORTED_EQUATION_SEMANTICS");
+        assert_eq!(blocker["preserved"], false);
+    }
+}
+
+#[test]
+fn test_unknown_equation_values_survive_edit_undo_redo_and_save_state() {
+    let unknown = br#"<HWPML Version="2.91"><HEAD/><BODY><SECTION><P><TEXT><EQUATION><SCRIPT>x</SCRIPT><FUTURE Mode="matrix&amp;inline">secret &lt; value</FUTURE></EQUATION></TEXT></P></SECTION></BODY><TAIL/></HWPML>"#;
+    let mut doc = HwpDocument::new(unknown).expect("unknown equation semantics remain readable");
+    let before_snapshot = doc.save_snapshot_native();
+
+    doc.set_equation_properties_native(0, 0, 0, None, None, r#"{"script":"x^2 + 2"}"#)
+        .expect("equation edit should apply");
+    let after_snapshot = doc.save_snapshot_native();
+
+    let assert_values = |doc: &HwpDocument| {
+        let state: Value =
+            serde_json::from_str(&doc.get_hml_save_state()).expect("save state JSON");
+        let blockers = state["blockers"].as_array().expect("blocker array");
+        assert!(blockers.iter().any(|blocker| {
+            blocker["xmlPath"] == "/HWPML/BODY/SECTION/P/TEXT/EQUATION/FUTURE/@Mode"
+                && blocker["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Mode=matrix&inline"))
+                && blocker["preserved"] == false
+        }));
+        assert!(blockers.iter().any(|blocker| {
+            blocker["xmlPath"] == "/HWPML/BODY/SECTION/P/TEXT/EQUATION/FUTURE/#text"
+                && blocker["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("#text=secret < value"))
+                && blocker["preserved"] == false
+        }));
+    };
+
+    assert_values(&doc);
+    doc.restore_snapshot_native(before_snapshot)
+        .expect("undo snapshot should restore");
+    assert_values(&doc);
+    doc.restore_snapshot_native(after_snapshot)
+        .expect("redo snapshot should restore");
+    assert_values(&doc);
+}
+
+#[test]
+fn test_hml_open_metadata_exposes_import_warnings() {
+    let bytes = include_bytes!("../../samples/hml/formatting_table.hml");
+    let doc = HwpDocument::new(bytes).expect("real HML fixture should open");
+    let metadata: Value =
+        serde_json::from_str(&doc.get_hml_open_metadata()).expect("HML metadata JSON");
+
+    assert_eq!(metadata["format"], "hml");
+    assert_eq!(metadata["hwpmlVersion"], "2.91");
+    assert_eq!(metadata["encoding"], "utf-8");
+    assert_eq!(metadata["resourceCount"], 0);
+    assert_eq!(metadata["hmlSavable"], true);
+    assert_eq!(metadata["saveBlockers"], serde_json::json!([]));
+    assert!(metadata["warnings"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|warning| warning["xmlPath"] == "/HWPML/TAIL/SCRIPTCODE")
+    }));
+}
+
+#[test]
+fn test_hml_open_metadata_escapes_special_characters_as_valid_json() {
+    let bytes = include_bytes!("../../samples/hml/formatting_table.hml");
+    let mut doc = HwpDocument::new(bytes).expect("real HML fixture should open");
+    let special = "2.91\"\\\n한글\t";
+    let metadata = doc
+        .core
+        .hml_metadata
+        .as_mut()
+        .expect("HML metadata should exist");
+    metadata.hwpml_version = Some(special.to_string());
+    metadata.warnings[0].message = special.to_string();
+
+    let json: Value = serde_json::from_str(&doc.get_hml_open_metadata())
+        .expect("metadata must remain valid JSON");
+
+    assert_eq!(json["hwpmlVersion"], special);
+    assert_eq!(json["warnings"][0]["message"], special);
+}
+
+#[test]
+fn test_export_hml_binding_preserves_edit_and_fragment() {
+    let bytes = include_bytes!("../../samples/hml/formatting_table.hml");
+    let mut doc = HwpDocument::new(bytes).expect("real HML fixture should open");
+    let (section_index, paragraph_index) = doc
+        .document()
+        .sections
+        .iter()
+        .enumerate()
+        .find_map(|(section_index, section)| {
+            section
+                .paragraphs
+                .iter()
+                .position(|paragraph| !paragraph.text.is_empty())
+                .map(|paragraph_index| (section_index, paragraph_index))
+        })
+        .expect("fixture should contain text");
+    doc.insert_text_native(section_index, paragraph_index, 0, "WASM_EDIT_")
+        .expect("apply public edit");
+
+    let exported = doc.export_hml().expect("exportHml should succeed");
+
+    assert_eq!(
+        crate::parser::detect_format(&exported),
+        crate::parser::FileFormat::Hml
+    );
+    assert!(String::from_utf8_lossy(&exported).contains("<SCRIPTCODE"));
+    let reparsed = DocumentCore::from_bytes(&exported).expect("exportHml output should reparse");
+    assert!(
+        reparsed.document().sections[section_index].paragraphs[paragraph_index]
+            .text
+            .starts_with("WASM_EDIT_")
+    );
+}
+
+#[test]
+fn test_export_hml_error_message_exposes_blocker_codes() {
+    let fixture = std::str::from_utf8(include_bytes!("../../samples/hml/formatting_table.hml"))
+        .expect("fixture is UTF-8");
+    let lossy = fixture.replacen("Type=\"None\"", "Type=\"Dash\"", 1);
+    let doc = HwpDocument::new(lossy.as_bytes()).expect("lossy HML should import");
+    let error = doc
+        .core
+        .export_hml_native()
+        .expect_err("lossy import must block exportHml");
+    let blocker = &error.blockers()[0];
+
+    let message = super::format_hml_export_error(&error);
+
+    assert!(message.contains(blocker.code), "{message}");
+    assert!(message.contains(&blocker.xml_path), "{message}");
+    assert!(message.contains(&blocker.message), "{message}");
+}
+
+#[test]
+fn test_hml_open_metadata_uses_shared_preflight_for_import_and_ir_loss() {
+    let fixture = std::str::from_utf8(include_bytes!("../../samples/hml/formatting_table.hml"))
+        .expect("fixture is UTF-8");
+    let lossy = fixture.replacen("Type=\"None\"", "Type=\"Dash\"", 1);
+    let import_loss = HwpDocument::new(lossy.as_bytes()).expect("lossy HML should import");
+    let import_json: Value =
+        serde_json::from_str(&import_loss.get_hml_open_metadata()).expect("metadata JSON");
+    assert_eq!(import_json["hmlSavable"], false);
+    assert!(import_json["saveBlockers"]
+        .as_array()
+        .is_some_and(|blockers| {
+            blockers.iter().any(|blocker| {
+                blocker["code"] == "UNSUPPORTED_ATTRIBUTE"
+                    && blocker["xmlPath"]
+                        == "/HWPML/HEAD/MAPPINGTABLE/BORDERFILLLIST/BORDERFILL/LEFTBORDER"
+                    && blocker["message"]
+                        .as_str()
+                        .is_some_and(|message| !message.is_empty())
+            })
+        }));
+
+    let mut edited_ir = HwpDocument::new(fixture.as_bytes()).expect("lawful HML should import");
+    edited_ir.document_mut().sections[0].paragraphs[0].column_type =
+        crate::model::paragraph::ColumnBreakType::Section;
+    let ir_json: Value =
+        serde_json::from_str(&edited_ir.get_hml_open_metadata()).expect("metadata JSON");
+    assert_eq!(ir_json["hmlSavable"], false);
+    assert!(ir_json["saveBlockers"].as_array().is_some_and(|blockers| {
+        blockers.iter().any(|blocker| {
+            blocker["code"] == "HML_UNSUPPORTED_IR"
+                && blocker["xmlPath"]
+                    .as_str()
+                    .is_some_and(|path| !path.is_empty())
+                && blocker["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty())
+        })
+    }));
+}
+
+#[test]
+fn test_hml_open_metadata_reports_mixed_import_and_ir_loss() {
+    let fixture = std::str::from_utf8(include_bytes!("../../samples/hml/formatting_table.hml"))
+        .expect("fixture is UTF-8");
+    let lossy = fixture.replacen("Type=\"None\"", "Type=\"Dash\"", 1);
+    let mut doc = HwpDocument::new(lossy.as_bytes()).expect("lossy HML should import");
+    doc.document_mut().sections[0].paragraphs[0].column_type =
+        crate::model::paragraph::ColumnBreakType::Section;
+
+    let metadata: Value =
+        serde_json::from_str(&doc.get_hml_open_metadata()).expect("metadata JSON");
+    let blockers = metadata["saveBlockers"]
+        .as_array()
+        .expect("save blockers array");
+
+    assert_eq!(metadata["hmlSavable"], false);
+    assert!(blockers
+        .iter()
+        .any(|blocker| blocker["code"] == "UNSUPPORTED_ATTRIBUTE"));
+    assert!(blockers
+        .iter()
+        .any(|blocker| blocker["code"] == "HML_UNSUPPORTED_IR"));
 }
 
 #[test]
@@ -24036,4 +24428,360 @@ fn task1413_evaluate_table_formula_ex_equivalent() {
         r#"{"sectionIdx":0,"parentParaIdx":0,"controlIdx":0,"targetRow":0,"targetCol":0,"formula":"=1+1","writeResult":false}"#,
     );
     assert_eq!(format!("{rp:?}"), format!("{re:?}"));
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Issue2214TargetCut {
+    page_index: u32,
+    start_row: usize,
+    end_row: usize,
+    is_continuation: bool,
+    start_cut: Vec<usize>,
+    end_cut: Vec<usize>,
+    is_block_split: bool,
+}
+
+fn issue2214_target_cuts(doc: &HwpDocument) -> Vec<Issue2214TargetCut> {
+    use crate::renderer::pagination::PageItem;
+
+    let pages = doc
+        .core
+        .pagination
+        .iter()
+        .flat_map(|section| section.pages.iter())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pages.len(),
+        doc.page_count() as usize,
+        "pagination page coverage"
+    );
+    pages
+        .into_iter()
+        .enumerate()
+        .map(|(global_page, page)| {
+            assert_eq!(page.section_index, 0, "#2214 target section");
+            assert_eq!(
+                page.page_index as usize, global_page,
+                "#2214 global page index"
+            );
+            let matches = page
+                .column_contents
+                .iter()
+                .flat_map(|column| column.items.iter())
+                .filter_map(|item| match item {
+                    PageItem::PartialTable {
+                        para_index: 0,
+                        control_index: 2,
+                        start_row,
+                        end_row,
+                        is_continuation,
+                        start_cut,
+                        end_cut,
+                        is_block_split,
+                    } => Some(Issue2214TargetCut {
+                        page_index: page.page_index,
+                        start_row: *start_row,
+                        end_row: *end_row,
+                        is_continuation: *is_continuation,
+                        start_cut: start_cut.clone(),
+                        end_cut: end_cut.clone(),
+                        is_block_split: *is_block_split,
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matches.len(),
+                1,
+                "page {global_page}: exactly one target PartialTable fragment"
+            );
+            matches.into_iter().next().expect("one target fragment")
+        })
+        .collect()
+}
+
+fn issue2214_assert_cut_continuity(label: &str, state: &str, cuts: &[Issue2214TargetCut]) {
+    assert_eq!(cuts.len(), 115, "{label} {state}: target page coverage");
+    assert!(!cuts[0].is_continuation, "{label} {state}: first fragment");
+    assert!(
+        cuts[0].start_cut.is_empty(),
+        "{label} {state}: first fragment starts at row origin"
+    );
+    assert!(
+        cuts.last().expect("last target cut").end_cut.is_empty(),
+        "{label} {state}: final fragment consumes the target table"
+    );
+    assert!(
+        cuts.iter().all(|cut| !cut.is_block_split),
+        "{label} {state}: #2214 fixture must remain a non-block split chain"
+    );
+    for cut in cuts {
+        assert!(
+            cut.start_row < cut.end_row,
+            "{label} {state}: page {} row range must advance",
+            cut.page_index
+        );
+        if cut.start_row + 1 == cut.end_row && !cut.start_cut.is_empty() && !cut.end_cut.is_empty()
+        {
+            assert_eq!(
+                cut.start_cut.len(),
+                cut.end_cut.len(),
+                "{label} {state}: page {} cut arity",
+                cut.page_index
+            );
+            assert!(
+                cut.start_cut
+                    .iter()
+                    .zip(&cut.end_cut)
+                    .all(|(start, end)| end >= start),
+                "{label} {state}: page {} cut components must not rewind",
+                cut.page_index
+            );
+            assert!(
+                cut.start_cut
+                    .iter()
+                    .zip(&cut.end_cut)
+                    .any(|(start, end)| end > start),
+                "{label} {state}: page {} cut must consume at least one unit",
+                cut.page_index
+            );
+        }
+    }
+    for (page, pair) in cuts.windows(2).enumerate() {
+        assert!(
+            pair[1].is_continuation,
+            "{label} {state}: page {} must be a continuation",
+            page + 1
+        );
+        if pair[0].end_cut.is_empty() {
+            assert!(
+                pair[1].start_cut.is_empty(),
+                "{label} {state}: page {} row boundary must restart without a cut",
+                page + 1
+            );
+            assert_eq!(
+                pair[1].start_row,
+                pair[0].end_row,
+                "{label} {state}: page {} row boundary must be contiguous",
+                page + 1
+            );
+        } else {
+            assert_eq!(
+                pair[0].end_cut,
+                pair[1].start_cut,
+                "{label} {state}: page {} end_cut must equal page {} start_cut",
+                page,
+                page + 1
+            );
+            assert_eq!(
+                pair[1].start_row,
+                pair[0].end_row - 1,
+                "{label} {state}: page {} split row must continue",
+                page + 1
+            );
+        }
+    }
+}
+
+/// #2214 Stage 3: scoped cache coherence는 deferred pagination geometry를 유지하면서
+/// warm tree/cursor만 최신 edit으로 복구하고, explicit flush에서만 cut/bounds를 갱신한다.
+#[test]
+fn issue2214_scoped_cache_coherence_preserves_transient_pagination() {
+    use crate::renderer::render_tree::{RenderNode, RenderNodeType};
+
+    fn target_tree_ranges(doc: &HwpDocument) -> Vec<(u32, usize, usize)> {
+        fn visit(node: &RenderNode, page: u32, ranges: &mut Vec<(u32, usize, usize)>) {
+            if let RenderNodeType::TextRun(run) = &node.node_type {
+                if let (Some(start), Some(ctx)) = (run.char_start, run.cell_context.as_ref()) {
+                    let target = ctx.parent_para_index == 0
+                        && ctx.path.len() == 1
+                        && ctx.path.first().is_some_and(|entry| {
+                            entry.control_index == 2
+                                && entry.cell_index == 2
+                                && entry.cell_para_index == 5
+                        });
+                    if target {
+                        assert!(run.char_overlap.is_none(), "target run must not overlap");
+                        assert_eq!(
+                            run.text.chars().count(),
+                            run.text.encode_utf16().count(),
+                            "fixture target run must be BMP"
+                        );
+                        let end = start + run.text.encode_utf16().count();
+                        assert!(end > start, "target run must advance");
+                        ranges.push((page, start, end));
+                    }
+                }
+            }
+            for child in &node.children {
+                visit(child, page, ranges);
+            }
+        }
+
+        let page = 0;
+        let tree = doc
+            .build_page_render_tree(page)
+            .unwrap_or_else(|e| panic!("page {page} tree: {e}"));
+        let mut ranges = Vec::new();
+        visit(&tree.root, page, &mut ranges);
+        ranges.sort_unstable_by_key(|(_, start, end)| (*start, *end));
+        assert!(!ranges.is_empty(), "target paragraph ranges");
+        let mut contiguous_end = 0;
+        for (page, start, end) in &ranges {
+            assert_eq!(
+                *start, contiguous_end,
+                "page {page}: target UTF-16 ranges must have no gap or overlap"
+            );
+            contiguous_end = *end;
+        }
+        ranges
+    }
+
+    for (label, relative) in [
+        ("hwp", "samples/issue1949_giant_cell_nested_tables_perf.hwp"),
+        (
+            "hwpx",
+            "samples/issue1949_giant_cell_nested_tables_perf.hwpx",
+        ),
+    ] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+        let bytes = std::fs::read(path).expect("read #2214 fixture");
+        let mut doc = HwpDocument::from_bytes(&bytes).expect("load #2214 fixture");
+
+        // 실제 Studio처럼 편집 전에 페이지 트리/셀 유닛을 warm한다.
+        let initial_ranges = target_tree_ranges(&doc);
+        assert_eq!(
+            initial_ranges.last().map(|(_, _, end)| *end),
+            Some(130),
+            "{label}: initial max char"
+        );
+        doc.get_cursor_rect_in_cell_native(0, 0, 2, 2, 5, 130)
+            .expect("warm target cursor");
+        let initial_cuts = issue2214_target_cuts(&doc);
+        issue2214_assert_cut_continuity(label, "initial", &initial_cuts);
+
+        // #2195 이후에도 44번째 입력은 target paragraph의 상대 flow advance를 바꾼다.
+        // 다만 선언 셀 높이가 증가분을 흡수해 full pagination의 cut/bounds는 불변이다.
+        // render_normalized warm tree는 flush 전에도 매 mutation을 즉시 반영해야 한다.
+        for inserted in 0..44 {
+            let raw = doc
+                .insert_text_in_cell_native_deferred_pagination(0, 0, 2, 2, 5, 130 + inserted, "1")
+                .expect("deferred sequential insert");
+            let result: Value = serde_json::from_str(&raw).expect("edit result json");
+            assert_eq!(
+                result["cellFlowChanged"].as_bool(),
+                Some(inserted == 43),
+                "{label}: input {} flow signal",
+                inserted + 1
+            );
+        }
+        let transient_cuts = issue2214_target_cuts(&doc);
+        issue2214_assert_cut_continuity(label, "transient", &transient_cuts);
+        let transient_cut = transient_cuts[0].clone();
+        let transient_ranges = target_tree_ranges(&doc);
+        let transient_max = transient_ranges
+            .last()
+            .map(|(_, _, end)| *end)
+            .expect("transient target end");
+        let transient_rect = doc
+            .get_cursor_rect_in_cell_native(0, 0, 2, 2, 5, 174)
+            .expect("transient direct rect");
+
+        doc.flush_deferred_pagination()
+            .expect("explicit pagination control");
+        let flushed_cuts = issue2214_target_cuts(&doc);
+        issue2214_assert_cut_continuity(label, "full-flush", &flushed_cuts);
+        let flushed_cut = flushed_cuts[0].clone();
+        let flushed_ranges = target_tree_ranges(&doc);
+        let flushed_max = flushed_ranges
+            .last()
+            .map(|(_, _, end)| *end)
+            .expect("flushed target end");
+        let flushed_rect = doc
+            .get_cursor_rect_in_cell_native(0, 0, 2, 2, 5, 174)
+            .expect("flushed direct rect");
+
+        eprintln!(
+            "#2214 {label}: transient max={transient_max} rect={transient_rect}; flushed max={flushed_max} rect={flushed_rect}; cuts transient={transient_cut:?} flushed={flushed_cut:?}"
+        );
+
+        assert_eq!(transient_max, 174, "{label}: scoped warm tree coherence");
+        assert_eq!(flushed_max, 174, "{label}: flush oracle");
+        assert_eq!(
+            transient_ranges, flushed_ranges,
+            "{label}: transient target UTF-16 ranges must equal flush oracle"
+        );
+        assert_eq!(
+            initial_cuts, transient_cuts,
+            "{label}: scoped eviction must not change pagination fragments"
+        );
+        assert_eq!(transient_cut.start_cut, Vec::<usize>::new());
+        assert_eq!(
+            transient_cut.end_cut,
+            vec![37],
+            "{label}: transient page-zero cut"
+        );
+        assert_eq!(flushed_cut.start_cut, Vec::<usize>::new());
+        assert_eq!(
+            flushed_cut.end_cut,
+            vec![37],
+            "{label}: flushed page-zero cut"
+        );
+        assert_eq!(
+            transient_cut, flushed_cut,
+            "{label}: #2195 declared height must absorb the first-page advance"
+        );
+        let changed_pages = transient_cuts
+            .iter()
+            .zip(&flushed_cuts)
+            .enumerate()
+            .filter_map(|(page, (transient, flushed))| (transient != flushed).then_some(page))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "#2214 {label}: PartialTable fragments={} changed_after_flush_count={}",
+            transient_cuts.len(),
+            changed_pages.len(),
+        );
+        assert_eq!(
+            transient_cuts.len(),
+            flushed_cuts.len(),
+            "{label}: page fingerprint count"
+        );
+        assert_eq!(
+            changed_pages,
+            (2..doc.page_count() as usize).collect::<Vec<_>>(),
+            "{label}: flush must realign downstream continuation cuts"
+        );
+        let transient_rect_json: Value =
+            serde_json::from_str(&transient_rect).expect("transient rect json");
+        let flushed_rect_json: Value =
+            serde_json::from_str(&flushed_rect).expect("flushed rect json");
+        for key in ["pageIndex", "x", "y", "height", "cellOverflowed"] {
+            assert_eq!(
+                transient_rect_json.get(key),
+                flushed_rect_json.get(key),
+                "{label}: transient cursor field {key} must equal flush oracle"
+            );
+        }
+        assert_eq!(
+            transient_rect_json.get("cellBounds"),
+            flushed_rect_json.get("cellBounds"),
+            "{label}: absorbed flow boundary must preserve cell bounds"
+        );
+        let transient_bounds_h = transient_rect_json["cellBounds"]["h"]
+            .as_f64()
+            .expect("transient bounds h");
+        let flushed_bounds_h = flushed_rect_json["cellBounds"]["h"]
+            .as_f64()
+            .expect("flushed bounds h");
+        assert!(
+            (transient_bounds_h - 945.9).abs() <= 0.2,
+            "{label}: transient bounds h={transient_bounds_h}"
+        );
+        assert!(
+            (flushed_bounds_h - 945.9).abs() <= 0.2,
+            "{label}: flushed bounds h={flushed_bounds_h}"
+        );
+        assert_eq!(doc.page_count(), 115, "{label}: page count");
+    }
 }

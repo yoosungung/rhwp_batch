@@ -271,6 +271,7 @@ fn test_layout_with_composed_styles() {
     let composed: Vec<_> = paragraphs.iter().map(|p| compose_paragraph(p)).collect();
 
     let styles = ResolvedStyleSet {
+        hwp3_variant: false,
         char_styles: vec![
             ResolvedCharStyle {
                 font_family: "함초롬돋움".to_string(),
@@ -402,6 +403,7 @@ fn test_layout_multi_run_x_position() {
 
     let composed: Vec<_> = paragraphs.iter().map(|p| compose_paragraph(p)).collect();
     let styles = ResolvedStyleSet {
+        hwp3_variant: false,
         char_styles: vec![
             ResolvedCharStyle {
                 font_size: 16.0,
@@ -483,6 +485,7 @@ fn test_resolved_to_text_style() {
     use crate::renderer::style_resolver::ResolvedCharStyle;
 
     let styles = ResolvedStyleSet {
+        hwp3_variant: false,
         char_styles: vec![ResolvedCharStyle {
             font_family: "나눔고딕".to_string(),
             font_size: 14.0,
@@ -515,6 +518,7 @@ fn test_resolved_to_text_style_with_ratio() {
     use crate::renderer::style_resolver::ResolvedCharStyle;
 
     let styles = ResolvedStyleSet {
+        hwp3_variant: false,
         char_styles: vec![ResolvedCharStyle {
             font_family: "함초롬돋움".to_string(),
             font_size: 16.0,
@@ -784,6 +788,7 @@ fn test_layout_table_basic() {
     let composed: Vec<_> = paragraphs.iter().map(|p| compose_paragraph(p)).collect();
     // border_fill_id=1은 styles.border_styles[0]을 참조 (1-indexed)
     let styles = ResolvedStyleSet {
+        hwp3_variant: false,
         border_styles: vec![ResolvedBorderStyle::default()],
         ..Default::default()
     };
@@ -1468,6 +1473,7 @@ fn test_tac_leading_width_block_table_full_line() {
         tab_extended: Vec::new(),
     };
     let styles = ResolvedStyleSet {
+        hwp3_variant: false,
         char_styles: vec![ResolvedCharStyle {
             font_size: 20.0,
             letter_spacing: -1.6,
@@ -1561,6 +1567,7 @@ fn test_tac_leading_width_inline_table_partial() {
         tab_extended: Vec::new(),
     };
     let styles = ResolvedStyleSet {
+        hwp3_variant: false,
         char_styles: vec![ResolvedCharStyle {
             font_size: 20.0,
             ..Default::default()
@@ -1978,7 +1985,12 @@ fn master_page_paper_relative_picture_uses_page_origin() {
     )));
 
     let bbox = first_master_child_bbox(&tree, |node_type| {
-        matches!(node_type, RenderNodeType::Image(_))
+        // [Task #2225] 데이터 없는 픽스처 그림은 MissingPicture placeholder 로
+        // 방출된다 — 위치 검증 프로브이므로 두 형태 모두 수용 (bbox 동일).
+        matches!(
+            node_type,
+            RenderNodeType::Image(_) | RenderNodeType::Placeholder(_)
+        )
     });
     assert!((bbox.x - hwpunit_to_px(1_500, DEFAULT_DPI)).abs() < 0.01);
     assert!((bbox.y - hwpunit_to_px(2_250, DEFAULT_DPI)).abs() < 0.01);
@@ -2103,7 +2115,12 @@ fn header_paper_relative_picture_uses_page_origin() {
         })));
 
     let bbox = first_header_child_bbox(&tree, |node_type| {
-        matches!(node_type, RenderNodeType::Image(_))
+        // [Task #2225] 데이터 없는 픽스처 그림은 MissingPicture placeholder 로
+        // 방출된다 — 위치 검증 프로브이므로 두 형태 모두 수용 (bbox 동일).
+        matches!(
+            node_type,
+            RenderNodeType::Image(_) | RenderNodeType::Placeholder(_)
+        )
     });
     assert!((bbox.x - hwpunit_to_px(1_500, DEFAULT_DPI)).abs() < 0.01);
     assert!((bbox.y - hwpunit_to_px(2_250, DEFAULT_DPI)).abs() < 0.01);
@@ -2139,6 +2156,7 @@ fn page_bg_color_and_image_present(is_section_first: bool) -> (bool, bool) {
     };
 
     let styles = ResolvedStyleSet {
+        hwp3_variant: false,
         border_styles: vec![ResolvedBorderStyle {
             fill_color: Some(0x00F0F0F0),
             image_fill: Some(ResolvedImageFill {
@@ -2154,7 +2172,7 @@ fn page_bg_color_and_image_present(is_section_first: bool) -> (bool, bool) {
     };
     let bin_data = vec![BinDataContent {
         id: 1,
-        data: vec![0xFF, 0xD8, 0xFF, 0xE0], // JPEG magic (내용 무관, 존재만 확인)
+        data: vec![0xFF, 0xD8, 0xFF, 0xE0].into(), // JPEG magic (내용 무관, 존재만 확인)
         extension: "jpg".to_string(),
     }];
     let page_border_fill = PageBorderFill {

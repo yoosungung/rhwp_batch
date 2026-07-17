@@ -382,6 +382,7 @@ fn test_find_active_char_shape() {
 fn make_styles_with_font_size(font_size: f64) -> ResolvedStyleSet {
     use crate::renderer::style_resolver::{ResolvedCharStyle, ResolvedParaStyle, ResolvedStyleSet};
     ResolvedStyleSet {
+        hwp3_variant: false,
         char_styles: vec![ResolvedCharStyle {
             font_size,
             ratio: 1.0,
@@ -621,6 +622,7 @@ fn test_reflow_lang_aware_mixed() {
     use crate::renderer::style_resolver::{ResolvedCharStyle, ResolvedParaStyle, ResolvedStyleSet};
 
     let styles = ResolvedStyleSet {
+        hwp3_variant: false,
         char_styles: vec![ResolvedCharStyle {
             font_family: "함초롬돋움".to_string(),
             font_families: vec![
@@ -728,6 +730,51 @@ fn test_reflow_korean_eojeol_wrap() {
     assert_eq!(para.line_segs[0].text_start, 0);
     // 두 번째 줄은 공백 다음 글자부터 (char_offset 6)
     assert_eq!(para.line_segs[1].text_start, 6);
+}
+
+/// 한글 줄 나눔 단위 계약: 0=어절, 1=글자
+#[test]
+fn test_reflow_korean_break_unit_contract() {
+    let mut word_styles = make_styles_with_font_size(16.0);
+    word_styles.para_styles[0].korean_break_unit = 0;
+
+    let mut char_styles = make_styles_with_font_size(16.0);
+    char_styles.para_styles[0].korean_break_unit = 1;
+
+    let make_para = || Paragraph {
+        text: "가나 다라".to_string(),
+        char_offsets: vec![0, 1, 2, 3, 4],
+        char_count: 6,
+        char_shapes: vec![CharShapeRef {
+            start_pos: 0,
+            char_shape_id: 0,
+        }],
+        line_segs: vec![LineSeg {
+            text_start: 0,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut word_para = make_para();
+    reflow_line_segs(&mut word_para, 60.0, &word_styles, 96.0);
+
+    let mut char_para = make_para();
+    reflow_line_segs(&mut char_para, 60.0, &char_styles, 96.0);
+
+    let word_starts: Vec<u32> = word_para
+        .line_segs
+        .iter()
+        .map(|seg| seg.text_start)
+        .collect();
+    let char_starts: Vec<u32> = char_para
+        .line_segs
+        .iter()
+        .map(|seg| seg.text_start)
+        .collect();
+
+    assert_eq!(word_starts, vec![0, 3], "어절 모드는 공백 뒤에서 줄바꿈");
+    assert_eq!(char_starts, vec![0, 4], "글자 모드는 다음 어절 일부를 채움");
 }
 
 /// 영어 단어 줄 바꿈: 공백에서 줄 바꿈
@@ -842,7 +889,8 @@ fn test_tokenize_korean_eojeol() {
         char_shape_id: 0,
     }];
 
-    let tokens = tokenize_paragraph(&text, &offsets, &shapes, &styles, 0, 1);
+    // [#2185] bit7=0 = 어절 단위 (한컴 통제 실측 3중 확증 — 종전 ==1 역해석 정정)
+    let tokens = tokenize_paragraph(&text, &offsets, &shapes, &styles, 0, 0);
     // "가나" (Text) + " " (Space) + "다라" (Text) = 3 tokens
     assert_eq!(tokens.len(), 3);
     assert!(matches!(
@@ -866,7 +914,7 @@ fn test_tokenize_korean_eojeol() {
 
 /// 토크나이저: 한국어 글자 단위 토큰화
 #[test]
-fn test_tokenize_korean_break_word_chars() {
+fn test_tokenize_korean_character_unit() {
     let styles = make_styles_with_font_size(16.0);
     let text: Vec<char> = "가나".chars().collect();
     let offsets: Vec<u32> = (0..text.len() as u32).collect();
@@ -875,7 +923,7 @@ fn test_tokenize_korean_break_word_chars() {
         char_shape_id: 0,
     }];
 
-    let tokens = tokenize_paragraph(&text, &offsets, &shapes, &styles, 0, 0);
+    let tokens = tokenize_paragraph(&text, &offsets, &shapes, &styles, 0, 1);
     assert_eq!(tokens.len(), 2);
     assert!(matches!(
         tokens[0],
@@ -1057,5 +1105,55 @@ fn test_expand_hancom_relationship_line_pua_to_box_drawing() {
     assert_eq!(
         out, "┌└─",
         "한컴 관계도 PUA 선문자는 공개 폰트 환경에서 두부가 아닌 box drawing 문자로 표시되어야 함"
+    );
+}
+
+/// [#2244] KBU=1(글자 단위) 줄바꿈에서 행두 금칙 문자 retraction —
+/// 새 줄이 마침표로 시작하지 않도록 직전 글자를 함께 이월한다.
+/// 한컴 2024 저장 오라클: "…하여 적용한 | 다.111…" (LINE_SEG [...,128] —
+/// '다'(128) 앞에서 분리, '.'(129) 고립 금지).
+#[test]
+fn test_kbu1_line_start_forbidden_retraction() {
+    let styles = make_styles_with_font_size(16.0);
+    let line = ComposedLine {
+        runs: vec![ComposedTextRun {
+            text: "적용한다.111111".to_string(),
+            char_style_id: 0,
+            lang_index: 0,
+            char_overlap: None,
+            footnote_marker: None,
+            display_text: None,
+        }],
+        line_height: 400,
+        baseline_distance: 320,
+        segment_width: 0,
+        column_start: 0,
+        line_spacing: 0,
+        has_line_break: false,
+        char_start: 0,
+    };
+    // 한글 4자(64px)는 들어가고 '.'에서 초과하는 폭 → 수정 전엔 둘째 줄이
+    // "."로 시작 ("적용한다 | .111111"), 수정 후엔 '다' 동반 이월.
+    let frags = split_composed_line_by_width(&line, 68.0, 68.0, &styles, true, 0.0);
+    assert!(
+        frags.len() >= 2,
+        "두 줄 이상으로 분할되어야 함: {:?}",
+        frags.len()
+    );
+    let line2_text: String = frags[1].runs.iter().map(|r| r.text.as_str()).collect();
+    assert!(
+        !line2_text.starts_with('.'),
+        "새 줄이 행두 금칙 '.'로 시작하면 안 됨 (한컴: 직전 글자 동반 이월): {:?}",
+        line2_text
+    );
+    assert!(
+        line2_text.starts_with("다."),
+        "한컴 오라클 정합: 둘째 줄은 '다.'로 시작해야 함: {:?}",
+        line2_text
+    );
+    // char_start 정합: 둘째 줄 시작 = '다' 위치(3)
+    assert_eq!(
+        frags[1].char_start, 3,
+        "retraction 후 char_start 는 '다' 위치"
     );
 }

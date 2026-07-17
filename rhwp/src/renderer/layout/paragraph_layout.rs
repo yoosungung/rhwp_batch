@@ -49,6 +49,22 @@ pub(crate) fn ensure_min_baseline(raw_baseline: f64, max_font_size: f64) -> f64 
     raw_baseline.max(min_baseline)
 }
 
+/// 인라인으로 이미 분류된 TAC 표의 줄바꿈 여부만 판단한다.
+///
+/// 인라인 분류 자체는 상류 게이트 `height_measurer::is_tac_table_inline_in_para`
+/// (앵커 양쪽 실제 텍스트 요구, 더 엄격)가 담당하므로, 여기서는 위치·폭 조건만 본다.
+fn should_wrap_middle_anchored_table(
+    control_position: Option<usize>,
+    text_len: usize,
+    occupied_width: f64,
+    table_footprint: f64,
+    line_width: f64,
+) -> bool {
+    control_position.is_some_and(|position| position > 0 && position < text_len)
+        && occupied_width > 1.0
+        && occupied_width + table_footprint > line_width + 0.5
+}
+
 fn paragraph_active_text_style(
     styles: &ResolvedStyleSet,
     para: Option<&Paragraph>,
@@ -897,7 +913,56 @@ fn compute_line_extra_spacing(
                     ),
                 );
                 let min_ews = -(space_base_w * 0.5);
-                (raw_ews.max(min_ews), 0.0, 0.0)
+                let ews = raw_ews.max(min_ews);
+                // [Task #2189] 저장 줄바꿈(LINE_SEG) 셀에서 대체 폰트 advance 가 한컴
+                // 실폰트보다 넓으면 공백 -50% 클램프만으로는 잔여 초과가 남아 우측
+                // 테두리에서 클리핑된다. 공백-없는 분기와 동일하게 잔여 음수 슬랙을
+                // 자간으로 흡수한다 (narrow glyph 역진은 #229 per-char 클램프가 방어).
+                let leftover = slack - ews * interior_spaces as f64;
+                let ecs = if in_cell && leftover < 0.0 && total_char_count > 1 && !has_tabs {
+                    let avg_char_w = total_text_width / total_char_count as f64;
+                    let min_ecs = -avg_char_w * 0.5;
+                    let mut ecs = (leftover / total_char_count as f64).max(min_ecs);
+                    // narrow glyph per-char 클램프가 음수 자간 기여 일부를 되돌리므로
+                    // 선형 1회 분배로는 부족하다 — underflow 확장과 동일하게 실효 폭
+                    // 재측정으로 수렴 반복한다.
+                    let measure_with = |ecs: f64| -> f64 {
+                        let mut measured = 0.0f64;
+                        for r in &comp_line.runs {
+                            let mut ts =
+                                resolved_to_text_style(styles, r.char_style_id, r.lang_index);
+                            ts.default_tab_width = tab_width;
+                            ts.extra_word_spacing = ews;
+                            ts.extra_char_spacing = ecs;
+                            measured += estimate_text_width(&r.text, &ts);
+                        }
+                        if trailing_spaces > 0 {
+                            if let Some(last_run) = comp_line.runs.last() {
+                                let mut ts = resolved_to_text_style(
+                                    styles,
+                                    last_run.char_style_id,
+                                    last_run.lang_index,
+                                );
+                                ts.default_tab_width = tab_width;
+                                ts.extra_word_spacing = ews;
+                                ts.extra_char_spacing = ecs;
+                                measured -= estimate_text_width(&" ".repeat(trailing_spaces), &ts);
+                            }
+                        }
+                        measured
+                    };
+                    for _ in 0..3 {
+                        let delta = available_width - measure_with(ecs);
+                        if delta.abs() < 0.5 {
+                            break;
+                        }
+                        ecs = (ecs + delta / total_char_count as f64).max(min_ecs);
+                    }
+                    ecs.min(0.0)
+                } else {
+                    0.0
+                };
+                (ews, ecs, 0.0)
             }
         } else if total_char_count > 1 {
             // 양쪽 정렬이지만 공백 없음 (일본어/숫자 등):
@@ -1386,6 +1451,7 @@ impl LayoutEngine {
         let mut wrapped_below_table = false; // 텍스트가 표 아래로 줄바꿈되었는지
                                              // [Task #518] 다음 break 인덱스 (line_break_char_indices 안에서)
         let mut next_break: usize = 0;
+        let control_positions = para.control_text_positions();
 
         for (s, e) in &segments {
             // 텍스트 세그먼트 렌더링 (줄바꿈 지원)
@@ -1652,6 +1718,24 @@ impl LayoutEngine {
                 let tbl_h = mt
                     .map(|m| m.total_height)
                     .unwrap_or_else(|| hwpunit_to_px(tbl.common.height as i32, self.dpi));
+                let table_footprint = tw.max(
+                    hwpunit_to_px(tbl.common.width as i32, self.dpi)
+                        + hwpunit_to_px(
+                            tbl.outer_margin_left as i32 + tbl.outer_margin_right as i32,
+                            self.dpi,
+                        ),
+                );
+                let table_wrapped = should_wrap_middle_anchored_table(
+                    control_positions.get(*ctrl_idx).copied(),
+                    text_chars.len(),
+                    inline_x - line_start_x,
+                    table_footprint,
+                    right_margin - line_start_x,
+                );
+                if table_wrapped {
+                    current_y += line_step;
+                    inline_x = line_start_x;
+                }
                 let om_bottom = hwpunit_to_px(tbl.outer_margin_bottom as i32, self.dpi);
                 let tbl_y = (current_y + baseline_dist + om_bottom - tbl_h).max(current_y);
 
@@ -1682,7 +1766,13 @@ impl LayoutEngine {
                     max_table_bottom = table_bottom;
                 }
 
-                inline_x += tw;
+                if table_wrapped {
+                    current_y = table_bottom;
+                    inline_x = line_start_x;
+                    wrapped_below_table = true;
+                } else {
+                    inline_x += tw;
+                }
                 table_idx += 1;
             }
         }
@@ -1812,7 +1902,9 @@ impl LayoutEngine {
                 let column_inner_width = (col_area.width - margin_l - margin_r).max(0.0);
                 if column_inner_width > 0.0 {
                     let mut cloned = comp.clone();
-                    crate::renderer::composer::recompose_for_cell_width(
+                    // [#2279] 본문 NO_LS 는 글자모양 재분할 포함 래퍼 사용 —
+                    // typeset(format_paragraph)과 동일 (측정/렌더 줄수·pitch 정합).
+                    crate::renderer::composer::recompose_for_body_width(
                         &mut cloned,
                         para,
                         column_inner_width,
@@ -1826,7 +1918,16 @@ impl LayoutEngine {
                 None
             };
             let comp_ref = recomposed.as_ref().unwrap_or(comp);
-            let end_line_adjusted = end_line.min(comp_ref.lines.len()).max(start_line);
+            // [#2279] 전체-문단 요청(start=0, end=원본 줄수 이상)은 재래핑 후 줄수로
+            // 확장한다. 종전에는 재래핑이 줄수를 늘린 문단(45자 폴백 3줄 → 실폭 4줄,
+            // 86712 pi=22)에서 원본 줄수로 클램프되어 마지막 줄이 렌더에서 소실됐다
+            // (측정 4줄 fit vs 렌더 3줄 — maintainer PR #2284 리뷰 p10 픽셀 하락과
+            // 정합). 분할(partial) 요청의 라인 범위는 종전 클램프 유지.
+            let end_line_adjusted = if start_line == 0 && end_line >= comp.lines.len() {
+                comp_ref.lines.len()
+            } else {
+                end_line.min(comp_ref.lines.len()).max(start_line)
+            };
             return self.layout_composed_paragraph(
                 tree,
                 col_node,
@@ -1908,8 +2009,7 @@ impl LayoutEngine {
                             }
                             let img_y = (y + baseline - pic_h).max(y);
                             let bin_data_id = pic.image_attr.bin_data_id;
-                            let image_data =
-                                find_bin_data(bdc, bin_data_id).map(|c| c.data.clone());
+                            let image_data = find_bin_data(bdc, bin_data_id).map(|c| c.data.load());
                             let crop = {
                                 let c = &pic.crop;
                                 if c.right > c.left
@@ -2766,28 +2866,53 @@ impl LayoutEngine {
                 max_fs,
                 self.dpi,
             );
-            let (line_height, line_spacing_px) = {
-                let ls_val = para_style.map(|s| s.line_spacing).unwrap_or(160.0);
-                let ls_type = para_style
-                    .map(|s| s.line_spacing_type)
-                    .unwrap_or(LineSpacingType::Percent);
-                let raw_text_height = para
-                    .and_then(|p| p.line_segs.get(line_idx))
-                    .map(|seg| hwpunit_to_px(seg.text_height, self.dpi))
-                    .unwrap_or(0.0);
-                let is_plain_text_para = para.map(|p| p.controls.is_empty()).unwrap_or(false);
-                let use_stored_text_height =
-                    is_plain_text_para && (self.is_hwpx_source.get() || cell_ctx.is_none());
-                crate::renderer::corrected_line_metrics_for_source(
-                    raw_lh,
-                    raw_text_height,
-                    hwpunit_to_px(comp_line.line_spacing, self.dpi),
-                    max_fs,
-                    ls_type,
-                    ls_val,
-                    use_stored_text_height,
-                )
-            };
+            let ls_val = para_style.map(|s| s.line_spacing).unwrap_or(160.0);
+            let ls_type = para_style
+                .map(|s| s.line_spacing_type)
+                .unwrap_or(LineSpacingType::Percent);
+            let raw_text_height = para
+                .and_then(|p| p.line_segs.get(line_idx))
+                .map(|seg| hwpunit_to_px(seg.text_height, self.dpi))
+                .unwrap_or(0.0);
+            let use_stored_text_height = para.map(|p| p.controls.is_empty()).unwrap_or(false)
+                && (self.is_hwpx_source.get() || cell_ctx.is_none());
+            let source_metrics_reflow_eligible = para
+                .map(|p| crate::renderer::controls_mark_section_start(&p.controls))
+                .unwrap_or(false)
+                && self.is_hwpx_source.get();
+            let source_metrics_reflowed = crate::renderer::source_line_metrics_need_reflow(
+                raw_lh,
+                raw_text_height,
+                max_fs,
+                ls_type,
+                ls_val,
+                source_metrics_reflow_eligible,
+            );
+            let (line_height, line_spacing_px) = crate::renderer::corrected_line_metrics_for_source(
+                raw_lh,
+                raw_text_height,
+                hwpunit_to_px(comp_line.line_spacing, self.dpi),
+                max_fs,
+                ls_type,
+                ls_val,
+                use_stored_text_height,
+                source_metrics_reflow_eligible,
+            );
+            // [#2279 진단] 줄별 pitch 분해 — 동작 불변.
+            if let Ok(pat) = std::env::var("RHWP_DIAG_PITCH") {
+                if para.map(|p| p.text.contains(&pat)).unwrap_or(false) {
+                    eprintln!(
+                        "DIAG_PITCH li={} raw_lh={:.2} raw_ls={:.2} max_fs={:.2} -> lh={:.2} ls={:.2} stored_ls_cnt={}",
+                        line_idx,
+                        raw_lh,
+                        hwpunit_to_px(comp_line.line_spacing, self.dpi),
+                        max_fs,
+                        line_height,
+                        line_spacing_px,
+                        para.map(|p| p.line_segs.len()).unwrap_or(0),
+                    );
+                }
+            }
             // 인라인 Shape(글상자)가 있는 줄: line_height에 Shape 높이가 포함됨
             // Shape는 별도 패스에서 para_y 기준으로 렌더링되므로,
             // 텍스트의 y와 line_height를 폰트 기반으로 보정하여 baseline 정렬
@@ -2840,7 +2965,11 @@ impl LayoutEngine {
                 (
                     line_height,
                     ensure_min_baseline(
-                        hwpunit_to_px(comp_line.baseline_distance, self.dpi),
+                        crate::renderer::corrected_line_baseline_for_source(
+                            hwpunit_to_px(comp_line.baseline_distance, self.dpi),
+                            max_fs,
+                            source_metrics_reflowed,
+                        ),
                         max_fs,
                     ),
                 )
@@ -4638,7 +4767,7 @@ impl LayoutEngine {
                                 let img_y = base_img_y + sibling_reserved_px;
                                 let bin_data_id = pic.image_attr.bin_data_id;
                                 let image_data =
-                                    find_bin_data(bdc, bin_data_id).map(|c| c.data.clone());
+                                    find_bin_data(bdc, bin_data_id).map(|c| c.data.load());
                                 let crop = {
                                     let c = &pic.crop;
                                     if c.right > c.left
@@ -4836,11 +4965,8 @@ impl LayoutEngine {
                                 px_to_hwpunit(col_area.width, self.dpi)
                             };
                             let should_render_inline = cell_ctx.is_some()
-                                || crate::renderer::height_measurer::is_tac_table_inline(
-                                    t,
-                                    seg_width,
-                                    &p.text,
-                                    &p.controls,
+                                || crate::renderer::height_measurer::is_tac_table_inline_in_para(
+                                    t, seg_width, p,
                                 );
                             let already_rendered = tree
                                 .get_inline_shape_position(
@@ -4855,6 +4981,22 @@ impl LayoutEngine {
                                 let om_bottom =
                                     hwpunit_to_px(t.outer_margin_bottom as i32, self.dpi);
                                 let table_y = (y + baseline + om_bottom - table_h).max(y);
+                                // [Task #2212] 셀 안 인라인 TAC 표는 외곽 셀 경로를
+                                // 확장한 2단 cell_context 로 렌더해야 경로 기반 조회
+                                // (get_table_cell_bboxes_by_path 등)가 내부 셀을 찾는다.
+                                // table_layout 중첩 분기(:3475)와 동일한 확장 규칙 —
+                                // 내부 entry 의 cell/cp 는 layout_table 셀 루프가 채운다.
+                                let nested_ctx = cell_ctx.as_ref().map(|ctx| {
+                                    let mut c = ctx.clone();
+                                    c.path.push(crate::renderer::layout::CellPathEntry {
+                                        control_index: tac_ci,
+                                        cell_index: 0,
+                                        cell_para_index: 0,
+                                        text_direction: 0,
+                                    });
+                                    c
+                                });
+                                let nested_depth = usize::from(cell_ctx.is_some());
                                 self.layout_table(
                                     tree,
                                     col_node,
@@ -4866,10 +5008,10 @@ impl LayoutEngine {
                                     table_y,
                                     bdc,
                                     None,
-                                    0,
+                                    nested_depth,
                                     Some((para_index, tac_ci)),
                                     alignment,
-                                    None,
+                                    nested_ctx,
                                     0.0,
                                     0.0,
                                     Some(x),
@@ -5747,8 +5889,7 @@ impl LayoutEngine {
                             };
                             let img_y = base_img_y + sibling_reserved_px;
                             let bin_data_id = pic.image_attr.bin_data_id;
-                            let image_data =
-                                find_bin_data(bdc, bin_data_id).map(|c| c.data.clone());
+                            let image_data = find_bin_data(bdc, bin_data_id).map(|c| c.data.load());
                             let crop = {
                                 let c = &pic.crop;
                                 if c.right > c.left

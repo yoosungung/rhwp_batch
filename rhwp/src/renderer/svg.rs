@@ -83,6 +83,8 @@ pub struct SvgRenderer {
     pub show_control_codes: bool,
     /// 디버그 오버레이 표시 여부
     pub debug_overlay: bool,
+    /// 편집 화면 전용 missing-picture placeholder 표시 여부.
+    pub show_missing_picture_placeholder: bool,
     /// 디버그 오버레이용: 문단별 경계 수집 (pi → bbox)
     overlay_para_bounds: std::collections::HashMap<usize, OverlayBounds>,
     /// 디버그 오버레이용: 표 경계 수집
@@ -164,6 +166,7 @@ impl SvgRenderer {
             show_paragraph_marks: false,
             show_control_codes: false,
             debug_overlay: false,
+            show_missing_picture_placeholder: false,
             overlay_para_bounds: std::collections::HashMap::new(),
             overlay_table_bounds: Vec::new(),
             overlay_image_bounds: Vec::new(),
@@ -515,6 +518,15 @@ impl SvgRenderer {
                 self.output.push_str(&r.svg);
             }
             RenderNodeType::Placeholder(ph) => {
+                // [Task #2225] 그림 미지정 placeholder 는 인쇄 등가 profile에서
+                // 미출력하고 편집 profile에서만 표시한다.
+                if matches!(
+                    ph.kind,
+                    crate::renderer::render_tree::PlaceholderKind::MissingPicture
+                ) && !self.show_missing_picture_placeholder
+                {
+                    return;
+                }
                 // Task #195: 차트/OLE placeholder (점선 테두리 + 중앙 라벨)
                 let cx = node.bbox.x + node.bbox.width / 2.0;
                 let cy = node.bbox.y + node.bbox.height / 2.0;

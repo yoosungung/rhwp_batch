@@ -186,24 +186,42 @@ impl Cell {
         allow_saved_small_cell_margin: bool,
     ) -> bool {
         if self.apply_inner_margin {
-            return cell_padding != 0;
+            // [#2070] aim=true 의 0 은 사용자가 지정한 셀 고유 안 여백 — 존중한다
+            // (한글 PDF 실측: 시장구조조사 c0 pad=(0,0) 코드 폭 37.0px > 표 폴백
+            // inner 26.5px — 표 패딩 폴백이면 물리적으로 1줄 불가). 음수는 결측
+            // 센티널로 보고 표 패딩 폴백 유지.
+            return cell_padding >= 0;
         }
-        if cell_padding <= table_padding {
-            return false;
-        }
-        if !allow_saved_small_cell_margin && cell_padding >= 2500 {
-            return false;
-        }
-        true
+        // [#2195] aim=false 는 **전 축 표 기본** — pad 통제 사다리 2종 실측:
+        // (1) 표(0,0,141,141)+셀(510,510,141,141): 실효 좌우 0·상하 141,
+        // (2) 표(510,510,223,223)+셀 동일: inner = 표폭-1020(좌우 510x2)·상하 223.
+        // 종전 #1785 보존 규칙(cell>table 시 셀 채택)은 사다리와 불합치 — 제거.
+        // (36381023 결재란 RT 케이스는 전체 게이트로 재검증.)
+        let _ = allow_saved_small_cell_margin;
+        false
     }
 
     /// 축별 규칙(`use_cell_padding_axis`)을 네 축에 적용한 유효 안 여백 (HWPUNIT).
+    /// [#2195 stage50] 표 기본 여백이 **네 축 모두 0**(미지정)이면 셀 저장 pad —
+    /// 86712 구분선(한글 PDF 괘선 21.1px = 셀 141 상하 포함) + exam_social 머리말
+    /// 글상자(#1100 rect 오라클) 실측. pad 사다리의 '표 기본' 실측은 표 기본이
+    /// 일부 축만 0(0,0,141,141)인 케이스 — 전축 0 과 구분된다.
+    pub fn table_padding_unspecified(table_padding: &crate::model::Padding) -> bool {
+        table_padding.left == 0
+            && table_padding.right == 0
+            && table_padding.top == 0
+            && table_padding.bottom == 0
+    }
+
     pub fn effective_padding(
         &self,
         table_padding: &crate::model::Padding,
     ) -> crate::model::Padding {
+        let unspec = !self.apply_inner_margin && Self::table_padding_unspecified(table_padding);
         let pick = |c: i16, t: i16| -> i16 {
-            if self.use_cell_padding_axis(c, t, false) {
+            // [#1785 위생 한도 유지] 10mm급(>=2500HU) 보존 pad 는 한컴이 렌더에
+            // 쓰지 않는다(36381023 render-diff) — 전축0 미지정 규칙에서도 제외.
+            if (unspec && c < 2500) || self.use_cell_padding_axis(c, t, false) {
                 c
             } else {
                 t

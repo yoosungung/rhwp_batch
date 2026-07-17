@@ -1349,6 +1349,9 @@ pub struct LayoutEngine {
     /// `cell_units_uncached` 안에서 계산되어 52,694 셀 표에서 O(셀²)(≈28억) 로 폭증했다.
     /// `cell_units_cache` 와 동일 조판 경계에서 clear 한다.
     table_nested_text_flag_cache: std::cell::RefCell<std::collections::HashMap<usize, bool>>,
+    /// Issue #2214 test-only: cache miss가 실제 table-wide scan으로 이어진 횟수.
+    #[cfg(test)]
+    table_nested_text_flag_scan_count: std::cell::Cell<usize>,
 }
 
 mod border_rendering;
@@ -1421,6 +1424,8 @@ impl LayoutEngine {
             hwpx_page_preview: std::cell::RefCell::new(None),
             cell_units_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             table_nested_text_flag_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            #[cfg(test)]
+            table_nested_text_flag_scan_count: std::cell::Cell::new(0),
         }
     }
 
@@ -1526,7 +1531,8 @@ impl LayoutEngine {
         body_area: &LayoutRect,
     ) -> Option<RenderLayerInfo> {
         let common = Self::control_common_attr(control)?;
-        let mut layer = Self::render_layer_from_common(common, para_index, control_index);
+        let mut layer =
+            Self::render_layer_from_common(common, para_index, control_index).for_master_page();
         if Self::master_background_common_attr(control).is_some_and(|common| {
             self.is_master_paper_background_control(common, paper_area, body_area)
         }) {
@@ -2508,7 +2514,7 @@ impl LayoutEngine {
                         bs.image_fill.as_ref().and_then(|img_fill| {
                             find_bin_data(bin_data_content, img_fill.bin_data_id).map(|c| {
                                 PageBackgroundImage {
-                                    data: c.data.clone(),
+                                    data: c.data.load(),
                                     fill_mode: img_fill.fill_mode,
                                     brightness: img_fill.brightness,
                                     contrast: img_fill.contrast,
@@ -2802,6 +2808,9 @@ impl LayoutEngine {
                     RenderNodeType::MasterPage,
                     layout_rect_to_bbox(&paper_area),
                 );
+                // 바탕쪽 그룹에 provenance layer 부여 (#2318): layer 없는 자식(텍스트 라인 등)이
+                // 상속받아 replay plane 분류에서 BehindText 상한이 적용된다.
+                mp_node.layer = Some(RenderLayerInfo::new(None, 0, 0).for_master_page());
                 // 바탕쪽 문단 렌더링: 컨트롤(표/도형/그림)은 compute_object_position으로 배치,
                 // 텍스트 문단은 layout_paragraph로 배치
                 let mut mp_y_offset = paper_area.y;
@@ -5513,7 +5522,7 @@ impl LayoutEngine {
                     let has_block_table = para.controls.iter()
                         .any(|c| matches!(c, Control::Table(t) if !t.common.treat_as_char
                             || (t.common.treat_as_char
-                                && !crate::renderer::height_measurer::is_tac_table_inline(t, seg_width, &para.text, &para.controls))));
+                                && !crate::renderer::height_measurer::is_tac_table_inline_in_para(t, seg_width, para))));
                     if has_block_table {
                         if para_is_empty_topbottom_table_anchor(para) {
                             // 빈 기본 표 host 문단은 별도 빈 줄로 소비하지 않는다.
@@ -5603,7 +5612,7 @@ impl LayoutEngine {
 
                     let has_inline_tables = para.controls.iter()
                         .any(|c| matches!(c, Control::Table(t) if t.common.treat_as_char
-                            && crate::renderer::height_measurer::is_tac_table_inline(t, seg_width, &para.text, &para.controls)));
+                            && crate::renderer::height_measurer::is_tac_table_inline_in_para(t, seg_width, para)));
 
                     // [Task #565] 인라인 표 + 다른 인라인 컨트롤(수식/treat_as_char Picture/Shape)
                     // 이 같이 있는 문단은 layout_inline_table_paragraph 가 인라인 수식 등을
@@ -5752,8 +5761,8 @@ impl LayoutEngine {
                         );
                         let has_tac_block = para.controls.iter().any(|c| {
                             matches!(c, Control::Table(t) if t.common.treat_as_char
-                                && !crate::renderer::height_measurer::is_tac_table_inline(
-                                    t, seg_width, &para.text, &para.controls))
+                                && !crate::renderer::height_measurer::is_tac_table_inline_in_para(
+                                    t, seg_width, para))
                         });
                         if has_tac_block {
                             let pp_text_only_ws = if let Some(comp) = composed.get(*para_index) {
@@ -7002,6 +7011,12 @@ impl LayoutEngine {
                         None
                     }
                 });
+                // [Task #2220] 저장 host lh 가 표 outer_margin 을 포함하는 증거
+                // (lh ≥ 표 선언높이 + om 상하합, 주보 p1: 24700 = 22996 + 852×2).
+                // 이 경우 저장 lh 기반 advance 는 문단 줄 상단(para_y) 기준이어야
+                // 하며, om_top 선가산분·om_bottom 후가산(#521)을 겹치면 om 상하합
+                // (1704HU=22.7px)만큼 후속 본문이 밀려 단 하단이 절단된다.
+                let mut stored_lh_covers_om = false;
                 if let Some(seg) = host_seg {
                     if seg.line_spacing > 0 {
                         y_offset += hwpunit_to_px(seg.line_spacing, self.dpi);
@@ -7010,7 +7025,22 @@ impl LayoutEngine {
                         // 표 렌더 높이가 아닌, 일반 문단과 동일한 lh+ls advance 사용
                         let advance =
                             hwpunit_to_px(seg.line_height + seg.line_spacing, self.dpi).max(0.0);
-                        y_offset = tac_table_y_before + advance;
+                        stored_lh_covers_om = matches!(
+                            para.controls.get(control_index),
+                            Some(Control::Table(t))
+                                if t.common.height < 0x8000_0000
+                                    && i64::from(seg.line_height)
+                                        >= t.common.height as i64
+                                            + t.outer_margin_top as i64
+                                            + t.outer_margin_bottom as i64
+                                            - 10
+                                    && t.outer_margin_top as i64 + t.outer_margin_bottom as i64 > 0
+                        );
+                        y_offset = if stored_lh_covers_om {
+                            para_y_for_table + advance
+                        } else {
+                            tac_table_y_before + advance
+                        };
                     }
                 }
                 let comp = composed.get(para_index);
@@ -7033,7 +7063,9 @@ impl LayoutEngine {
                     } else {
                         0.0
                     };
-                if outer_margin_bottom_px > 0.0 {
+                // [Task #2220] 저장 lh 가 om 을 포함한 advance 를 썼으면 om_bottom
+                // 은 이미 반영됨 — #521 후가산은 그 외 경로에만 적용.
+                if outer_margin_bottom_px > 0.0 && !stored_lh_covers_om {
                     y_offset += outer_margin_bottom_px;
                 }
                 return (y_offset, true);
@@ -7048,11 +7080,8 @@ impl LayoutEngine {
                     }
                     if let Control::Table(inline_t) = ctrl {
                         if inline_t.common.treat_as_char
-                            && crate::renderer::height_measurer::is_tac_table_inline(
-                                inline_t,
-                                seg_width,
-                                &para.text,
-                                &para.controls,
+                            && crate::renderer::height_measurer::is_tac_table_inline_in_para(
+                                inline_t, seg_width, para,
                             )
                         {
                             let mt = measured_tables
@@ -7736,8 +7765,8 @@ impl LayoutEngine {
 
                         if !already_registered && !has_full_para_item {
                             let bin_data_id = pic.image_attr.bin_data_id;
-                            let image_data = find_bin_data(bin_data_content, bin_data_id)
-                                .map(|c| c.data.clone());
+                            let image_data =
+                                find_bin_data(bin_data_content, bin_data_id).map(|c| c.data.load());
                             let crop = {
                                 let c = &pic.crop;
                                 if c.right > c.left && c.bottom > c.top {
