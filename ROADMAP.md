@@ -26,6 +26,7 @@
 > | 2026-07-13 | 1.1 | upstream `rhwp` **v0.7.18** 동기화. `rhwp-batch` 동일 버전 릴리즈. |
 > | 2026-07-17 | 1.2 | upstream `rhwp` **v0.7.19** 동기화. `rhwp-batch` 동일 버전 릴리즈. |
 > | 2026-07-25 | 1.3 | upstream `rhwp` **v0.8.0** 동기화. `rhwp-batch` 동일 버전 릴리즈. |
+> | 2026-07-26 | 1.4 | upstream `rhwp` **v0.8.2** 동기화. `rhwp-batch` 동일 버전 릴리즈. |
 
 ---
 
