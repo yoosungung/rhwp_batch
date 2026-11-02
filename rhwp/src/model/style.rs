@@ -48,7 +48,7 @@ pub fn border_width_mm_str(index: u8) -> &'static str {
 }
 
 /// 글꼴 정보 (HWPTAG_FACE_NAME)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Font {
     /// 원본 레코드 바이트 (라운드트립 보존용)
     pub raw_data: Option<Vec<u8>>,
@@ -81,7 +81,7 @@ pub struct Font {
 /// 4개 속성을 모두 보존해 라운드트립 무손실을 보장한다. `font_type`/`is_embedded`/
 /// `bin_item_id_ref` 는 부모 `<hh:font>` 의 같은 이름 속성과 독립적이다
 /// (예: HFT 글꼴이 TTF 대체 글꼴을 가질 수 있음).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct SubstFont {
     /// 대체 글꼴 이름
     pub face: String,
@@ -96,7 +96,10 @@ pub struct SubstFont {
 }
 
 /// 글자 모양 (HWPTAG_CHAR_SHAPE)
-#[derive(Debug, Clone, Default)]
+///
+/// `Default` 는 [수동 구현](#impl-Default-for-CharShape)이다 — 파생하면 `relative_sizes` 가
+/// 스펙 위반값 0 이 된다(#4141).
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CharShape {
     /// 원본 레코드 바이트 (라운드트립 보존용, 있으면 직렬화 시 우선 사용)
     pub raw_data: Option<Vec<u8>>,
@@ -161,6 +164,97 @@ pub struct CharShape {
     pub use_font_space: bool,
 }
 
+/// `relative_sizes` 만 Rust 파생 기본값(0)이 아니라 **스펙 기본값 100** 이다. 나머지 필드는
+/// 파생값과 같다.
+///
+/// # 왜 파생 Default 로는 안 되는가 (#4141)
+///
+/// OWPML 은 `relSz` 를 `xs:positiveInteger` minInclusive=10 / maxInclusive=250,
+/// `default="100"` 으로 정의한다(`mydocs/manual/OWPML SCHEMA/Header XML schema.xml:716-728`).
+/// **0 은 타입 수준에서 이미 불법이다.** 한컴은 실효 크기를 `기준 크기 × 상대크기%` 로
+/// 해석하므로 0 이 저장되면 10pt 글자가 0.1pt 로 그려져 문서가 사실상 백지가 된다
+/// (`samples/SO-SUEOP.hwp` 변환본 한컴 PDF 실측: 46쪽 10,604 span 전부 0.12pt).
+///
+/// 이 값을 채우지 않는 생성 경로가 여럿이다 — HWP3 변환(`parser/hwp3/mod.rs:526`, HWP3
+/// 레코드에 상대크기 개념 자체가 없다), HWPX `charPr` 의 `relSz` 자식 부재와 id 갭
+/// 채움(`parser/hwpx/header.rs:588`, `:848-858`), HML `RELSIZE` 부재
+/// (`parser/hml/reader.rs:599-605`), HTML import. 세 라이터(HWP5·HWPX·HML)는 모두 가드 없이
+/// IR 값을 그대로 방출한다. 기본값을 스펙에 맞추면 그 전부가 한 곳에서 해소된다.
+///
+/// HWP5 바이너리 파서는 이미 100 을 폴백한다(`parser/doc_info.rs:542-545`) — 파생 Default 의
+/// 0 은 그 폴백과도 불일치였다.
+///
+/// # 장평 `ratios` (#4161)
+///
+/// OWPML `ratio` 는 default="100", `xs:positiveInteger` [50,200] 이라 파생값 0 은 타입
+/// 수준에서 불법이고, HWP5 파서 폴백(`parser/doc_info.rs:528-532`)도 100 이다. 렌더러
+/// 폭 경로는 전부 `ratio > 0.0` 폴백이라 0→100 전환의 자체 렌더 산출은 동일하며,
+/// 저장 축(HWP5·HWPX·HML)의 스키마 불법값 방출만 사라진다.
+///
+/// # 왜 `base_size` 는 그대로 두는가
+///
+/// OWPML `height` 는 `xs:integer`(제약 없음, default=1000)라 0 이 스키마 합법이고,
+/// 실표본에서 기본값 base_size 가 소비되는 사례가 없다(#4161 stage1 §5). 반면 1000 으로
+/// 바꾸면 `doclang/adapter/inline.rs` 의 "폰트 정보 없음" sentinel, hidden-text 은닉
+/// 판정(0pt→10pt), 무가드 레이아웃 소비(`renderer/style_resolver.rs:341`) 세 축의 계약이
+/// 움직인다. "기본값 유래" 프로버넌스 설계가 필요한 별도 이슈로 남긴다.
+///
+/// # 음영색 sentinel (#4155)
+///
+/// `shade_color` 의 파생 기본값 0 은 **검정**이고, HWP5 라이터가 그대로 저장하면 한컴이
+/// 글자마다 순검정 사각형을 칠해 본문 전체가 검정 막대가 된다(`samples/SO-SUEOP.hwp`
+/// 변환본 한컴 PDF 실측: 3쪽에 줄 크기 검정 fill 65개, 원본은 글리프 크기 35개).
+/// rhwp 자신은 이 결함을 볼 수 없다 — 렌더러가 검정을 "음영 없음" sentinel 로 읽는다.
+///
+/// 한컴은 "음영 없음"을 `0xFFFFFFFF` 로 쓴다 — 코퍼스 380건에서 22,189회, 검정은 0회다.
+/// HWPX `shadeColor="none"` 과 한/글 HML `4294967295` 도 같은 값으로 수렴한다. 정의는
+/// [`crate::model::color::NONE`] 하나이며, 세 라이터(HWP5·HWPX·HML)가 무수정으로 정합한다.
+///
+/// # 왜 필드를 전부 나열하는가
+///
+/// `CharShape` 에 필드가 추가되면 이 impl 이 컴파일 에러를 낸다. 새 필드의 기본값을 스펙과
+/// 대조하도록 강제하는 장치다 — 조용한 표류를 막는다.
+impl Default for CharShape {
+    fn default() -> Self {
+        Self {
+            raw_data: None,
+            font_ids: [0; 7],
+            // ↓ 파생값 0 은 OWPML 유효범위 50~200 밖 — positiveInteger 라 타입 수준 불법 (#4161)
+            ratios: [100; 7],
+            spacings: [0; 7],
+            // ↓ 이 한 줄만 파생값과 다르다 (파생값 0 은 OWPML 유효범위 10~250 밖)
+            relative_sizes: [100; 7],
+            char_offsets: [0; 7],
+            base_size: 0,
+            attr: 0,
+            italic: false,
+            bold: false,
+            underline_type: UnderlineType::None,
+            outline_type: 0,
+            shadow_type: 0,
+            shadow_offset_x: 0,
+            shadow_offset_y: 0,
+            text_color: 0,
+            underline_color: 0,
+            // ↓ 파생값 0(검정)은 한컴이 본문을 검정 막대로 덮게 만든다 (#4155)
+            shade_color: super::color::NONE,
+            shadow_color: 0,
+            border_fill_id: 0,
+            strike_color: 0,
+            strikethrough: false,
+            subscript: false,
+            superscript: false,
+            emboss: false,
+            engrave: false,
+            emphasis_dot: 0,
+            underline_shape: 0,
+            strike_shape: 0,
+            kerning: false,
+            use_font_space: false,
+        }
+    }
+}
+
 /// CharShape 비교: raw_data 필드 제외 (라운드트립용 원본 바이트는 논리적 동일성과 무관)
 impl PartialEq for CharShape {
     fn eq(&self, other: &Self) -> bool {
@@ -209,7 +303,7 @@ pub enum UnderlineType {
 }
 
 /// 문단 머리 모양 종류 (attr1 bit 23~24)
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub enum HeadType {
     /// 없음
     #[default]
@@ -223,7 +317,7 @@ pub enum HeadType {
 }
 
 /// 문단 모양 (HWPTAG_PARA_SHAPE)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ParaShape {
     /// 원본 레코드 바이트 (라운드트립 보존용)
     pub raw_data: Option<Vec<u8>>,
@@ -263,11 +357,43 @@ pub struct ParaShape {
     pub head_type: HeadType,
     /// 문단 수준 (0~6 → 1~7수준, attr1 bit 25~27)
     pub para_level: u8,
+    /// [#4898] HWPX 원본이 `hp:switch` 없이 여백·줄간격을 평문으로 적었는지 보존한다.
+    /// 평문 고정 줄간격은 switch와 다른 저장 계약이므로 원본 표기를 유지한다.
+    /// 평문 여백의 패키지 버전별 단위는 아래 출처와 함께 보존한다.
+    pub hwpx_plain_para_margin: bool,
+    /// 패키지 xmlVersion 1.4 이상에서 평문 여백이 물리 HWPUNIT인지 보존한다.
+    /// 이전 버전은 저장값이 이미 공통 IR 단위이므로 직렬화에서도 절반으로 줄이지 않는다.
+    pub hwpx_plain_para_margin_physical: bool,
     /// [#1986] HWPX breakSetting@breakLatinWord 원문 보존
     /// (BREAK_WORD/KEEP_WORD/HYPHENATION). 파서 미수집 시 None → 직렬화 기본값
     /// KEEP_WORD. 값이 3가지라 attr1 비트 인코딩 대신 원문 보존으로 무손실 방출.
     /// 꼬리말·표셀 등 재계산 경로에서 줄나눔이 달라져 레이아웃이 갈리는 것을 막는다.
     pub break_latin_word: Option<String>,
+}
+
+/// [#6875] 문단 줄바꿈 방식("한 줄로 입력") — HWP5 ParaShape `attr2` bits 0-1 ↔
+/// OWPML `hh:breakSetting@lineWrap`.
+///
+/// 값 대응은 셀 줄바꿈(#4898, LIST_HEADER bit 19-20)과 같은 열거 순서다:
+/// `0`=BREAK · `1`=SQUEEZE · `2`=KEEP. 한컴 변환본으로 1↔SQUEEZE 를 확인했다.
+pub const PARA_ATTR2_LINE_WRAP_MASK: u32 = 0x03;
+
+/// OWPML `lineWrap` 문자열 → `attr2` bits 0-1 값. 모르는 값은 BREAK(0).
+pub fn para_line_wrap_bits(value: &str) -> u32 {
+    match value {
+        "SQUEEZE" => 1,
+        "KEEP" => 2,
+        _ => 0,
+    }
+}
+
+/// `attr2` bits 0-1 → OWPML `lineWrap` 문자열. 3(정의되지 않음)은 BREAK.
+pub fn para_line_wrap_str(attr2: u32) -> &'static str {
+    match attr2 & PARA_ATTR2_LINE_WRAP_MASK {
+        1 => "SQUEEZE",
+        2 => "KEEP",
+        _ => "BREAK",
+    }
 }
 
 /// ParaShape 비교: raw_data 필드 제외 (라운드트립용 원본 바이트는 논리적 동일성과 무관)
@@ -298,7 +424,7 @@ impl PartialEq for ParaShape {
 impl Eq for ParaShape {}
 
 /// 문단 번호 정의 (HWPTAG_NUMBERING)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Numbering {
     /// 원본 레코드 바이트 (라운드트립 보존용)
     pub raw_data: Option<Vec<u8>>,
@@ -319,7 +445,7 @@ pub struct Numbering {
 }
 
 /// 문단 머리 정보 (표 41)
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct NumberingHead {
     /// 속성 (정렬, 너비 따름, 자동 내어쓰기 등)
     pub attr: u32,
@@ -334,7 +460,7 @@ pub struct NumberingHead {
 }
 
 /// 글머리표 정의 (HWPTAG_BULLET, 표 44, 24바이트)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Bullet {
     /// 원본 레코드 바이트 (라운드트립 보존용)
     pub raw_data: Option<Vec<u8>>,
@@ -361,7 +487,7 @@ pub struct Bullet {
 }
 
 /// 텍스트 정렬 방식
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub enum Alignment {
     #[default]
     Justify,
@@ -373,7 +499,7 @@ pub enum Alignment {
 }
 
 /// 줄 간격 종류
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub enum LineSpacingType {
     #[default]
     Percent,
@@ -383,7 +509,7 @@ pub enum LineSpacingType {
 }
 
 /// 탭 정의 (HWPTAG_TAB_DEF)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TabDef {
     /// 원본 레코드 바이트 (라운드트립 보존용)
     pub raw_data: Option<Vec<u8>>,
@@ -398,7 +524,7 @@ pub struct TabDef {
 }
 
 /// 탭 항목
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TabItem {
     /// 탭 위치
     pub position: HwpUnit,
@@ -427,7 +553,7 @@ impl PartialEq for TabDef {
 impl Eq for TabDef {}
 
 /// 스타일 (HWPTAG_STYLE)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Style {
     /// 원본 레코드 바이트 (라운드트립 보존용)
     pub raw_data: Option<Vec<u8>>,
@@ -455,7 +581,7 @@ pub struct Style {
 }
 
 /// 테두리/배경 (HWPTAG_BORDER_FILL)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct BorderFill {
     /// 원본 레코드 바이트 (라운드트립 보존용)
     pub raw_data: Option<Vec<u8>>,
@@ -474,7 +600,7 @@ pub struct BorderFill {
 }
 
 /// 중심선 방향 (HWPX borderFill@centerLine)
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub enum CenterLine {
     /// 없음
     #[default]
@@ -539,7 +665,7 @@ impl CenterLine {
 }
 
 /// 테두리선 정보
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub struct BorderLine {
     /// 선 종류
     pub line_type: BorderLineType,
@@ -551,7 +677,7 @@ pub struct BorderLine {
 
 /// 테두리선 종류 (HWP 스펙 표 27)
 /// 0=선없음, 1=실선, 2=파선, 3=점선, ...
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub enum BorderLineType {
     /// 선 없음 (0)
     None,
@@ -593,7 +719,7 @@ pub enum BorderLineType {
 }
 
 /// 대각선 정보
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub struct DiagonalLine {
     /// 대각선 선 종류 코드. BorderLineType의 HWP/HWPX 코드와 같은 값을 사용한다.
     pub diagonal_type: u8,
@@ -604,7 +730,7 @@ pub struct DiagonalLine {
 }
 
 /// 채우기 정보
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct Fill {
     /// 채우기 종류
     pub fill_type: FillType,
@@ -619,7 +745,7 @@ pub struct Fill {
 }
 
 /// 채우기 종류
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub enum FillType {
     #[default]
     None,
@@ -629,7 +755,7 @@ pub enum FillType {
 }
 
 /// 단색 채우기
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub struct SolidFill {
     /// 배경색
     pub background_color: ColorRef,
@@ -640,7 +766,7 @@ pub struct SolidFill {
 }
 
 /// 그러데이션 채우기
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct GradientFill {
     /// 유형 (1: 줄무늬, 2: 원형, 3: 원뿔형, 4: 사각형)
     pub gradient_type: i16,
@@ -661,18 +787,40 @@ pub struct GradientFill {
 }
 
 /// 이미지 채우기
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct ImageFill {
     /// 채우기 유형
     pub fill_mode: ImageFillMode,
-    /// 밝기
+    /// HWP5 이진 `FILL_INFO` 의 **첫 바이트** — 화면 `contrast` 다. [`Self::display_brightness_contrast`] 참조.
     pub brightness: i8,
-    /// 명암
+    /// HWP5 이진 `FILL_INFO` 의 **둘째 바이트** — 화면 `bright` 다. [`Self::display_brightness_contrast`] 참조.
     pub contrast: i8,
     /// 그림 효과
     pub effect: u8,
     /// BinData ID 참조
     pub bin_data_id: u16,
+}
+
+impl ImageFill {
+    /// 화면·HWPX 속성 순서의 `(bright, contrast)`.
+    ///
+    /// `ImageFill` 의 두 필드는 **HWP5 이진 `FILL_INFO` 의 저장 순서**를 그대로 담는다.
+    /// 그 순서는 HWPX 속성 이름과 반대다 — 이진 1번 바이트가 HWPX `contrast`, 2번
+    /// 바이트가 HWPX `bright` 다. `#6895` 에서 한/글 오라클로 확인했다:
+    ///
+    /// ```text
+    ///   원본 HWPX               bright="50"  contrast="-15"
+    ///   한/글이 HWP5 로 저장     이진 1번 = -15 · 2번 = 50
+    ///   한/글이 다시 HWPX 로     bright="50"  contrast="-15"   (보존)
+    /// ```
+    ///
+    /// 그래서 **화면·HWPX 로 나갈 때는 반드시 이 함수를 거친다.** 필드를 곧바로
+    /// 쓰면 두 값이 뒤바뀐다(저장마다 뒤집히고, 칸 배경 그림은 색조가 반대로 그려졌다).
+    /// [`crate::renderer::render_tree::PageBackgroundImage::display_brightness_contrast`]
+    /// 와 같은 계약이다.
+    pub const fn display_brightness_contrast(&self) -> (i8, i8) {
+        (self.contrast, self.brightness)
+    }
 }
 
 /// 이미지 채우기 유형
@@ -685,6 +833,8 @@ pub enum ImageFillMode {
     TileVertLeft,
     TileVertRight,
     FitToSize,
+    /// HWPX `imgBrush mode="ZOOM"` — 영역에 맞춰 종횡비를 지키며 축소(#6310).
+    Zoom,
     Total,
     Center,
     CenterTop,
@@ -699,7 +849,7 @@ pub enum ImageFillMode {
 }
 
 /// 테두리 선 정보 (그리기 개체용)
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct ShapeBorderLine {
     /// 선 색상
     pub color: ColorRef,
@@ -1058,6 +1208,63 @@ mod tests {
         assert!(!cs.bold);
         assert!(!cs.italic);
         assert_eq!(cs.underline_type, UnderlineType::None);
+    }
+
+    /// `Default` 수동 구현이 파생값과 어긋나는 필드는 `relative_sizes`(#4141),
+    /// `shade_color`(#4155), `ratios`(#4161) **셋뿐**임을 고정한다.
+    ///
+    /// 이 비대칭은 의도된 것이다. 세 필드는 파생값이 각각 스펙 위반(relSz·ratio 유효범위
+    /// 밖)과 실제 색(검정)이라 저장 바이트에서 소비자를 깨뜨렸다. 반면 `base_size` 는
+    /// 파생값 0 이 스키마 합법(`height` 는 xs:integer)이고 손실 보고·은닉 판정·레이아웃
+    /// 계약이 그 값에 걸려 있어 남겼다 — 이 테스트가 그 경계를 읽히게 한다.
+    #[test]
+    fn char_shape_default_matches_spec_except_base_size() {
+        let cs = CharShape::default();
+
+        // #4141 — OWPML relSz default="100", 유효범위 10~250
+        // (mydocs/manual/OWPML SCHEMA/Header XML schema.xml:716-728)
+        assert_eq!(
+            cs.relative_sizes, [100; 7],
+            "상대크기 기본값은 OWPML 기본값 100 이어야 한다. 0 이면 한컴이 \
+             `크기 × 상대크기%` 로 해석해 전 본문을 0.1pt 로 그린다 (#4141)"
+        );
+
+        // #4161 — OWPML ratio default="100", positiveInteger 유효범위 50~200
+        // (mydocs/manual/OWPML SCHEMA/Header XML schema.xml:590-611)
+        assert_eq!(
+            cs.ratios, [100; 7],
+            "장평 기본값은 OWPML 기본값 100 이어야 한다. 0 은 positiveInteger [50,200] \
+             밖의 스키마 불법값이고, 이 값을 신뢰하는 소비자는 장평 0 = 글자 폭 0 을 \
+             받는다 (#4161)"
+        );
+
+        // 의도적으로 고치지 않은 것 — 0 이 스키마 합법(xs:integer)이고, 1000 으로 바꾸면
+        // doclang 손실 보고 sentinel(`doclang/adapter/inline.rs`)·hidden-text 은닉
+        // 판정(0pt→10pt)·무가드 레이아웃 소비 세 축의 계약이 움직인다 (#4161 stage1 §5).
+        assert_eq!(
+            cs.base_size, 0,
+            "기준 크기 기본값을 바꾸려면 '기본값 유래' 프로버넌스 설계가 먼저다 — \
+             #4161 범위 밖이며 별도 이슈로 다룬다. 무심코 바꾸지 마라"
+        );
+
+        // 0 이 스펙상 유효값이라 손대지 않는 것
+        // (OWPML offset default=0 범위 [-100,100], spacing default=0 범위 [-50,50])
+        assert_eq!(cs.char_offsets, [0; 7]);
+        assert_eq!(cs.spacings, [0; 7]);
+
+        // 이번에 고친 것 — "음영 없음"은 색이 아니라 sentinel 이다. 파생값 0(검정)을
+        // HWP5 로 저장하면 한컴이 글자마다 순검정 사각형을 칠한다 (#4155).
+        assert_eq!(
+            cs.shade_color,
+            crate::model::color::NONE,
+            "음영 없음 sentinel 은 한컴 HWP5·HWPX \"none\"·한/글 HML 4294967295 와 같은 \
+             0xFFFFFFFF 다 (#4155). 0 으로 되돌리면 HWP3 변환본이 검정 막대가 된다"
+        );
+
+        // 0 이 그대로 유효한 나머지 색상값
+        assert_eq!(cs.shadow_color, 0);
+        assert_eq!(cs.underline_color, 0);
+        assert_eq!(cs.text_color, 0);
     }
 
     #[test]

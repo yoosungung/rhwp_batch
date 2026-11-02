@@ -193,8 +193,10 @@ pub fn write_line<W: Write>(
     write_fill_brush(w, &line.drawing.fill, ctx)?;
     write_shadow(w, &line.drawing)?;
 
-    // 좌표 — hp:startPt/hp:endPt 자식 (파서가 읽는 유일 경로). connectLine 은
-    // subjectIDRef/subjectIdx(연결 개체) 포함.
+    // 좌표 — startPt/endPt 자식 (파서가 읽는 유일 경로. 프리픽스 무관 로컬명
+    // 매칭). 네임스페이스는 요소별로 다르다: hp:line 의 자식은 hc: (XSD LineType
+    // — hp: 로 쓰면 한컴오피스가 문서를 거부한다), hp:connectLine 의 자식은
+    // hp: (ConnectPointType 로컬 요소, subjectIDRef/subjectIdx 포함).
     let (sub_start_ref, sub_start_idx, sub_end_ref, sub_end_idx) = line
         .connector
         .as_ref()
@@ -233,8 +235,8 @@ pub fn write_line<W: Write>(
             ],
         )?;
     } else {
-        empty_tag(w, "hp:startPt", &[("x", &sx), ("y", &sy)])?;
-        empty_tag(w, "hp:endPt", &[("x", &ex), ("y", &ey)])?;
+        empty_tag(w, "hc:startPt", &[("x", &sx), ("y", &sy)])?;
+        empty_tag(w, "hc:endPt", &[("x", &ex), ("y", &ey)])?;
     }
 
     // connectLine 제어점 (꺾인/곡선 커넥터의 경로).
@@ -283,6 +285,10 @@ pub fn write_container_open<W: Write>(
     let z_order = common.z_order.to_string();
     let tw = text_wrap_str(common.text_wrap);
     let tf = text_flow_str(common.text_flow);
+    // [#5716] groupLevel 은 IR(shape_attr.group_level)을 보존한다. 종전 "0" 하드코딩은
+    // 다른 그룹의 멤버인 컨테이너의 중첩 레벨이 저장 시 전부 0 으로 유실됐다
+    // (리프 도형 경로는 #2746 에서 이미 보존 — 컨테이너 자신만 누락).
+    let group_level = sa.group_level.to_string();
 
     start_tag_attrs(
         w,
@@ -297,7 +303,7 @@ pub fn write_container_open<W: Write>(
             ("lock", bool01(common.locked)),
             ("dropcapstyle", "None"),
             ("href", ""),
-            ("groupLevel", "0"),
+            ("groupLevel", &group_level),
             ("instid", &id_str),
         ],
     )?;
@@ -345,13 +351,22 @@ pub(crate) fn write_ole<W: Write>(
     ctx: &mut SerializeContext,
 ) -> Result<(), SerializeError> {
     let c = &ole.common;
-    let id_str = c.instance_id.to_string();
+    // [#4669] 원본 `id` 는 `instid` 와 별개 값이다 — 파서가 보존한 원문을 되쓰고,
+    // HWP5 출신(None)은 종전대로 instance_id 를 겸용한다.
+    let id_str = ole.hwpx_ole_id.unwrap_or(c.instance_id).to_string();
+    let instid_str = c.instance_id.to_string();
     let z_order = c.z_order.to_string();
     let tw = text_wrap_str(c.text_wrap);
     let tf = text_flow_str(c.text_flow);
     // owned 으로 변환해 ctx 불변 borrow 를 즉시 해제(이후 write_caption 의 &mut 사용).
-    let bidref = ctx
-        .resolve_bin_id(ole.bin_data_id as u16)
+    // [버그] ole.bin_data_id 는 HWP5 바이너리 상 4바이트(u32) 필드지만 BinData 테이블은
+    // u16 ID 로 관리된다. 종전에는 `as u16` 로 상위 비트를 자른 뒤 조회해, 65536 이상인
+    // (잘못된/조작된) 값이 하위 16비트가 같은 다른 BinData 항목을 가리키는 오참조를
+    // 일으킬 수 있었다. try_from 으로 범위를 벗어나면 미등록으로 취급해 빈 참조로
+    // 남긴다(기존 "미등록 id → 빈 문자열" 처리와 동일한 안전한 폴백).
+    let bidref = u16::try_from(ole.bin_data_id)
+        .ok()
+        .and_then(|id| ctx.resolve_bin_id(id))
         .unwrap_or("")
         .to_string();
     let draw_aspect = match ole.drawing_aspect {
@@ -362,6 +377,9 @@ pub(crate) fn write_ole<W: Write>(
     };
     // [#2931] 개체 잠금(lock) — IR(common.locked)을 보존(종전 "0" 하드코딩 제거).
     let lock = if c.locked { "1" } else { "0" };
+    // [#5716] groupLevel — 컨테이너와 동형. IR(drawing.shape_attr.group_level)을
+    // 보존한다(종전 "0" 하드코딩은 그룹 내 OLE 의 중첩 레벨을 저장 시 유실).
+    let group_level = ole.drawing.shape_attr.group_level.to_string();
 
     start_tag_attrs(
         w,
@@ -376,8 +394,8 @@ pub(crate) fn write_ole<W: Write>(
             ("lock", bool01(c.locked)),
             ("dropcapstyle", "None"),
             ("href", ""),
-            ("groupLevel", "0"),
-            ("instid", &id_str),
+            ("groupLevel", &group_level),
+            ("instid", &instid_str),
             ("objectType", "UNKNOWN"),
             ("binaryItemIDRef", &bidref),
             ("hasMoniker", "0"),
@@ -402,6 +420,90 @@ pub(crate) fn write_ole<W: Write>(
     write_shape_comment(w, c)?;
 
     end_tag(w, "hp:ole")?;
+    Ok(())
+}
+
+// =====================================================================
+// <hp:chart> — HWPX OOXML 차트 원형 재방출 (#3546)
+// 파서는 hp:chart 를 OLE 모델(bin_data_id=60000+N)로 변환한다. 종전 저장은
+// 이를 일반 OLE 로 방출해 hp:chart → hp:ole 치환·Chart/chartN.xml →
+// BinData/image6000N.ooxml_chart 이동이 일어났고, 한컴오피스가 차트 XML 을
+// OLE 복합문서로 해석했다. chart_id_ref 표식이 있으면 원형 구조로 되쓴다.
+// =====================================================================
+pub(crate) fn write_ole_or_chart<W: Write>(
+    w: &mut Writer<W>,
+    ole: &OleShape,
+    ctx: &mut SerializeContext,
+) -> Result<(), SerializeError> {
+    match ole.chart_id_ref.as_deref() {
+        Some(chart_id_ref) => write_chart_switch(w, ole, chart_id_ref, ctx),
+        None => write_ole(w, ole, ctx),
+    }
+}
+
+/// hp:chart 재방출 — 원본이 <hp:switch> 래핑(fallback OLE 보유)이었으면 같은
+/// 구조로, bare <hp:chart> 였으면 같은 형태로 되쓴다.
+const OOXML_CHART_REQUIRED_NS: &str = "http://www.hancom.co.kr/hwpml/2016/ooxmlchart";
+
+fn write_chart_switch<W: Write>(
+    w: &mut Writer<W>,
+    ole: &OleShape,
+    chart_id_ref: &str,
+    ctx: &mut SerializeContext,
+) -> Result<(), SerializeError> {
+    match &ole.chart_switch_fallback {
+        Some(fallback) => {
+            start_tag(w, "hp:switch")?;
+            start_tag_attrs(
+                w,
+                "hp:case",
+                &[("hp:required-namespace", OOXML_CHART_REQUIRED_NS)],
+            )?;
+            write_chart_element(w, ole, chart_id_ref, ctx)?;
+            end_tag(w, "hp:case")?;
+            start_tag(w, "hp:default")?;
+            write_ole(w, fallback, ctx)?;
+            end_tag(w, "hp:default")?;
+            end_tag(w, "hp:switch")?;
+            Ok(())
+        }
+        None => write_chart_element(w, ole, chart_id_ref, ctx),
+    }
+}
+
+fn write_chart_element<W: Write>(
+    w: &mut Writer<W>,
+    ole: &OleShape,
+    chart_id_ref: &str,
+    ctx: &mut SerializeContext,
+) -> Result<(), SerializeError> {
+    let c = &ole.common;
+    let id_str = c.instance_id.to_string();
+    let z_order = c.z_order.to_string();
+    start_tag_attrs(
+        w,
+        "hp:chart",
+        &[
+            ("id", &id_str),
+            ("zOrder", &z_order),
+            ("numberingType", numbering_type_str(c.numbering_type)),
+            ("textWrap", text_wrap_str(c.text_wrap)),
+            ("textFlow", text_flow_str(c.text_flow)),
+            ("lock", bool01(c.locked)),
+            ("dropcapstyle", "None"),
+            ("chartIDRef", chart_id_ref),
+        ],
+    )?;
+    write_sz(w, c)?;
+    write_pos(w, c)?;
+    write_out_margin(w, c)?;
+    // [#4319] 캡션 — 종전엔 hp:chart 재방출 경로에만 write_caption 호출이 없어
+    // 파서를 고쳐도(ole.caption 정상 적재) 저장 시 다시 유실됐다(hp:ole 방출
+    // 경로인 write_ole 는 이미 캡션을 쓴다 — 그쪽과 동형으로 맞춘다).
+    if let Some(cap) = &ole.caption {
+        write_caption(w, cap, ctx)?;
+    }
+    end_tag(w, "hp:chart")?;
     Ok(())
 }
 
@@ -520,12 +622,17 @@ pub(crate) fn write_shape_component_block<W: Write>(
     Ok(())
 }
 
-fn write_offset<W: Write>(
+pub(super) fn write_offset<W: Write>(
     w: &mut Writer<W>,
     sa: &ShapeComponentAttr,
 ) -> Result<(), SerializeError> {
-    let x = sa.offset_x.to_string();
-    let y = sa.offset_y.to_string();
+    // [#3544] hp:offset x/y 는 OWPML XSD 상 unsigned. 한컴 산출물은 음수 오프셋을
+    // u32 wraparound 십진수로 기록하고(예: -2429 → "4294964867"), 파서도
+    // `parse_u32 as i32` 로 같은 관례를 복호한다. IR 은 레이아웃 계산을 위해
+    // signed 가 정당하므로 값은 두고, XML 경계에서만 부호화를 복원한다 —
+    // signed 그대로 문자열화하면 `y="-2"` 류 스키마 위반이 된다.
+    let x = (sa.offset_x as u32).to_string();
+    let y = (sa.offset_y as u32).to_string();
     empty_tag(w, "hp:offset", &[("x", &x), ("y", &y)])
 }
 
@@ -533,8 +640,20 @@ fn write_org_sz<W: Write>(
     w: &mut Writer<W>,
     sa: &ShapeComponentAttr,
 ) -> Result<(), SerializeError> {
-    let width = sa.original_width.to_string();
-    let height = sa.original_height.to_string();
+    // [#4669] HWP5 저장을 위해 유효 extent로 materialize했더라도 HWPX 원문의
+    // `orgSz=0` sentinel은 그대로 되돌린다.
+    let width = if sa.original_width_was_zero {
+        0
+    } else {
+        sa.original_width
+    }
+    .to_string();
+    let height = if sa.original_height_was_zero {
+        0
+    } else {
+        sa.original_height
+    }
+    .to_string();
     empty_tag(w, "hp:orgSz", &[("width", &width), ("height", &height)])
 }
 
@@ -876,6 +995,7 @@ pub(crate) fn write_fill_brush<W: Write>(
                 ImageFillMode::TileVertLeft => "TILE_VERT_LEFT",
                 ImageFillMode::TileVertRight => "TILE_VERT_RIGHT",
                 ImageFillMode::FitToSize => "FIT",
+                ImageFillMode::Zoom => "ZOOM",
                 ImageFillMode::Total => "TOTAL",
                 ImageFillMode::Center => "CENTER",
                 ImageFillMode::CenterTop => "CENTER_TOP",
@@ -890,8 +1010,13 @@ pub(crate) fn write_fill_brush<W: Write>(
             match ctx.resolve_bin_id(img.bin_data_id) {
                 Some(manifest_id) => {
                     start_tag_attrs(w, "hc:imgBrush", &[("mode", mode)])?;
-                    let bright = img.brightness.to_string();
-                    let contrast = img.contrast.to_string();
+                    // [#6895] `ImageFill` 은 이진 HWP5 저장 순서를 담으므로 HWPX 속성명으로
+                    // 나갈 때 되돌린다. 종전엔 그대로 써서 **HWPX 를 열어 저장할 때마다 두
+                    // 값이 뒤바뀌었다**(두 번 저장하면 원상 복귀). 한/글은 같은 문서에서
+                    // bright/contrast 를 보존한다.
+                    let (display_bright, display_contrast) = img.display_brightness_contrast();
+                    let bright = display_bright.to_string();
+                    let contrast = display_contrast.to_string();
                     let effect = match img.effect {
                         1 => "GRAY_SCALE",
                         2 => "BLACK_WHITE",
@@ -1406,18 +1531,20 @@ mod tests {
 
     #[test]
     fn line_emits_start_end_attrs() {
-        // [Issue #1943] 좌표는 hp:startPt/hp:endPt 자식으로 방출한다 (파서가 읽는
+        // [Issue #1943] 좌표는 startPt/endPt 자식으로 방출한다 (파서가 읽는
         // 유일 경로). 종전 startX/Y attr 은 파서가 무시하는 dead 출력이었다.
+        // hp:line 의 자식 네임스페이스는 hc: 다 (XSD LineType — hp: 로 쓰면
+        // 한컴오피스가 문서를 거부한다).
         let mut line = LineShape::default();
         line.start = Point { x: 100, y: 200 };
         line.end = Point { x: 300, y: 400 };
         let xml = serialize_line(&line);
         assert!(
-            xml.contains(r#"<hp:startPt x="100" y="200""#),
+            xml.contains(r#"<hc:startPt x="100" y="200""#),
             "startPt 자식 방출: {xml}"
         );
         assert!(
-            xml.contains(r#"<hp:endPt x="300" y="400""#),
+            xml.contains(r#"<hc:endPt x="300" y="400""#),
             "endPt 자식 방출: {xml}"
         );
         // 컴포넌트 블록·lineShape 보존 (#1943 (B)).
@@ -1531,6 +1658,21 @@ mod tests {
             xml.contains(r#"textDirection="VERTICAL""#) && !xml.contains("VERTICALALL"),
             "VERTICAL (ALL 아님) 보존: {}",
             xml
+        );
+    }
+
+    /// [Issue #3544] hp:offset x/y 는 OWPML XSD 상 unsigned — 음수 IR 오프셋은
+    /// 한컴 관례대로 u32 wraparound 십진수로 방출해야 한다 (파서 `parse_u32 as
+    /// i32` 복호의 역함수). signed 그대로 문자열화하면 `y="-2"` 류 스키마 위반.
+    #[test]
+    fn issue3544_negative_offset_emitted_as_u32_wraparound() {
+        let mut rect = RectangleShape::default();
+        rect.drawing.shape_attr.offset_x = -8974;
+        rect.drawing.shape_attr.offset_y = -2;
+        let xml = serialize_rect(&rect);
+        assert!(
+            xml.contains(r#"<hp:offset x="4294958322" y="4294967294"/>"#),
+            "음수 오프셋은 u32 wraparound 십진수로 방출되어야 한다: {xml}"
         );
     }
 
@@ -1860,5 +2002,106 @@ mod tests {
         assert_eq!(hatch_style_str(5), "CROSS");
         assert_eq!(hatch_style_str(6), "CROSS_DIAGONAL");
         assert_eq!(hatch_style_str(99), "HORIZONTAL");
+    }
+
+    /// [#4669] 재방출 `id` 는 파서가 보존한 원문(hwpx_ole_id)을 되쓰고 `instid`
+    /// 는 instance_id 를 쓴다 — 원산 파일은 두 값이 다르다(실측 2141242094 /
+    /// 1067500271). 종전엔 둘 다 instance_id 로 방출돼 id 원문이 유실됐다.
+    /// curSz=0 센티널(#2017)의 OLE 경로 복원도 함께 고정한다.
+    #[test]
+    fn issue4669_write_ole_preserves_original_id_and_cur_sz_zero() {
+        use crate::model::document::Document;
+
+        let doc = Document::default();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+
+        let mut ole = OleShape::default();
+        ole.hwpx_ole_id = Some(2141242094);
+        ole.common.instance_id = 1067500271;
+        ole.drawing.shape_attr.original_width = 42001;
+        ole.drawing.shape_attr.original_height = 13501;
+        ole.drawing.shape_attr.current_width = 42001;
+        ole.drawing.shape_attr.current_height = 13501;
+        ole.drawing.shape_attr.current_width_was_zero = true;
+        ole.drawing.shape_attr.current_height_was_zero = true;
+
+        let mut w: Writer<Vec<u8>> = Writer::new(Vec::new());
+        write_ole(&mut w, &ole, &mut ctx).expect("write_ole");
+        let xml = String::from_utf8(w.into_inner()).unwrap();
+
+        assert!(xml.contains(r#"id="2141242094""#), "id 원문 보존: {xml}");
+        assert!(
+            xml.contains(r#"instid="1067500271""#),
+            "instid 는 instance_id: {xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:curSz width="0" height="0"/>"#),
+            "curSz=0 원문 복원(#2017 센티널): {xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:orgSz width="42001" height="13501"/>"#),
+            "orgSz 보존: {xml}"
+        );
+    }
+
+    /// [#4669] HWP5 출신(hwpx_ole_id=None)은 종전대로 id=instid=instance_id.
+    #[test]
+    fn issue4669_write_ole_without_original_id_falls_back_to_instance_id() {
+        use crate::model::document::Document;
+
+        let doc = Document::default();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+
+        let mut ole = OleShape::default();
+        ole.common.instance_id = 77;
+
+        let mut w: Writer<Vec<u8>> = Writer::new(Vec::new());
+        write_ole(&mut w, &ole, &mut ctx).expect("write_ole");
+        let xml = String::from_utf8(w.into_inner()).unwrap();
+        assert!(xml.contains(r#"id="77""#), "{xml}");
+        assert!(xml.contains(r#"instid="77""#), "{xml}");
+    }
+
+    /// [버그] OLE 의 `bin_data_id` 는 HWP5 바이너리상 u32 필드다. 종전 코드는
+    /// `as u16` 로 상위 비트를 잘라 조회했기 때문에, 65536 이상인 id가 하위 16비트가
+    /// 같은 *다른* BinData 항목(예: id=5)을 잘못 가리킬 수 있었다. 이 값이 등록된
+    /// BinData 범위(u16)를 벗어나면 그 어떤 항목도 가리키지 않고 빈 참조로 남아야
+    /// 한다(오참조 방지).
+    #[test]
+    fn ole_bin_data_id_beyond_u16_does_not_alias_truncated_entry() {
+        use crate::model::bin_data::{BinData, BinDataContent, BinDataType};
+        use crate::model::document::Document;
+
+        let mut doc = Document::default();
+        // 하위 16비트가 0x10005 와 같은(=5) 정상 BinData 항목을 등록해 둔다.
+        doc.bin_data_content.push(BinDataContent {
+            id: 5,
+            data: vec![0, 1, 2].into(),
+            extension: "png".to_string(),
+        });
+        doc.doc_info.bin_data_list.push(BinData {
+            data_type: BinDataType::Embedding,
+            storage_id: 5,
+            extension: Some("png".to_string()),
+            ..Default::default()
+        });
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        // 등록 확인: id=5 는 정상적으로 조회돼야 한다.
+        assert_eq!(ctx.resolve_bin_id(5), Some("image5"));
+
+        let ole = OleShape {
+            bin_data_id: 0x1_0005, // truncate 시 5 가 되는 값(범위 밖)
+            drawing_aspect: OleDrawingAspect::Content,
+            ..Default::default()
+        };
+
+        let mut w: Writer<Vec<u8>> = Writer::new(Vec::new());
+        write_ole(&mut w, &ole, &mut ctx).expect("write_ole");
+        let xml = String::from_utf8(w.into_inner()).unwrap();
+
+        assert!(
+            !xml.contains(r#"binaryItemIDRef="image5""#),
+            "u32 bin_data_id 가 u16 로 잘려 무관한 image5 를 오참조함: {xml}"
+        );
     }
 }

@@ -276,20 +276,7 @@ fn hyperlink_href_map(para: &Paragraph, char_len: usize) -> (Vec<Option<usize>>,
 /// `\` escaping `;` and `\` itself. We return the first (URL) segment, unescaped
 /// and trimmed.
 fn hyperlink_uri(command: &str) -> String {
-    let mut out = String::new();
-    let mut chars = command.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                if let Some(n) = chars.next() {
-                    out.push(n);
-                }
-            }
-            ';' => break,
-            _ => out.push(c),
-        }
-    }
-    out.trim().to_string()
+    crate::model::hyperlink::command_uri(command)
 }
 
 /// A contiguous formatting run expressed as a half-open visible-char range.
@@ -745,6 +732,7 @@ mod tests {
             end_char_idx: 8,
             control_idx: 0,
             end_field_id: 0,
+            inner_slot_count: 0,
         }];
 
         let di = DocInfo::default();
@@ -779,6 +767,7 @@ mod tests {
             end_char_idx: 6,
             control_idx: 0,
             end_field_id: 0,
+            inner_slot_count: 0,
         }];
 
         let di = DocInfo::default();

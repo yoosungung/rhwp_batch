@@ -3,9 +3,12 @@ use super::super::pagination::{ColumnContent, PageContent, PageItem};
 use super::text_measurement::estimate_text_width;
 use super::utils::{expand_numbering_format, numbering_format_to_number_format};
 use super::*;
+use crate::model::image::Picture;
 use crate::model::page::{ColumnDef, PageDef};
 use crate::model::paragraph::{CharShapeRef, LineSeg, Paragraph};
-use crate::model::shape::{CommonObjAttr, RectangleShape, TextWrap, VertRelTo};
+use crate::model::shape::{
+    Caption, CaptionDirection, CommonObjAttr, RectangleShape, TextWrap, VertRelTo,
+};
 use crate::model::style::{Numbering, NumberingHead};
 use crate::model::table::{Cell, Table, TablePageBreak};
 use crate::renderer::composer::compose_paragraph;
@@ -34,6 +37,7 @@ fn test_build_empty_page() {
     let page_content = PageContent {
         page_index: 0,
         page_number: 0,
+        page_number_restarted: false,
         section_index: 0,
         layout,
         column_contents: Vec::new(),
@@ -44,6 +48,7 @@ fn test_build_empty_page() {
         footnotes: Vec::new(),
         active_master_page: None,
         extra_master_pages: Vec::new(),
+        ladder_band_tables: Vec::new(),
     };
     let styles = ResolvedStyleSet::default();
     let tree = engine.build_render_tree(
@@ -63,6 +68,149 @@ fn test_build_empty_page() {
     );
     // 페이지 노드 + 배경 + 머리말 + 본문 + 각주 + 꼬리말
     assert!(tree.root.children.len() >= 4);
+}
+
+#[test]
+fn physical_outer_box_paint_inset_layout_gate_requires_single_active_zone_column_and_height_match()
+{
+    use super::physical_outer_box_paint_inset_layout_gate;
+
+    assert!(physical_outer_box_paint_inset_layout_gate(
+        1,
+        Some(317.2),
+        317.2,
+    ));
+    assert!(physical_outer_box_paint_inset_layout_gate(
+        1,
+        Some(317.7),
+        317.2,
+    ));
+    assert!(!physical_outer_box_paint_inset_layout_gate(
+        2,
+        Some(317.2),
+        317.2,
+    ));
+    assert!(!physical_outer_box_paint_inset_layout_gate(1, None, 317.2,));
+    assert!(!physical_outer_box_paint_inset_layout_gate(
+        1,
+        Some(317.71),
+        317.2,
+    ));
+}
+
+#[test]
+fn note_separator_length_resolves_schema_sentinels_and_absolute_hwpunit() {
+    use super::{footnote_separator_length_px, note_separator_length_px};
+
+    let width = 600.0;
+    let dpi = 96.0;
+    assert!((note_separator_length_px(-1, width, dpi) - 188.976_377_95).abs() < 1e-6);
+    assert!((note_separator_length_px(-2, width, dpi) - 75.590_551_18).abs() < 1e-6);
+    assert!((note_separator_length_px(-3, width, dpi) - 200.0).abs() < 1e-9);
+    assert!((note_separator_length_px(-4, width, dpi) - width).abs() < 1e-9);
+    assert!((note_separator_length_px(7_200, width, dpi) - 96.0).abs() < 1e-9);
+    assert!((note_separator_length_px(72_000, width, dpi) - width).abs() < 1e-9);
+    assert_eq!(note_separator_length_px(0, width, dpi), 0.0);
+
+    // FootnoteArea가 실제 단 폭/시작점을 갖기 전에는 상대 sentinel을 넓히지 않는다.
+    assert!((footnote_separator_length_px(-3, width, dpi) - 200.0).abs() < 1e-9);
+    assert!((footnote_separator_length_px(-4, width, dpi) - 200.0).abs() < 1e-9);
+}
+
+#[test]
+fn endnote_separator_caller_uses_schema_sentinel_widths() {
+    fn rendered_width(separator_length: i32) -> f64 {
+        let engine = LayoutEngine::with_default_dpi();
+        let mut tree = PageRenderTree::new(0, 800.0, 1_100.0);
+        let area = LayoutRect {
+            x: 100.0,
+            y: 100.0,
+            width: 600.0,
+            height: 900.0,
+        };
+        let mut column = RenderNode::new(
+            tree.next_id(),
+            RenderNodeType::Column(0),
+            BoundingBox::new(area.x, area.y, area.width, area.height),
+        );
+        engine.layout_endnote_separator_item(
+            &mut tree,
+            &mut column,
+            &area,
+            area.y,
+            separator_length,
+            0,
+            0,
+            1,
+            1,
+            0,
+        );
+        let line = column.children.first().expect("endnote separator line");
+        match &line.node_type {
+            RenderNodeType::Line(line) => (line.x2 - line.x1).abs(),
+            other => panic!("expected separator Line, got {other:?}"),
+        }
+    }
+
+    assert!((rendered_width(-2) - 96.0 * 2.0 / 2.54).abs() < 1e-6);
+    assert!((rendered_width(-4) - 600.0).abs() < 1e-9);
+}
+
+#[test]
+fn footnote_separator_caller_uses_absolute_hwpunit_width() {
+    let engine = LayoutEngine::with_default_dpi();
+    let mut tree = PageRenderTree::new(0, 800.0, 1_100.0);
+    let area = LayoutRect {
+        x: 100.0,
+        y: 900.0,
+        width: 600.0,
+        height: 100.0,
+    };
+    let mut footnote_area = RenderNode::new(
+        tree.next_id(),
+        RenderNodeType::FootnoteArea,
+        BoundingBox::new(area.x, area.y, area.width, area.height),
+    );
+    let paragraphs = vec![Paragraph {
+        controls: vec![Control::Footnote(Box::new(
+            crate::model::footnote::Footnote {
+                number: 1,
+                ..Default::default()
+            },
+        ))],
+        ..Default::default()
+    }];
+    let footnotes = vec![FootnoteRef {
+        number: 1,
+        source: FootnoteSource::Body {
+            para_index: 0,
+            control_index: 0,
+        },
+        fragment: None,
+    }];
+    let shape = FootnoteShape {
+        separator_length: 7_200,
+        separator_line_type: 1,
+        separator_line_width: 1,
+        ..Default::default()
+    };
+
+    engine.layout_footnote_area(
+        &mut tree,
+        &mut footnote_area,
+        &footnotes,
+        &paragraphs,
+        &ResolvedStyleSet::default(),
+        &area,
+        &shape,
+    );
+
+    let line = footnote_area
+        .children
+        .iter()
+        .find(|child| matches!(child.node_type, RenderNodeType::Line(_)))
+        .expect("footnote separator line");
+    assert!((line.bbox.width - 96.0).abs() < 1e-9);
 }
 
 /// Task #3216: AutoNumber(Page)와 명시 쪽번호 필드가 같은 문단에 있어도 각각은
@@ -202,6 +350,147 @@ fn issue2439_full_table_top_matches_first_partial_fragment_top() {
 }
 
 #[test]
+fn native_multiline_visible_float_uses_host_end_only_for_short_offset() {
+    let mut table = Table {
+        common: CommonObjAttr {
+            treat_as_char: false,
+            text_wrap: TextWrap::TopAndBottom,
+            vert_rel_to: VertRelTo::Para,
+            vertical_offset: 4_000,
+            flow_with_text: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let para = Paragraph {
+        text: "표 앞 본문 첫째 줄\n둘째 줄\n셋째 줄".to_string(),
+        line_segs: vec![
+            LineSeg {
+                vertical_pos: 0,
+                line_height: 1_000,
+                ..Default::default()
+            },
+            LineSeg {
+                vertical_pos: 2_000,
+                line_height: 1_000,
+                ..Default::default()
+            },
+            LineSeg {
+                vertical_pos: 4_000,
+                line_height: 1_000,
+                ..Default::default()
+            },
+        ],
+        controls: vec![Control::Table(Box::new(table.clone()))],
+        ..Default::default()
+    };
+
+    assert!(native_multiline_visible_float_table_top(true, &para, &table, 100.0, 96.0).is_some());
+
+    // p9 같은 3줄 host에서 offset(5,317 HU)이 마지막 줄의 bottom(5,000 HU)
+    // 이후를 이미 가리키면, host 높이를 다시 가산하지 않아야 한다.
+    table.common.vertical_offset = 5_317;
+    assert!(native_multiline_visible_float_table_top(true, &para, &table, 100.0, 96.0).is_none());
+}
+
+#[test]
+fn stored_layout_relocated_picture_caption_uses_next_saved_flow_anchor() {
+    let picture = Picture {
+        common: CommonObjAttr {
+            height: 24_791,
+            treat_as_char: false,
+            text_wrap: TextWrap::TopAndBottom,
+            vert_rel_to: VertRelTo::Para,
+            vertical_offset: (-52_790_i32) as u32,
+            flow_with_text: true,
+            ..Default::default()
+        },
+        caption: Some(Caption {
+            direction: CaptionDirection::Bottom,
+            paragraphs: vec![Paragraph::default()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let table = Table {
+        row_count: 1,
+        col_count: 1,
+        page_break: TablePageBreak::RowBreak,
+        common: CommonObjAttr {
+            height: 18_257,
+            treat_as_char: false,
+            text_wrap: TextWrap::TopAndBottom,
+            vert_rel_to: VertRelTo::Para,
+            vertical_offset: 560,
+            ..Default::default()
+        },
+        cells: vec![Cell {
+            row: 0,
+            col: 0,
+            row_span: 1,
+            col_span: 1,
+            height: 36_782,
+            paragraphs: vec![Paragraph {
+                line_segs: vec![LineSeg {
+                    vertical_pos: 0,
+                    ..Default::default()
+                }],
+                controls: vec![Control::Picture(Box::new(picture))],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let host = Paragraph {
+        line_segs: vec![LineSeg {
+            vertical_pos: 52_230,
+            ..Default::default()
+        }],
+        controls: vec![Control::Table(Box::new(table.clone()))],
+        ..Default::default()
+    };
+    let next = Paragraph {
+        line_segs: vec![LineSeg {
+            vertical_pos: 30_689,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let col = LayoutRect {
+        x: 0.0,
+        y: 79.2,
+        width: 600.0,
+        height: 900.0,
+    };
+
+    let flow_top = stored_layout_relocated_empty_rowbreak_picture_next_flow_top(
+        true,
+        &host,
+        &table,
+        Some(&next),
+        &col,
+        96.0,
+    )
+    .expect("이월 그림의 다음 저장 anchor");
+    assert!(
+        (flow_top - 488.386_666_7).abs() < 0.001,
+        "flow_top={flow_top}"
+    );
+    assert!(
+        stored_layout_relocated_empty_rowbreak_picture_next_flow_top(
+            false,
+            &host,
+            &table,
+            Some(&next),
+            &col,
+            96.0,
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn oversized_row_width_outlier_does_not_expand_base_columns() {
     let mut cells = Vec::new();
     for row in 0..3 {
@@ -288,6 +577,7 @@ fn test_build_page_with_paragraph() {
     let page_content = PageContent {
         page_index: 0,
         page_number: 0,
+        page_number_restarted: false,
         section_index: 0,
         layout,
         column_contents: vec![ColumnContent {
@@ -300,6 +590,11 @@ fn test_build_page_with_paragraph() {
             wrap_around_paras: Vec::new(),
             used_height: 0.0,
             wrap_anchors: std::collections::HashMap::new(),
+            overlay_continuations: Vec::new(),
+            overlay_cuts: Vec::new(),
+            inline_placements: Default::default(),
+            inline_flow_plans: Default::default(),
+            paragraph_float_placements: Default::default(),
         }],
         active_header: None,
         active_footer: None,
@@ -308,6 +603,7 @@ fn test_build_page_with_paragraph() {
         footnotes: Vec::new(),
         active_master_page: None,
         extra_master_pages: Vec::new(),
+        ladder_band_tables: Vec::new(),
     };
 
     let tree = engine.build_render_tree(
@@ -325,7 +621,6 @@ fn test_build_page_with_paragraph() {
         0,
         &[],
     );
-    assert!(tree.needs_render());
 
     // Body 노드 찾기
     let body = tree
@@ -364,6 +659,7 @@ fn partial_paragraph_start_line_beyond_lines_does_not_panic() {
     let page_content = PageContent {
         page_index: 0,
         page_number: 0,
+        page_number_restarted: false,
         section_index: 0,
         layout,
         column_contents: vec![ColumnContent {
@@ -381,6 +677,11 @@ fn partial_paragraph_start_line_beyond_lines_does_not_panic() {
             wrap_around_paras: Vec::new(),
             used_height: 0.0,
             wrap_anchors: std::collections::HashMap::new(),
+            overlay_continuations: Vec::new(),
+            overlay_cuts: Vec::new(),
+            inline_placements: Default::default(),
+            inline_flow_plans: Default::default(),
+            paragraph_float_placements: Default::default(),
         }],
         active_header: None,
         active_footer: None,
@@ -389,6 +690,7 @@ fn partial_paragraph_start_line_beyond_lines_does_not_panic() {
         footnotes: Vec::new(),
         active_master_page: None,
         extra_master_pages: Vec::new(),
+        ladder_band_tables: Vec::new(),
     };
 
     // 패닉 없이 반환하면 성공 (범위 밖 조각은 빈 렌더).
@@ -441,7 +743,9 @@ fn test_layout_with_composed_styles() {
     let composed: Vec<_> = paragraphs.iter().map(|p| compose_paragraph(p)).collect();
 
     let styles = ResolvedStyleSet {
+        page_number_char_style_id: None,
         hwp3_variant: false,
+        hft_ascii_halfwidth: false,
         char_styles: vec![
             ResolvedCharStyle {
                 font_family: "함초롬돋움".to_string(),
@@ -461,11 +765,15 @@ fn test_layout_with_composed_styles() {
         border_styles: Vec::new(),
         numberings: Vec::new(),
         bullets: Vec::new(),
+        kerning_measurement_context: None,
+        horizontal_shaping_context: None,
+        supplemental_metrics: None,
     };
 
     let page_content = PageContent {
         page_index: 0,
         page_number: 0,
+        page_number_restarted: false,
         section_index: 0,
         layout,
         column_contents: vec![ColumnContent {
@@ -478,6 +786,11 @@ fn test_layout_with_composed_styles() {
             wrap_around_paras: Vec::new(),
             used_height: 0.0,
             wrap_anchors: std::collections::HashMap::new(),
+            overlay_continuations: Vec::new(),
+            overlay_cuts: Vec::new(),
+            inline_placements: Default::default(),
+            inline_flow_plans: Default::default(),
+            paragraph_float_placements: Default::default(),
         }],
         active_header: None,
         active_footer: None,
@@ -486,6 +799,7 @@ fn test_layout_with_composed_styles() {
         footnotes: Vec::new(),
         active_master_page: None,
         extra_master_pages: Vec::new(),
+        ladder_band_tables: Vec::new(),
     };
 
     let tree = engine.build_render_tree(
@@ -573,7 +887,9 @@ fn test_layout_multi_run_x_position() {
 
     let composed: Vec<_> = paragraphs.iter().map(|p| compose_paragraph(p)).collect();
     let styles = ResolvedStyleSet {
+        page_number_char_style_id: None,
         hwp3_variant: false,
+        hft_ascii_halfwidth: false,
         char_styles: vec![
             ResolvedCharStyle {
                 font_size: 16.0,
@@ -588,11 +904,15 @@ fn test_layout_multi_run_x_position() {
         border_styles: Vec::new(),
         numberings: Vec::new(),
         bullets: Vec::new(),
+        kerning_measurement_context: None,
+        horizontal_shaping_context: None,
+        supplemental_metrics: None,
     };
 
     let page_content = PageContent {
         page_index: 0,
         page_number: 0,
+        page_number_restarted: false,
         section_index: 0,
         layout,
         column_contents: vec![ColumnContent {
@@ -605,6 +925,11 @@ fn test_layout_multi_run_x_position() {
             wrap_around_paras: Vec::new(),
             used_height: 0.0,
             wrap_anchors: std::collections::HashMap::new(),
+            overlay_continuations: Vec::new(),
+            overlay_cuts: Vec::new(),
+            inline_placements: Default::default(),
+            inline_flow_plans: Default::default(),
+            paragraph_float_placements: Default::default(),
         }],
         active_header: None,
         active_footer: None,
@@ -613,6 +938,7 @@ fn test_layout_multi_run_x_position() {
         footnotes: Vec::new(),
         active_master_page: None,
         extra_master_pages: Vec::new(),
+        ladder_band_tables: Vec::new(),
     };
 
     let tree = engine.build_render_tree(
@@ -655,7 +981,9 @@ fn test_resolved_to_text_style() {
     use crate::renderer::style_resolver::ResolvedCharStyle;
 
     let styles = ResolvedStyleSet {
+        page_number_char_style_id: None,
         hwp3_variant: false,
+        hft_ascii_halfwidth: false,
         char_styles: vec![ResolvedCharStyle {
             font_family: "나눔고딕".to_string(),
             font_size: 14.0,
@@ -670,6 +998,9 @@ fn test_resolved_to_text_style() {
         border_styles: Vec::new(),
         numberings: Vec::new(),
         bullets: Vec::new(),
+        kerning_measurement_context: None,
+        horizontal_shaping_context: None,
+        supplemental_metrics: None,
     };
 
     let ts = resolved_to_text_style(&styles, 0, 0);
@@ -688,7 +1019,9 @@ fn test_resolved_to_text_style_with_ratio() {
     use crate::renderer::style_resolver::ResolvedCharStyle;
 
     let styles = ResolvedStyleSet {
+        page_number_char_style_id: None,
         hwp3_variant: false,
+        hft_ascii_halfwidth: false,
         char_styles: vec![ResolvedCharStyle {
             font_family: "함초롬돋움".to_string(),
             font_size: 16.0,
@@ -699,6 +1032,9 @@ fn test_resolved_to_text_style_with_ratio() {
         border_styles: Vec::new(),
         numberings: Vec::new(),
         bullets: Vec::new(),
+        kerning_measurement_context: None,
+        horizontal_shaping_context: None,
+        supplemental_metrics: None,
     };
 
     let ts = resolved_to_text_style(&styles, 0, 0);
@@ -958,7 +1294,9 @@ fn test_layout_table_basic() {
     let composed: Vec<_> = paragraphs.iter().map(|p| compose_paragraph(p)).collect();
     // border_fill_id=1은 styles.border_styles[0]을 참조 (1-indexed)
     let styles = ResolvedStyleSet {
+        page_number_char_style_id: None,
         hwp3_variant: false,
+        hft_ascii_halfwidth: false,
         border_styles: vec![ResolvedBorderStyle::default()],
         ..Default::default()
     };
@@ -966,6 +1304,7 @@ fn test_layout_table_basic() {
     let page_content = PageContent {
         page_index: 0,
         page_number: 0,
+        page_number_restarted: false,
         section_index: 0,
         layout,
         column_contents: vec![ColumnContent {
@@ -984,6 +1323,11 @@ fn test_layout_table_basic() {
             wrap_around_paras: Vec::new(),
             used_height: 0.0,
             wrap_anchors: std::collections::HashMap::new(),
+            overlay_continuations: Vec::new(),
+            overlay_cuts: Vec::new(),
+            inline_placements: Default::default(),
+            inline_flow_plans: Default::default(),
+            paragraph_float_placements: Default::default(),
         }],
         active_header: None,
         active_footer: None,
@@ -992,6 +1336,7 @@ fn test_layout_table_basic() {
         footnotes: Vec::new(),
         active_master_page: None,
         extra_master_pages: Vec::new(),
+        ladder_band_tables: Vec::new(),
     };
 
     let tree = engine.build_render_tree(
@@ -1117,6 +1462,7 @@ fn test_layout_table_cell_positions() {
     let page_content = PageContent {
         page_index: 0,
         page_number: 0,
+        page_number_restarted: false,
         section_index: 0,
         layout,
         column_contents: vec![ColumnContent {
@@ -1135,6 +1481,11 @@ fn test_layout_table_cell_positions() {
             wrap_around_paras: Vec::new(),
             used_height: 0.0,
             wrap_anchors: std::collections::HashMap::new(),
+            overlay_continuations: Vec::new(),
+            overlay_cuts: Vec::new(),
+            inline_placements: Default::default(),
+            inline_flow_plans: Default::default(),
+            paragraph_float_placements: Default::default(),
         }],
         active_header: None,
         active_footer: None,
@@ -1143,6 +1494,7 @@ fn test_layout_table_cell_positions() {
         footnotes: Vec::new(),
         active_master_page: None,
         extra_master_pages: Vec::new(),
+        ladder_band_tables: Vec::new(),
     };
 
     let tree = engine.build_render_tree(
@@ -1310,6 +1662,40 @@ fn test_expand_numbering_format_hangul() {
 }
 
 #[test]
+fn test_expand_numbering_format_zero_start_number_does_not_underflow() {
+    let numbering = Numbering {
+        raw_data: None,
+        heads: [NumberingHead {
+            number_format: 0,
+            ..Default::default()
+        }; 7],
+        level_formats: [
+            "^1.".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ],
+        start_number: 0,
+        level_start_numbers: [0, 1, 1, 1, 1, 1, 1],
+        raw_para_heads: None,
+    };
+    let counters = [1, 0, 0, 0, 0, 0, 0];
+
+    let result = expand_numbering_format(
+        "^1.",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        0,
+    );
+
+    assert_eq!(result, "1.");
+}
+
+#[test]
 fn test_expand_numbering_format_level_path() {
     // ^n/^N: 레벨 경로 자동코드 (#2145). 재현 문서는 전 수준 "^N".
     let numbering = Numbering {
@@ -1439,6 +1825,7 @@ fn test_expand_numbering_format_level_path_mixed_format() {
 
 #[test]
 fn test_numbering_format_to_number_format() {
+    assert_eq!(numbering_format_to_number_format(10), NumFmt::HangulJamo);
     assert!(matches!(
         numbering_format_to_number_format(0),
         NumFmt::Digit
@@ -1643,9 +2030,12 @@ fn test_tac_leading_width_block_table_full_line() {
         tac_controls: Vec::new(), // block 취급이라 비어있음
         footnote_positions: Vec::new(),
         tab_extended: Vec::new(),
+        horizontal_shaping: None,
     };
     let styles = ResolvedStyleSet {
+        page_number_char_style_id: None,
         hwp3_variant: false,
+        hft_ascii_halfwidth: false,
         char_styles: vec![ResolvedCharStyle {
             font_size: 20.0,
             letter_spacing: -1.6,
@@ -1653,7 +2043,7 @@ fn test_tac_leading_width_block_table_full_line() {
         }],
         ..Default::default()
     };
-    let width = super::compute_tac_leading_width(&composed, 0, &styles);
+    let width = super::compute_tac_leading_width(&composed, 0, &styles, None);
     // [#2279] 자간 글자폭 비례: 4 spaces × (10 base + 10×-8% = 9.2) = 36.8
     // (min_clamp 5.0 미작동)
     assert!((width - 36.8).abs() < 0.5, "expected ~36.8, got {}", width);
@@ -1738,16 +2128,19 @@ fn test_tac_leading_width_inline_table_partial() {
         tac_controls: vec![(2, 1000, 0)], // pos=2 (ab 뒤), control_index=0
         footnote_positions: Vec::new(),
         tab_extended: Vec::new(),
+        horizontal_shaping: None,
     };
     let styles = ResolvedStyleSet {
+        page_number_char_style_id: None,
         hwp3_variant: false,
+        hft_ascii_halfwidth: false,
         char_styles: vec![ResolvedCharStyle {
             font_size: 20.0,
             ..Default::default()
         }],
         ..Default::default()
     };
-    let width = super::compute_tac_leading_width(&composed, 0, &styles);
+    let width = super::compute_tac_leading_width(&composed, 0, &styles, None);
     // "ab" 2 chars, 반각 × font_size/2 = 20*0.5*2 = 20
     assert!((width - 20.0).abs() < 0.5, "expected ~20.0, got {}", width);
 }
@@ -1901,15 +2294,113 @@ fn task296_inline_tab_type_decimal() {
     assert_eq!(super::text_measurement::inline_tab_type(&ext), 4);
 }
 
+/// [#4334 stableIndex 서수화] `paper_node_sort_key`가 더 이상 `node.id`(next_id 카운터)
+/// 를 참조하지 않음을 고정한다. **폐기된 이전 pin**(2026-08-09 이전 커밋)은 정확히
+/// 반대를 검증했다 — layer 없는(inline) 노드는 `(plane=2, z=0, stable=node.id)` 폴백,
+/// layer 있는(task1197) 노드는 `object_stable_index(para,ctrl)` 패킹 — 두 갈래가
+/// 서로 다른 수 공간(para_index=1 layered 노드가 벌써 65536, 카운터인 inline 은
+/// 보통 수십~수백)이라 하나의 수로 비교할 수 없었다. 이제 둘 다
+/// `doc_path_for_node`(render_tree.rs, #4334)가 유도하는 같은 `DocPath` 좌표계를
+/// 쓴다 — `RenderLayerInfo.stable_index` 는 더 이상 세 번째 정렬키가 아니다.
 #[test]
-fn task1197_paper_nodes_sort_by_plane_z_order_and_stable_index() {
-    fn node(id: u32, text_wrap: TextWrap, z_order: i32, stable_index: u32) -> RenderNode {
+fn issue_4334_paper_node_sort_key_no_longer_depends_on_node_id() {
+    use crate::renderer::render_tree::ImageNode;
+
+    fn image_at(id: u32, para: usize, control: usize) -> RenderNode {
+        let mut image = ImageNode::new(0, None);
+        image.section_index = Some(0);
+        image.para_index = Some(para);
+        image.control_index = Some(control);
+        RenderNode::new(
+            id,
+            RenderNodeType::Image(image),
+            BoundingBox::new(0.0, 0.0, 1.0, 1.0),
+        )
+    }
+
+    // 같은 문서 위치(para=3, control=1), 다른 node.id(5 vs 999) → 같은 정렬키.
+    // 카운터 기반이었다면 달랐을 것 — #4334 목표(node.id 로부터 독립)의 직접 증거.
+    assert_eq!(
+        LayoutEngine::paper_node_sort_key(&image_at(5, 3, 1)),
+        LayoutEngine::paper_node_sort_key(&image_at(999, 3, 1)),
+        "node.id 가 달라도 문서 위치(para,control)가 같으면 정렬키가 같아야 한다"
+    );
+
+    // node.id 는 "이르지만"(1) 문서 위치는 더 늦은(para=5) 노드가, node.id 는
+    // "늦지만"(9000) 문서 위치는 더 이른(para=1) 노드보다 위(뒤)여야 한다 — 카운터
+    // 순서였다면 반대로 나왔을 상황.
+    let later_para_low_id = image_at(1, 5, 0);
+    let earlier_para_high_id = image_at(9000, 1, 0);
+    assert!(
+        LayoutEngine::paper_node_sort_key(&later_para_low_id)
+            > LayoutEngine::paper_node_sort_key(&earlier_para_high_id),
+        "정렬은 node.id 가 아니라 문서 위치(para)를 따라야 한다"
+    );
+
+    // layer=Some(레이어 있음, task1197 케이스)과 layer=None(인라인)이 이제 같은
+    // 좌표계를 공유한다 — `RenderLayerInfo.stable_index`(예전엔 65536 같은 패킹값)를
+    // 더 이상 세 번째 원소로 읽지 않으므로, 그 값을 아무리 크게 채워도 무시된다.
+    let mut layered_para1 = image_at(50, 1, 0);
+    layered_para1.set_layer(RenderLayerInfo::new(None, 0, 999_999));
+    let inline_para300 = image_at(1, 300, 0);
+    assert!(
+        LayoutEngine::paper_node_sort_key(&inline_para300)
+            > LayoutEngine::paper_node_sort_key(&layered_para1),
+        "para_index=300 인라인이 para_index=1 layered 보다 위여야 한다 — 예전엔 \
+         layered 의 패킹된 stable_index 가 자릿수만으로 항상 이겼다(#4334 결함)"
+    );
+
+    // 문서 위치를 유도할 수 없는 노드(#4334 stage3 실측 잔여 — 대부분 구조 노드나
+    // 아직 doc_path_for_node 가 다루지 않는 타입) → 빈 경로로 결정적으로 폴백한다.
+    // node.id 를 전혀 참조하지 않으므로 서로 다른 id 라도 완전히 동일한 정렬키다.
+    fn positionless(id: u32) -> RenderNode {
         RenderNode::new(
             id,
             RenderNodeType::Column(0),
             BoundingBox::new(0.0, 0.0, 1.0, 1.0),
         )
-        .with_layer(RenderLayerInfo::new(Some(text_wrap), z_order, stable_index))
+    }
+    assert_eq!(
+        LayoutEngine::paper_node_sort_key(&positionless(5)).2,
+        Vec::<u32>::new(),
+        "문서 위치를 못 만드는 노드는 빈 DocPath 로 폴백한다(node.id 아님)"
+    );
+    assert_eq!(
+        LayoutEngine::paper_node_sort_key(&positionless(5)),
+        LayoutEngine::paper_node_sort_key(&positionless(999)),
+        "빈 경로 폴백은 node.id 값과 무관하게 항상 동일해야 한다"
+    );
+}
+
+/// [#4334 갱신] 세 번째 정렬키가 `RenderLayerInfo.stable_index`(패킹된 u32) 에서
+/// `doc_path_for_node`(문서 위치 — 이 테스트에서는 `GroupNode` 의 section/para/control)
+/// 로 바뀌었다. 원래 이 테스트는 `RenderNodeType::Column` 을 자리표시자로 썼는데,
+/// Column 은 out-of-flow 개체로 실제 존재하지 않고(`paper_images` 에 절대 들어가지
+/// 않는 순수 레이아웃 구조 노드) `doc_path_for_node` 도 다루지 않으므로 이제 항상
+/// 빈 경로를 반환해 정렬이 깨진다 — 실제로 `paper_images` 에 들어가는 타입(Group)
+/// 으로 바꾸고, 원래 stable_index 값(0,2,3,0,1)과 같은 상대 순서가 나오도록
+/// control_index 를 그대로 재사용한다. 정렬 결과(BehindText → flow → InFrontOfText,
+/// 각 안에서 z_order/문서위치 오름차순)는 바뀌지 않는다 — 정렬 알고리즘이 아니라
+/// 세 번째 키의 유도 방식만 바뀌었다는 근거.
+#[test]
+fn task1197_paper_nodes_sort_by_plane_z_order_and_stable_index() {
+    use crate::renderer::render_tree::GroupNode;
+
+    fn node(id: u32, text_wrap: TextWrap, z_order: i32, control_index: usize) -> RenderNode {
+        RenderNode::new(
+            id,
+            RenderNodeType::Group(GroupNode {
+                section_index: Some(0),
+                para_index: Some(0),
+                control_index: Some(control_index),
+            }),
+            BoundingBox::new(0.0, 0.0, 1.0, 1.0),
+        )
+        .with_layer(RenderLayerInfo::new(
+            Some(text_wrap),
+            z_order,
+            control_index as u32,
+        ))
     }
 
     let mut nodes = vec![
@@ -2213,6 +2704,7 @@ fn render_tree_with_header_control(control: Control) -> PageRenderTree {
     let page_content = PageContent {
         page_index: 0,
         page_number: 1,
+        page_number_restarted: false,
         section_index: 0,
         layout,
         column_contents: Vec::new(),
@@ -2220,6 +2712,7 @@ fn render_tree_with_header_control(control: Control) -> PageRenderTree {
             para_index: 0,
             control_index: 0,
             source_section_index: 0,
+            table_path: Vec::new(),
         }),
         active_footer: None,
         page_number_pos: None,
@@ -2227,6 +2720,7 @@ fn render_tree_with_header_control(control: Control) -> PageRenderTree {
         footnotes: Vec::new(),
         active_master_page: None,
         extra_master_pages: Vec::new(),
+        ladder_band_tables: Vec::new(),
     };
     engine.build_render_tree(
         &page_content,
@@ -2270,8 +2764,13 @@ fn header_paper_relative_shape_uses_page_origin() {
     assert!((bbox.y - hwpunit_to_px(2_250, DEFAULT_DPI)).abs() < 0.01);
 }
 
+/// [#6608] 머리말 안 용지 기준 그림은 물리 용지가 아니라 **머리말 틀 원점**에서
+/// 오프셋을 잰다. PR #1682 는 바탕쪽의 용지 원점 규칙을 머리말에도 유추해
+/// 이 테스트를 용지 원점으로 적었지만, 실문서 `pic-in-head-02.hwp` 를 한/글 2020·2022
+/// PDF 와 대조하면 머리말 그림(`PAPER`, 오프셋 (245, 1066)HU)이 틀 원점
+/// (왼쪽 여백, 위 여백) + 오프셋 = (78.68, 51.94)px 에 있다 — 6쪽 전부.
 #[test]
-fn header_paper_relative_picture_uses_page_origin() {
+fn header_paper_relative_picture_uses_header_frame_origin() {
     let tree =
         render_tree_with_header_control(Control::Picture(Box::new(crate::model::image::Picture {
             common: CommonObjAttr {
@@ -2295,8 +2794,14 @@ fn header_paper_relative_picture_uses_page_origin() {
             RenderNodeType::Image(_) | RenderNodeType::Placeholder(_)
         )
     });
-    assert!((bbox.x - hwpunit_to_px(1_500, DEFAULT_DPI)).abs() < 0.01);
-    assert!((bbox.y - hwpunit_to_px(2_250, DEFAULT_DPI)).abs() < 0.01);
+    let header_area =
+        PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default()).header_area;
+    assert!(
+        header_area.x > 0.0 && header_area.y > 0.0,
+        "픽스처 머리말 틀은 용지 원점과 달라야 한다"
+    );
+    assert!((bbox.x - (header_area.x + hwpunit_to_px(1_500, DEFAULT_DPI))).abs() < 0.01);
+    assert!((bbox.y - (header_area.y + hwpunit_to_px(2_250, DEFAULT_DPI))).abs() < 0.01);
 }
 
 // [Task #2102] 쪽 배경 이미지 채우기는 구역 첫 쪽에만 적용된다.
@@ -2316,6 +2821,7 @@ fn page_bg_color_and_image_present(is_section_first: bool) -> (bool, bool) {
     let page_content = PageContent {
         page_index: 0,
         page_number: 0,
+        page_number_restarted: false,
         section_index: 0,
         layout,
         column_contents: Vec::new(),
@@ -2326,10 +2832,13 @@ fn page_bg_color_and_image_present(is_section_first: bool) -> (bool, bool) {
         footnotes: Vec::new(),
         active_master_page: None,
         extra_master_pages: Vec::new(),
+        ladder_band_tables: Vec::new(),
     };
 
     let styles = ResolvedStyleSet {
+        page_number_char_style_id: None,
         hwp3_variant: false,
+        hft_ascii_halfwidth: false,
         border_styles: vec![ResolvedBorderStyle {
             fill_color: Some(0x00F0F0F0),
             image_fill: Some(ResolvedImageFill {
@@ -2421,5 +2930,271 @@ fn tac_picture_effective_margin_left_matches_paragraph_layout_single_margin_rule
             .abs()
             < 1e-9,
         "indent>0 이면 margin_left + indent 만 반영해야 함 (inner_pad 이중 가산 없이)"
+    );
+}
+
+/// [#4515] 최상위 표 y 겹침 검출 — 검출기 단위 동작.
+///
+/// `LAYOUT_OVERFLOW` 는 본문 하단 초과만 잡아 하단 clamp 겹침(#4514)에 침묵했다.
+/// 검출기는 y 시작 정렬 후 인접 쌍의 `위 표 하단 - 아래 표 상단 > 임계` 를 겹침으로
+/// 판정한다. 임계 2px 이하는 테두리 접합 오차다 (sample1 20쪽 1.7px 실측).
+#[test]
+fn detect_table_overlaps_flags_only_above_threshold() {
+    // 겹침 없음 (접합 오차 1.7px 포함) → 0건
+    let spans = vec![(10, 75.6, 312.7), (20, 311.0, 577.1)];
+    assert!(detect_table_overlaps(spans, TABLE_OVERLAP_THRESHOLD_PX).is_empty());
+
+    // #4514 8쪽 실측 좌표: 102(182.3~676.3) / 118(202.5~710.8) / 119(430.1~1046.9)
+    // / 139(491.4~1046.9) → 인접 3쌍 전부 겹침. 입력 순서는 뒤섞여도 정렬로 복원된다.
+    let spans = vec![
+        (139, 491.4, 555.5 + 491.4),
+        (119, 430.1, 616.8 + 430.1),
+        (102, 182.3, 494.0 + 182.3),
+        (118, 202.5, 508.3 + 202.5),
+    ];
+    let found = detect_table_overlaps(spans, TABLE_OVERLAP_THRESHOLD_PX);
+    assert_eq!(found.len(), 3, "인접 3쌍 모두 겹침으로 검출돼야 한다");
+    let pairs: Vec<(usize, usize)> = found.iter().map(|f| (f.0, f.1)).collect();
+    assert_eq!(pairs, vec![(102, 118), (118, 119), (119, 139)]);
+    let max_overlap = found.iter().map(|f| f.6).fold(0.0f64, f64::max);
+    assert!(
+        (max_overlap - 555.5).abs() < 0.1,
+        "최대 겹침은 119~139 쌍의 555.5px 이어야 한다 (실측: {max_overlap})"
+    );
+
+    // 정확히 임계값(2.0px)은 접합 오차로 보고 무시한다
+    let spans = vec![(1, 0.0, 100.0), (2, 98.0, 200.0)];
+    assert!(detect_table_overlaps(spans, TABLE_OVERLAP_THRESHOLD_PX).is_empty());
+}
+
+/// [#4515] 최상위 표 수집 도메인 — Page 직계(overlay z-layer)와 Body→Column 직계
+/// (흐름 표)는 포함하고, 셀 안 중첩 표와 비가시 노드는 제외한다.
+#[test]
+fn collect_top_level_table_spans_domain() {
+    fn table_node(id: u32, pi: usize, y: f64, h: f64) -> RenderNode {
+        RenderNode::new(
+            id,
+            RenderNodeType::Table(crate::renderer::render_tree::TableNode {
+                row_count: 4,
+                col_count: 5,
+                border_fill_id: 0,
+                section_index: Some(0),
+                para_index: Some(pi),
+                control_index: Some(0),
+                cell_context: None,
+            }),
+            BoundingBox::new(75.6, y, 642.5, h),
+        )
+    }
+
+    let mut root = RenderNode::new(
+        0,
+        RenderNodeType::Page(crate::renderer::render_tree::PageNode {
+            page_index: 7,
+            width: 793.7,
+            height: 1122.5,
+            section_index: 0,
+        }),
+        BoundingBox::new(0.0, 0.0, 793.7, 1122.5),
+    );
+
+    // Body → Column → 흐름 표 (+ 그 셀 안의 중첩 표는 제외 대상)
+    let mut flow_table = table_node(4, 118, 202.5, 508.3);
+    let mut cell = RenderNode::new(
+        5,
+        RenderNodeType::TableCell(crate::renderer::render_tree::TableCellNode {
+            col: 0,
+            row: 0,
+            col_span: 1,
+            row_span: 1,
+            border_fill_id: 0,
+            text_direction: 0,
+            clip: false,
+            page_fragment: false,
+            model_cell_index: None,
+        }),
+        BoundingBox::new(75.6, 202.5, 100.0, 100.0),
+    );
+    cell.children.push(table_node(6, 999, 210.0, 50.0)); // 중첩 표 — 수집 금지
+    flow_table.children.push(cell);
+    let mut column = RenderNode::new(
+        3,
+        RenderNodeType::Column(0),
+        BoundingBox::new(75.6, 75.6, 642.5, 971.3),
+    );
+    column.children.push(flow_table);
+    let mut body = RenderNode::new(
+        2,
+        RenderNodeType::Body { clip_rect: None },
+        BoundingBox::new(75.6, 75.6, 642.5, 971.3),
+    );
+    body.children.push(column);
+    root.children.push(body);
+
+    // Page 직계 overlay 표 2개 (하나는 비가시 — 제외)
+    root.children.push(table_node(7, 102, 182.3, 494.0));
+    let mut hidden = table_node(8, 555, 300.0, 100.0);
+    hidden.visible = false;
+    root.children.push(hidden);
+
+    let mut spans = collect_top_level_table_spans(&root);
+    spans.sort_by_key(|s| s.0);
+    assert_eq!(
+        spans.iter().map(|s| s.0).collect::<Vec<_>>(),
+        vec![102, 118],
+        "Page 직계 overlay 표와 Column 직계 흐름 표만 수집한다 \
+         (중첩 표 999·비가시 표 555 는 제외)"
+    );
+}
+
+// ── [#4610 · #4599 ④] 공백-전용 TAC 캐리어 문단 페인트 변위 게이트 ──
+
+/// 야간방호일지 36374873 p1 pi4 형상: 공백 텍스트 + TAC 표 1개 + 저장 세그 2개가
+/// 문단 안에서 개체 밴드만큼(>100px) 벌어진 캐리어.
+fn whitespace_tac_carrier_para() -> Paragraph {
+    Paragraph {
+        text: " \u{FFFC} ".repeat(4),
+        controls: vec![Control::Table(Box::new(Table {
+            common: CommonObjAttr {
+                treat_as_char: true,
+                width: 19_000,
+                height: 1_800,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))],
+        line_segs: vec![
+            LineSeg {
+                vertical_pos: 13_575,
+                line_height: 2_414,
+                text_start: 0,
+                ..Default::default()
+            },
+            LineSeg {
+                vertical_pos: 67_877,
+                line_height: 1_000,
+                text_start: 6,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+/// 실제 배치 경로에서는 compose 결과가 존재하고, 대상 표가 inline TAC 로 등록돼야 한다.
+fn whitespace_tac_carrier_composed(para: &Paragraph) -> ComposedParagraph {
+    let mut composed = compose_paragraph(para);
+    composed.tac_controls = vec![(0, 19_000, 0)];
+    composed
+}
+
+#[test]
+fn whitespace_tac_carrier_paint_y_rewinds_to_stored_vpos() {
+    let para = whitespace_tac_carrier_para();
+    let composed = whitespace_tac_carrier_composed(&para);
+    // 흐름 커서가 선행 자리차지 표 하단(1064px)까지 밀린 상태 — 저장 위치로 되돌린다.
+    let got =
+        whitespace_tac_carrier_stored_paint_y(true, &para, Some(&composed), 75.6, 1064.0, 96.0);
+    let expected = 75.6 + 13_575.0 / 75.0;
+    assert!((got.unwrap() - expected).abs() < 0.1, "got {got:?}");
+}
+
+#[test]
+fn whitespace_tac_carrier_paint_y_requires_hwpx_stored_profile() {
+    let para = whitespace_tac_carrier_para();
+    let composed = whitespace_tac_carrier_composed(&para);
+    assert_eq!(
+        whitespace_tac_carrier_stored_paint_y(false, &para, Some(&composed), 75.6, 1064.0, 96.0),
+        None
+    );
+}
+
+#[test]
+fn whitespace_tac_carrier_paint_y_rejects_substantive_text_host() {
+    let mut para = whitespace_tac_carrier_para();
+    para.text = "본문 텍스트".into();
+    let composed = whitespace_tac_carrier_composed(&para);
+    assert_eq!(
+        whitespace_tac_carrier_stored_paint_y(true, &para, Some(&composed), 75.6, 1064.0, 96.0),
+        None
+    );
+}
+
+#[test]
+fn whitespace_tac_carrier_paint_y_rejects_float_host_para() {
+    // 자리차지(비-TAC) 표를 함께 앵커한 host 문단은 기존 float 계약 소관 — 제외.
+    let mut para = whitespace_tac_carrier_para();
+    para.controls.push(Control::Table(Box::new(Table {
+        common: CommonObjAttr {
+            treat_as_char: false,
+            text_wrap: TextWrap::TopAndBottom,
+            ..Default::default()
+        },
+        ..Default::default()
+    })));
+    let composed = whitespace_tac_carrier_composed(&para);
+    assert_eq!(
+        whitespace_tac_carrier_stored_paint_y(true, &para, Some(&composed), 75.6, 1064.0, 96.0),
+        None
+    );
+}
+
+#[test]
+fn whitespace_tac_carrier_paint_y_rejects_small_intra_gap() {
+    // 낡은 세대 사다리(문단 간격 누락류)는 문단-내 거대 간격을 만들지 않는다 —
+    // 세그 간 간격이 100px(7500HU) 미만이면 무동작.
+    let mut para = whitespace_tac_carrier_para();
+    para.line_segs[1].vertical_pos = 13_575 + 2_414 + 7_000;
+    let composed = whitespace_tac_carrier_composed(&para);
+    assert_eq!(
+        whitespace_tac_carrier_stored_paint_y(true, &para, Some(&composed), 75.6, 1064.0, 96.0),
+        None
+    );
+}
+
+#[test]
+fn whitespace_tac_carrier_paint_y_rejects_forward_displacement() {
+    // 방향-한정: 흐름이 저장 위치보다 아래로 충분히 밀렸을 때만 되돌린다.
+    let para = whitespace_tac_carrier_para();
+    let composed = whitespace_tac_carrier_composed(&para);
+    assert_eq!(
+        whitespace_tac_carrier_stored_paint_y(true, &para, Some(&composed), 75.6, 200.0, 96.0),
+        None
+    );
+}
+
+#[test]
+fn whitespace_tac_carrier_paint_y_rejects_synthetic_segs() {
+    let mut para = whitespace_tac_carrier_para();
+    para.line_segs[0].tag |= crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY;
+    let composed = whitespace_tac_carrier_composed(&para);
+    assert_eq!(
+        whitespace_tac_carrier_stored_paint_y(true, &para, Some(&composed), 75.6, 1064.0, 96.0),
+        None
+    );
+}
+
+#[test]
+fn whitespace_tac_carrier_paint_y_rejects_missing_or_block_tac() {
+    let para = whitespace_tac_carrier_para();
+    let block_composed = compose_paragraph(&para);
+    assert!(
+        block_composed.tac_controls.is_empty(),
+        "이 fixture의 표는 강제 inline 등록 없이 block 후보여야 한다"
+    );
+    assert_eq!(
+        whitespace_tac_carrier_stored_paint_y(true, &para, None, 75.6, 1064.0, 96.0),
+        None
+    );
+    assert_eq!(
+        whitespace_tac_carrier_stored_paint_y(
+            true,
+            &para,
+            Some(&block_composed),
+            75.6,
+            1064.0,
+            96.0,
+        ),
+        None
     );
 }

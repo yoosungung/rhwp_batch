@@ -59,20 +59,36 @@ fn render_box(
             let fi = fs;
             // CJK/한글 텍스트는 이탤릭 없이 렌더링 (수학 변수명만 이탤릭).
             // FontStyle::Roman(`rm` 적용)으로 italic=false 가 전달된 경우에도 이탤릭을 적용하지 않는다.
-            let has_cjk = text.chars().any(|c| {
-                matches!(c,
-                    '\u{3000}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' | '\u{AC00}'..='\u{D7AF}'
-                )
-            });
+            let has_cjk = super::text_has_cjk(text);
             let italic_attr = if !has_cjk && italic {
                 " font-style=\"italic\""
             } else {
                 ""
             };
             let weight_attr = if bold { " font-weight=\"bold\"" } else { "" };
+            if has_cjk && (lb.width - estimate_text_width(text, fi, false)).abs() > 0.01 {
+                for (ch, offset) in super::positioned_cjk_text(text, fi, lb.width) {
+                    svg.push_str(&format!(
+                        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"{:.2}\" fill=\"{}\"{} font-family=\"'Haansoft Batang', '한컴바탕', 'Batang', '바탕', serif\">{}</text>\n",
+                        text_x + offset, text_y, fi, color, weight_attr, escape_xml(&ch.to_string()),
+                    ));
+                }
+                return;
+            }
             svg.push_str(&format!(
                 "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"{:.2}\" fill=\"{}\"{}{}{}>{}</text>\n",
-                text_x, text_y, fi, color, italic_attr, weight_attr, EQ_FONT_FAMILY, esc,
+                text_x,
+                text_y,
+                fi,
+                color,
+                italic_attr,
+                weight_attr,
+                if has_cjk {
+                    " font-family=\"'Haansoft Batang', '한컴바탕', 'Batang', '바탕', serif\""
+                } else {
+                    EQ_FONT_FAMILY
+                },
+                esc,
             ));
         }
         LayoutKind::Number(text) => {
@@ -666,7 +682,13 @@ fn escape_xml(text: &str) -> String {
             '>' => result.push_str("&gt;"),
             '"' => result.push_str("&quot;"),
             '\'' => result.push_str("&apos;"),
-            _ => result.push(ch),
+            // XML 1.0 허용 문자: #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+            // 그 외(제어문자, U+FFFE, U+FFFF 등)는 제거 — 방출된 SVG 가 불법 XML 이 되지 않도록 (#3382)
+            '\u{09}' | '\u{0A}' | '\u{0D}' => result.push(ch),
+            '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}' => {
+                result.push(ch)
+            }
+            _ => {} // XML 무효 문자 제거
         }
     }
     result
@@ -692,6 +714,27 @@ mod tests {
         let ast = EqParser::new(tokens).parse();
         let layout = EqLayout::new(20.0).layout(&ast);
         render_equation_svg(&layout, "#000000", 20.0)
+    }
+
+    #[test]
+    fn escape_xml_drops_xml_invalid_control_chars() {
+        // #3382: 수식 SVG 는 본문 SVG(renderer/svg.rs)와 달리 XML 1.0 문자 필터가 없어,
+        // IR 텍스트에 섞인 제어문자를 그대로 방출하면 산출 SVG 가 불법 XML 이 된다
+        // ("PCDATA invalid Char value 3") — 뷰어가 해당 페이지 렌더를 중단한다.
+        assert_eq!(escape_xml("a\u{03}b"), "ab");
+        for c in ['\u{00}', '\u{08}', '\u{0B}', '\u{0C}', '\u{0E}', '\u{1F}'] {
+            assert_eq!(
+                escape_xml(&format!("x{c}y")),
+                "xy",
+                "control {:#04x}",
+                c as u32
+            );
+        }
+        assert_eq!(escape_xml("a\u{FFFE}\u{FFFF}b"), "ab");
+        // 탭·개행·복귀는 XML 1.0 허용 문자이므로 유지
+        assert_eq!(escape_xml("a\tb\nc\rd"), "a\tb\nc\rd");
+        // 기존 마크업 이스케이프는 무회귀
+        assert_eq!(escape_xml("<a & b>\"'"), "&lt;a &amp; b&gt;&quot;&apos;");
     }
 
     #[test]

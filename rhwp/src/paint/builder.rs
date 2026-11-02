@@ -1,16 +1,22 @@
 use crate::model::style::UnderlineType;
+use crate::paint::font_glyph::lower_font_native_glyph_sidecars_excluding;
 use crate::paint::layer_tree::{
     CacheHint, ClipKind, GroupKind, LayerNode, LayerNodeKind, LayerOutputOptions, PageLayerTree,
 };
 use crate::paint::paint_op::{PaintOp, TextDecorationKind};
 use crate::paint::profile::RenderProfile;
-use crate::paint::{lower_font_native_glyph_sidecars, EmbeddedFontFace};
-use crate::renderer::render_tree::{PageRenderTree, RenderNode, RenderNodeType};
+use crate::paint::shaping_glyph::lower_horizontal_shaping_page_sidecars;
+use crate::paint::shaping_glyph_vertical::lower_vertical_shaping_page_sidecars;
+use crate::paint::EmbeddedFontFace;
+use crate::renderer::render_tree::{ControlCode, PageRenderTree, RenderNode, RenderNodeType};
+
+const TEXT_MARK_BODY_CLIP_RIGHT_PAD: f64 = 48.0;
 
 /// semantic render tree를 visual layer tree로 내린다.
 pub struct LayerBuilder {
     profile: RenderProfile,
     output_options: LayerOutputOptions,
+    bin_data_epoch: u32,
 }
 
 impl LayerBuilder {
@@ -18,11 +24,17 @@ impl LayerBuilder {
         Self {
             profile,
             output_options: LayerOutputOptions::default(),
+            bin_data_epoch: 0,
         }
     }
 
     pub fn with_output_options(mut self, output_options: LayerOutputOptions) -> Self {
         self.output_options = output_options;
+        self
+    }
+
+    pub fn with_bin_data_epoch(mut self, bin_data_epoch: u32) -> Self {
+        self.bin_data_epoch = bin_data_epoch;
         self
     }
 
@@ -51,20 +63,68 @@ impl LayerBuilder {
 
         let mut layer_tree =
             PageLayerTree::with_profile(page_width, page_height, root, self.profile)
-                .with_output_options(self.output_options);
-        lower_font_native_glyph_sidecars(&mut layer_tree.root, &mut layer_tree.resources, fonts);
+                .with_output_options(self.output_options)
+                .with_bin_data_epoch(self.bin_data_epoch);
+        publish_line_decoration_trims(&mut layer_tree.root);
+        // Vertical exact-source publication owns its leaf slots first. The
+        // horizontal and nominal lowerers remain independent and only share
+        // the final claim set used to suppress duplicate nominal GlyphRuns.
+        let mut claimed_glyph_run_sources = lower_vertical_shaping_page_sidecars(
+            &mut layer_tree.root,
+            &tree.frame,
+            &mut layer_tree.resources,
+        );
+        claimed_glyph_run_sources.extend(lower_horizontal_shaping_page_sidecars(
+            &mut layer_tree.root,
+            tree.frame.horizontal_shaping_sidecars(),
+            &mut layer_tree.resources,
+        ));
+        lower_font_native_glyph_sidecars_excluding(
+            &mut layer_tree.root,
+            &mut layer_tree.resources,
+            fonts,
+            &claimed_glyph_run_sources,
+        );
         layer_tree
     }
 
     fn build_children(&mut self, node: &RenderNode) -> Vec<LayerNode> {
-        node.children
+        let mut children = node
+            .children
             .iter()
             .filter_map(|child| self.build_node(child))
-            .collect()
+            .collect::<Vec<_>>();
+        if self.output_options.show_control_codes {
+            let label = match &node.node_type {
+                // 그림·수식은 전용 paint 하위화 경로에서 조판부호를 생성한다.
+                RenderNodeType::Image(_) | RenderNodeType::Equation(_) => None,
+                _ => node.control_code_label(),
+            };
+            if let Some(label) = label {
+                children.push(
+                    LayerNode::leaf(
+                        node.bbox,
+                        Some(node.id),
+                        vec![PaintOp::control_label(node.bbox, label)],
+                    )
+                    .with_layer(node.layer),
+                );
+            }
+        }
+        children
     }
 
     fn build_node(&mut self, node: &RenderNode) -> Option<LayerNode> {
         if !node.visible || (node.editor_only && !self.profile.shows_editor_visuals()) {
+            return None;
+        }
+        if matches!(
+            &node.node_type,
+            RenderNodeType::Placeholder(placeholder)
+                if placeholder.kind
+                    == crate::renderer::render_tree::PlaceholderKind::MissingPicture
+                    && !self.profile.shows_editor_visuals()
+        ) {
             return None;
         }
 
@@ -87,13 +147,23 @@ impl LayerBuilder {
                 Some(vec![PaintOp::ellipse(node.bbox, ellipse.clone())])
             }
             RenderNodeType::Path(path) => Some(vec![PaintOp::path(node.bbox, path.clone())]),
-            RenderNodeType::Image(image) => Some(vec![PaintOp::image(
-                node.bbox,
-                image.clone(),
-                crate::renderer::image_resolver::resolve_image_payload(image),
-            )]),
+            RenderNodeType::Image(image) => {
+                let mut ops = vec![PaintOp::image(
+                    node.bbox,
+                    image.clone(),
+                    crate::renderer::image_resolver::resolve_image_payload(image),
+                )];
+                if self.output_options.show_control_codes {
+                    ops.push(PaintOp::control_label(node.bbox, "[그림]"));
+                }
+                Some(ops)
+            }
             RenderNodeType::Equation(equation) => {
-                Some(vec![PaintOp::equation(node.bbox, equation.clone())])
+                let mut ops = vec![PaintOp::equation(node.bbox, equation.clone())];
+                if self.output_options.show_control_codes {
+                    ops.push(PaintOp::control_label(node.bbox, "[수식]"));
+                }
+                Some(ops)
             }
             RenderNodeType::FormObject(form) => {
                 Some(vec![PaintOp::form_object(node.bbox, form.clone())])
@@ -107,7 +177,10 @@ impl LayerBuilder {
 
         if let Some(ops) = own_ops {
             let own_leaf = LayerNode::leaf(node.bbox, Some(node.id), ops).with_layer(node.layer);
-            return if node.children.is_empty() {
+            // 내부 문단이 없는 사각형도 원본 컨트롤 부호를 출력해야 한다.
+            let has_source_marker = self.output_options.show_control_codes
+                && matches!(node.control_code, ControlCode::Rectangle(_));
+            return if node.children.is_empty() && !has_source_marker {
                 Some(own_leaf)
             } else {
                 let mut children = Vec::with_capacity(node.children.len() + 1);
@@ -130,6 +203,18 @@ impl LayerBuilder {
             RenderNodeType::Body {
                 clip_rect: Some(clip),
             } => {
+                let effective_clip = if self.output_options.show_paragraph_marks
+                    || self.output_options.show_control_codes
+                {
+                    crate::renderer::render_tree::BoundingBox::new(
+                        clip.x,
+                        clip.y,
+                        clip.width + TEXT_MARK_BODY_CLIP_RIGHT_PAD,
+                        clip.height,
+                    )
+                } else {
+                    *clip
+                };
                 let child = LayerNode::group(
                     node.bbox,
                     Some(node.id),
@@ -138,8 +223,14 @@ impl LayerBuilder {
                     GroupKind::Body,
                 );
                 Some(
-                    LayerNode::clip_rect(node.bbox, Some(node.id), *clip, child, ClipKind::Body)
-                        .with_layer(node.layer),
+                    LayerNode::clip_rect(
+                        node.bbox,
+                        Some(node.id),
+                        effective_clip,
+                        child,
+                        ClipKind::Body,
+                    )
+                    .with_layer(node.layer),
                 )
             }
             RenderNodeType::TableCell(cell) if cell.clip => {
@@ -221,6 +312,109 @@ impl LayerBuilder {
             RenderNodeType::TextBox => GroupKind::TextBox,
             RenderNodeType::Group(group) => GroupKind::Group(group.clone()),
             _ => GroupKind::Generic,
+        }
+    }
+}
+
+fn line_decoration_trim_target(
+    children: &[LayerNode],
+) -> Option<(crate::paint::TextSourceSpan, usize)> {
+    fn scan(node: &LayerNode, found: &mut Option<Option<(crate::paint::TextSourceSpan, usize)>>) {
+        if found.is_some() {
+            return;
+        }
+        match &node.kind {
+            LayerNodeKind::Leaf { ops } => {
+                for op in ops.iter().rev() {
+                    if let PaintOp::TextRun {
+                        run,
+                        source: Some(source),
+                        ..
+                    } = op
+                    {
+                        if run.text.chars().any(|ch| ch != ' ') {
+                            if run.is_para_end || run.is_line_break_end {
+                                *found = Some(None);
+                                return;
+                            }
+                            let trailing =
+                                run.text.chars().rev().take_while(|ch| *ch == ' ').count();
+                            *found = Some((trailing > 0).then_some((source.clone(), trailing)));
+                            return;
+                        }
+                    }
+                }
+            }
+            LayerNodeKind::Group { children, .. } => {
+                for child in children.iter().rev() {
+                    scan(child, found);
+                    if found.is_some() {
+                        return;
+                    }
+                }
+            }
+            LayerNodeKind::ClipRect { child, .. } => scan(child, found),
+        }
+    }
+    let mut found = None;
+    for child in children.iter().rev() {
+        scan(child, &mut found);
+        if found.is_some() {
+            break;
+        }
+    }
+    found.flatten()
+}
+
+fn publish_line_decoration_trims(node: &mut LayerNode) {
+    if let LayerNodeKind::Group {
+        children,
+        group_kind: GroupKind::TextLine(_),
+        ..
+    } = &mut node.kind
+    {
+        if let Some((source, trim)) = line_decoration_trim_target(children) {
+            set_decoration_trim_for_source(children, &source, trim);
+        }
+    }
+    match &mut node.kind {
+        LayerNodeKind::Group { children, .. } => {
+            for child in children {
+                publish_line_decoration_trims(child);
+            }
+        }
+        LayerNodeKind::ClipRect { child, .. } => publish_line_decoration_trims(child),
+        LayerNodeKind::Leaf { .. } => {}
+    }
+}
+
+fn set_decoration_trim_for_source(
+    nodes: &mut [LayerNode],
+    source: &crate::paint::TextSourceSpan,
+    trim: usize,
+) {
+    for node in nodes {
+        match &mut node.kind {
+            LayerNodeKind::Group { children, .. } => {
+                set_decoration_trim_for_source(children, source, trim);
+            }
+            LayerNodeKind::ClipRect { child, .. } => {
+                set_decoration_trim_for_source(std::slice::from_mut(child), source, trim);
+            }
+            LayerNodeKind::Leaf { ops } => {
+                for op in ops {
+                    if let PaintOp::TextDecoration {
+                        source: Some(candidate),
+                        trim_trailing_spaces,
+                        ..
+                    } = op
+                    {
+                        if candidate == source {
+                            *trim_trailing_spaces = trim;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -372,11 +566,16 @@ mod tests {
         };
         assert!(matches!(
             ops.as_slice(),
-            [PaintOp::TextRun { .. }, PaintOp::GlyphOutline { .. }]
+            [
+                PaintOp::TextRun { .. },
+                PaintOp::GlyphRun { .. },
+                PaintOp::GlyphOutline { .. }
+            ]
         ));
         assert_eq!(layer_tree.resources.image_count(), 1);
-        assert!(layer_tree.resources.font_resources().blobs.is_empty());
-        assert!(layer_tree.resources.font_resources().faces.is_empty());
+        assert_eq!(layer_tree.resources.font_blob_count(), 1);
+        assert_eq!(layer_tree.resources.font_resources().blobs.len(), 1);
+        assert_eq!(layer_tree.resources.font_resources().faces.len(), 1);
     }
 
     #[test]
@@ -426,6 +625,7 @@ mod tests {
                 section_index: Some(0),
                 para_index: Some(0),
                 control_index: Some(0),
+                cell_context: None,
             }),
             BoundingBox::new(0.0, 0.0, 10.0, 10.0),
         )
@@ -520,6 +720,7 @@ mod tests {
                 border_fill_id: 0,
                 text_direction: 0,
                 clip: true,
+                page_fragment: false,
                 model_cell_index: None,
             }),
             BoundingBox::new(100.0, 200.0, 150.0, 80.0),
@@ -951,6 +1152,7 @@ mod tests {
                 section_index: Some(0),
                 para_index: Some(2),
                 control_index: Some(0),
+                cell_context: None,
             }),
             BoundingBox::new(60.0, 110.0, 180.0, 80.0),
         );
@@ -964,6 +1166,7 @@ mod tests {
                 border_fill_id: 3,
                 text_direction: 0,
                 clip: true,
+                page_fragment: false,
                 model_cell_index: Some(4),
             }),
             BoundingBox::new(60.0, 110.0, 180.0, 80.0),
@@ -977,6 +1180,7 @@ mod tests {
                 section_index: Some(0),
                 para_index: Some(2),
                 control_index: Some(1),
+                cell_context: None,
             }),
             BoundingBox::new(70.0, 120.0, 80.0, 40.0),
         );
@@ -990,6 +1194,7 @@ mod tests {
                 border_fill_id: 6,
                 text_direction: 0,
                 clip: false,
+                page_fragment: false,
                 model_cell_index: None,
             }),
             BoundingBox::new(70.0, 120.0, 80.0, 40.0),
@@ -1150,6 +1355,7 @@ mod tests {
             border_fill_id: 0,
             baseline: 12.0,
             field_marker: Default::default(),
+            layout_positions: None,
             display_text: None,
         }
     }
@@ -1168,6 +1374,7 @@ mod tests {
             color_str: "#000000".to_string(),
             color: 0x00000000,
             font_size: 12.0,
+            script: String::new(),
             section_index: None,
             para_index: None,
             control_index: None,
@@ -1182,6 +1389,8 @@ mod tests {
             form_type: FormType::PushButton,
             caption: "OK".to_string(),
             text: String::new(),
+            display_text: None,
+            appearance: Default::default(),
             fore_color: "#000000".to_string(),
             back_color: "#ffffff".to_string(),
             value: 0,

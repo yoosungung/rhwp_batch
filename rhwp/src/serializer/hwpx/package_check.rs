@@ -167,17 +167,22 @@ pub fn check_package(hwpx_bytes: &[u8], doc: &Document) -> PackageCheckReport {
     );
 
     // 7. BinData 수·확장자 보존 (IR 기준)
+    // [#3546] OOXML 차트(extension="ooxml_chart", HWPX 파서가 60000+N 으로 주입)는
+    // BinData 가 아니라 Chart/chartN.xml 원형 경로로 방출된다 — 기대값을 분리한다.
+    let (ir_chart, ir_bin): (Vec<_>, Vec<_>) = doc
+        .bin_data_content
+        .iter()
+        .partition(|b| b.extension == "ooxml_chart");
     let zip_bin: Vec<&String> = names.iter().filter(|n| n.starts_with("BinData/")).collect();
-    if zip_bin.len() != doc.bin_data_content.len() {
+    if zip_bin.len() != ir_bin.len() {
         report.push(format!(
             "BinData 엔트리 수 불일치: zip={} ir={}",
             zip_bin.len(),
-            doc.bin_data_content.len()
+            ir_bin.len()
         ));
     } else {
         let mut zip_exts: Vec<String> = zip_bin.iter().map(|n| extension_lower(n)).collect();
-        let mut ir_exts: Vec<String> = doc
-            .bin_data_content
+        let mut ir_exts: Vec<String> = ir_bin
             .iter()
             .map(|b| b.extension.to_ascii_lowercase())
             .collect();
@@ -189,6 +194,20 @@ pub fn check_package(hwpx_bytes: &[u8], doc: &Document) -> PackageCheckReport {
                 zip_exts, ir_exts
             ));
         }
+    }
+
+    // 7-1. [#3546] 차트 파트 원형 보존 — Chart/chartN.xml 존재 + BinData 이동 금지.
+    for b in &ir_chart {
+        let expected = format!("Chart/chart{}.xml", b.id.saturating_sub(60000));
+        if !names.contains(&expected) {
+            report.push(format!("차트 파트 누락: {expected}"));
+        }
+    }
+    if let Some(moved) = zip_bin
+        .iter()
+        .find(|n| n.to_ascii_lowercase().ends_with(".ooxml_chart"))
+    {
+        report.push(format!("차트 파트가 BinData 로 이동됨: {moved}"));
     }
 
     report

@@ -156,7 +156,7 @@ fn parse_bmp_header(bytes: &[u8]) -> Option<CanvasKitEncodedImageHeader> {
         return None;
     }
     let pixel_offset = usize::try_from(read_le_u32(bytes, 10)?).ok()?;
-    if pixel_offset < dib_end || read_le_u16(bytes, 26)? != 1 {
+    if pixel_offset < dib_end || pixel_offset > bytes.len() || read_le_u16(bytes, 26)? != 1 {
         return None;
     }
     if !matches!(read_le_u16(bytes, 28)?, 1 | 4 | 8 | 16 | 24 | 32) {
@@ -400,6 +400,10 @@ mod tests {
         let mut malformed_gif = gif(1, 1);
         malformed_gif[10] = 0x80;
         assert!(canvaskit_encoded_image_header(&malformed_gif).is_none());
+
+        let mut malformed_bmp = bmp(1, 1);
+        malformed_bmp[10..14].copy_from_slice(&55u32.to_le_bytes());
+        assert!(canvaskit_encoded_image_header(&malformed_bmp).is_none());
 
         let mut malformed_jpeg = jpeg(1, 1);
         malformed_jpeg[10..12].copy_from_slice(&u16::MAX.to_be_bytes());

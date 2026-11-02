@@ -4,16 +4,21 @@
 //! 구조체로 표현한다. 모든 크기 단위는 HWPUNIT(1/7200인치)을 사용한다.
 
 pub mod bin_data;
+pub mod color;
 pub mod control;
 pub mod document;
 pub mod event;
 pub mod footnote;
 pub mod header_footer;
+pub mod hyperlink;
+pub mod hyperlink_format;
+pub(crate) mod identity;
 pub mod image;
 pub mod page;
 pub mod paragraph;
 pub mod path;
 pub mod provenance;
+pub mod raw_provenance;
 pub mod shape;
 pub mod style;
 pub mod table;
@@ -31,7 +36,7 @@ pub type HwpUnit16 = i16;
 pub type ColorRef = u32;
 
 /// 2차원 좌표
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct Point {
     pub x: i32,
     pub y: i32,
@@ -57,7 +62,7 @@ impl Rect {
 }
 
 /// 4방향 여백
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct Padding {
     pub left: HwpUnit16,
     pub right: HwpUnit16,

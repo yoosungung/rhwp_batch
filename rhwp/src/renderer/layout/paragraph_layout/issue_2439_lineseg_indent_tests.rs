@@ -1,6 +1,7 @@
-use super::authoritative_stored_line_start_px;
+use super::{authoritative_stored_line_start_px, uses_hwp5_stored_line_start_profile};
 use crate::model::page::{ColumnDef, PageDef};
 use crate::model::paragraph::{CharShapeRef, LineSeg, Paragraph};
+use crate::model::provenance::LayoutCompatibilityProfile;
 use crate::renderer::composer::compose_paragraph;
 use crate::renderer::layout::LayoutEngine;
 use crate::renderer::page_layout::PageLayoutInfo;
@@ -83,7 +84,9 @@ fn synthetic_lineseg_indent_tree() -> crate::renderer::render_tree::PageRenderTr
     ];
     let composed: Vec<_> = paragraphs.iter().map(compose_paragraph).collect();
     let styles = ResolvedStyleSet {
+        page_number_char_style_id: None,
         hwp3_variant: false,
+        hft_ascii_halfwidth: false,
         char_styles: vec![ResolvedCharStyle::default(), ResolvedCharStyle::default()],
         para_styles: vec![
             ResolvedParaStyle {
@@ -98,10 +101,14 @@ fn synthetic_lineseg_indent_tree() -> crate::renderer::render_tree::PageRenderTr
         border_styles: Vec::new(),
         numberings: Vec::new(),
         bullets: Vec::new(),
+        kerning_measurement_context: None,
+        horizontal_shaping_context: None,
+        supplemental_metrics: None,
     };
     let page_content = PageContent {
         page_index: 0,
         page_number: 0,
+        page_number_restarted: false,
         section_index: 0,
         layout,
         column_contents: vec![ColumnContent {
@@ -117,6 +124,11 @@ fn synthetic_lineseg_indent_tree() -> crate::renderer::render_tree::PageRenderTr
             wrap_around_paras: Vec::new(),
             used_height: 0.0,
             wrap_anchors: std::collections::HashMap::new(),
+            overlay_continuations: Vec::new(),
+            overlay_cuts: Vec::new(),
+            inline_placements: Default::default(),
+            inline_flow_plans: Default::default(),
+            paragraph_float_placements: Default::default(),
         }],
         active_header: None,
         active_footer: None,
@@ -125,6 +137,7 @@ fn synthetic_lineseg_indent_tree() -> crate::renderer::render_tree::PageRenderTr
         footnotes: Vec::new(),
         active_master_page: None,
         extra_master_pages: Vec::new(),
+        ladder_band_tables: Vec::new(),
     };
 
     engine.build_render_tree(
@@ -200,6 +213,20 @@ fn synthetic_or_non_body_geometry_does_not_override_para_margin() {
             false,
         ),
         styled_margin_px,
+    );
+}
+
+#[test]
+fn hwp5_origin_hwpx_keeps_the_hwp5_stored_line_start_contract() {
+    let native_hwp5 = LayoutCompatibilityProfile::new(false, false, false, false, false, true);
+    let hwp5_origin_hwpx = LayoutCompatibilityProfile::new(false, false, false, true, true, false);
+    let original_hwpx = LayoutCompatibilityProfile::new(false, false, true, true, false, false);
+
+    assert!(uses_hwp5_stored_line_start_profile(native_hwp5));
+    assert!(uses_hwp5_stored_line_start_profile(hwp5_origin_hwpx));
+    assert!(
+        !uses_hwp5_stored_line_start_profile(original_hwpx),
+        "원본 HWPX의 별도 저장 LineSeg 계약까지 HWP5로 넓히면 안 된다"
     );
 }
 

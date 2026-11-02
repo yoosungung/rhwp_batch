@@ -64,6 +64,23 @@ pub fn parse_ole_container(cfb_bytes: &[u8]) -> Option<OleContainer> {
     if cfb_bytes.len() < 8 {
         return None;
     }
+    // [#5582] HWPX 의 `BinData/*.ole` 는 CFB 앞에 u32 LE 길이 프리픽스를 붙인다
+    // (00128 실측: `00 B8 02 00` = 178,176 = 뒤따르는 CFB 크기). HWPX 적재 경로는
+    // `normalize_ole_bytes`(#2263)가 이미 벗기지만, 이 함수는 다른 유입 경로
+    // (HWP5 bindata·도구성 호출)도 받으므로 방어적으로 같은 정규화를 둔다.
+    // 선언 길이가 실제 잔여 길이와 일치할 때만 벗긴다 — 우연히 D0CF 로 이어지는
+    // 다른 형식을 오인하지 않게.
+    const CFB_MAGIC: [u8; 4] = [0xD0, 0xCF, 0x11, 0xE0];
+    let cfb_bytes = if cfb_bytes[0..4] != CFB_MAGIC
+        && cfb_bytes.len() >= 12
+        && cfb_bytes[4..8] == CFB_MAGIC
+        && u32::from_le_bytes([cfb_bytes[0], cfb_bytes[1], cfb_bytes[2], cfb_bytes[3]]) as usize
+            == cfb_bytes.len() - 4
+    {
+        &cfb_bytes[4..]
+    } else {
+        cfb_bytes
+    };
     let cursor = Cursor::new(cfb_bytes);
     let mut comp = CompoundFile::open(cursor).ok()?;
 
@@ -83,10 +100,17 @@ pub fn parse_ole_container(cfb_bytes: &[u8]) -> Option<OleContainer> {
                 let mut buf = Vec::new();
                 if s.read_to_end(&mut buf).is_ok() {
                     container.preview_emf = strip_ole_presentation_header(&buf);
-                    // [#3363] EMF 부재 시 WMF 프레젠테이션 폴백 (HWP3 내장 OLE·글맵시)
-                    if container.preview_emf.is_none() {
-                        container.preview_wmf = strip_ole_presentation_header_wmf(&buf);
-                    }
+                    // [#3363] WMF 프레젠테이션 폴백 (HWP3 내장 OLE·글맵시).
+                    //
+                    // [#6896] EMF **가 있어도** 채운다. 종전에는 `preview_emf.is_none()`
+                    // 일 때만 채웠는데, EMF 를 ` WMFC` 주석으로 감싼 WMF(EMF-in-WMF)는
+                    // 그 안의 EMF 조각이 `EMR_HEADER` 로 먼저 잡히고 뒤가 잘려 있어
+                    // 렌더가 실패한다. 그때 폴백이 비어 있으면 개체가 자리표시자로만
+                    // 남는다 (156564340 4쪽: OlePres000 12MB, offset 102 의 EMF 가
+                    // 선언 6,022,292B 중 6,022,272B 에서 0xFF 로 끊긴다 — offset 40 의
+                    // WMF 는 멀쩡하다). 렌더는 `차트 → EMF → WMF → 자리표시자` 순으로
+                    // 내려가므로, 둘 다 들고 있으면 EMF 실패가 자연히 WMF 로 이어진다.
+                    container.preview_wmf = strip_ole_presentation_header_wmf(&buf);
                 }
             }
         } else if name == "OOXMLChartContents" {
@@ -96,7 +120,10 @@ pub fn parse_ole_container(cfb_bytes: &[u8]) -> Option<OleContainer> {
                     container.ooxml_chart = Some(buf);
                 }
             }
-        } else if name == "Contents" {
+        } else if name.eq_ignore_ascii_case("contents") {
+            // [#5582] 한컴 산출 변형은 대문자 `CONTENTS` 도 쓴다(00128 실측). 차트가
+            // 아닌 일반 내장 개체의 CONTENTS 는 차트 파싱이 실패하고, 렌더 경로가
+            // 그 실패를 폴백 사유로 강등해 EMF/WMF 미리보기로 내려간다.
             if let Ok(mut s) = comp.open_stream(&path) {
                 let mut buf = Vec::new();
                 if s.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
@@ -123,7 +150,7 @@ pub fn parse_ole_container(cfb_bytes: &[u8]) -> Option<OleContainer> {
         // (이미 preview_emf가 None인 경우만)
         if let Ok(entries) = std::panic::catch_unwind(|| {
             let cursor = Cursor::new(cfb_bytes);
-            CompoundFile::open(cursor).ok().map(|mut comp| {
+            CompoundFile::open(cursor).ok().map(|comp| {
                 comp.walk()
                     .filter(|e| e.is_stream())
                     .map(|e| e.path().to_string_lossy().to_string())
@@ -173,8 +200,130 @@ pub fn is_hmapsi_ole_container(cfb_bytes: &[u8]) -> bool {
     contains_bytes(cfb_bytes, b"HMapsi") || contains_bytes(cfb_bytes, b"Hmapsi file")
 }
 
+/// 중첩 OLE CFB 의 루트 CLSID(= OLE 서버 클래스 ID)를 읽는다. (#4097)
+///
+/// `parse_ole_container` 는 스트림 **이름**으로만 개체를 판별하므로 CLSID 를 보지 않는다.
+/// 그래서 재포장에서 CLSID 가 사라져도 rhwp 의 왕복 검증·조립 검증은 전부 통과했고
+/// **한컴에서만** 드러났다. 중첩 CFB 를 다시 쓸 때는 이 값을 읽어
+/// `serializer::mini_cfb::build_cfb_with_root_clsid` 에 넘겨야 한다.
+///
+/// 바이트 해석은 `cfb_reader::root_clsid` 한 곳에서만 한다 — 오프셋 지식을 복제하지 않는다.
+pub fn ole_root_clsid(cfb_bytes: &[u8]) -> Option<[u8; 16]> {
+    crate::parser::cfb_reader::root_clsid(cfb_bytes)
+}
+
+/// 중첩 OLE CFB 의 **모든** 스트림을 `(경로, 바이트)` 로 열거한다. (#4100)
+///
+/// [`parse_ole_container`] 는 아는 이름 4종만 뽑으므로 **재포장에 쓸 수 없다** — 나머지가
+/// 소실된다. 차트 편집은 `OOXMLChartContents` 하나만 갈고 나머지(레거시 `Contents`,
+/// `\x02OlePres000` EMF)는 바이트 그대로 되실어야 하므로 전수 열거가 필요하다.
+///
+/// 경로는 플랫폼 무관 표기로 정규화한다 — Windows 의 `cfb` 는 `/BinData\BIN0001.OLE`
+/// 처럼 구분자를 섞어 돌려주는데, 반환값을 **이름으로 비교**하는 소비자가 있다.
+///
+/// #4055 스파이크가 코퍼스 28종에서 "아는 4종 밖 스트림 0건"을 실측했다. 그래도 이름을
+/// 고정하지 않고 전수로 도는 이유는, 그 관찰이 코퍼스의 성질이지 포맷의 보장이 아니라서다.
+pub fn all_ole_streams(cfb_bytes: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
+    if cfb_bytes.len() < 8 {
+        return None;
+    }
+    let mut comp = CompoundFile::open(Cursor::new(cfb_bytes)).ok()?;
+    let paths: Vec<std::path::PathBuf> = comp
+        .walk()
+        .filter(|e| e.is_stream())
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let mut buf = Vec::new();
+        let mut stream = comp.open_stream(&path).ok()?;
+        stream.read_to_end(&mut buf).ok()?;
+        out.push((path.to_string_lossy().replace('\\', "/"), buf));
+    }
+    Some(out)
+}
+
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// [#5725] `Contents` 가 한글 수식 편집기 봉투면 수식 스크립트를 꺼낸다.
+///
+/// 봉투 구조 (2921145 `BinData/ole1.ole` 실측):
+/// - offset 0..32: 시그니처 `Hwp 5.0 Equation Editor(HwpEq5x)` (정확히 32바이트)
+/// - offset 52: u32 LE 버전 (실측 5)
+/// - offset 68: u32 LE 스크립트 바이트 길이
+/// - offset 72: UTF-16LE 수식 스크립트
+///
+/// 이 OLE 들의 `\x02OlePres000` 은 전부 28바이트 스텁(헤더만)이라 미리보기
+/// 폴백으로는 그릴 것이 없다 — 스크립트가 유일한 출처다.
+pub fn parse_equation_contents_script(data: &[u8]) -> Option<String> {
+    const SIG: &[u8] = b"Hwp 5.0 Equation Editor";
+    if data.len() < 72 || !data.starts_with(SIG) {
+        return None;
+    }
+    let len = u32::from_le_bytes([data[68], data[69], data[70], data[71]]) as usize;
+    if len == 0 || !len.is_multiple_of(2) || data.len() < 72 + len {
+        return None;
+    }
+    let units: Vec<u16> = data[72..72 + len]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let script = String::from_utf16_lossy(&units)
+        .trim_end_matches('\0')
+        .to_string();
+    if script.trim().is_empty() {
+        None
+    } else {
+        Some(script)
+    }
+}
+
+/// [#5724] `Contents` 페이로드가 선두 매직 기준으로 WMF(placeable/표준)인지 판별.
+pub fn raw_contents_is_wmf(data: &[u8]) -> bool {
+    if data.len() < 18 {
+        return false;
+    }
+    // Aldus placeable metafile
+    if data.starts_with(&[0xD7, 0xCD, 0xC6, 0x9A]) {
+        return true;
+    }
+    // 표준 WMF: mtType(1|2) + mtHeaderSize=9 + mtVersion(0x0100|0x0300)
+    let mt_type = u16::from_le_bytes([data[0], data[1]]);
+    let header_size = u16::from_le_bytes([data[2], data[3]]);
+    let version = u16::from_le_bytes([data[4], data[5]]);
+    (mt_type == 1 || mt_type == 2) && header_size == 9 && (version == 0x0100 || version == 0x0300)
+}
+
+/// [#5724] `Contents` 페이로드가 EMF 인지 판별 (EMR_HEADER: type=1, offset 40 `" EMF"`).
+pub fn raw_contents_is_emf(data: &[u8]) -> bool {
+    contents_emf_payload(data).is_some()
+}
+
+/// [#7266] `Contents` 안에서 `EMR_HEADER` 부터의 EMF 조각을 돌려준다.
+///
+/// 한컴 산출 변형은 앞에 `u32` 길이를 붙인다 — 2817919 실측 `6C 00 00 00`
+/// (= 뒤따르는 `EMR_HEADER` 사본 108B) + 사본 + 본 EMF. `data[0..4] == 1` 만 보면
+/// 이 갈래를 통째로 놓쳐, 미리보기가 실패해도 `Contents` 폴백이 받지 못한다.
+pub fn contents_emf_payload(data: &[u8]) -> Option<&[u8]> {
+    fn emf_header_at(data: &[u8], at: usize) -> bool {
+        data.len() >= at + 44
+            && u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]) == 1
+            && &data[at + 40..at + 44] == b" EMF"
+    }
+
+    if emf_header_at(data, 0) {
+        return Some(data);
+    }
+    if data.len() >= 8 {
+        let declared = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if (44..=data.len()).contains(&declared) && emf_header_at(data, 4) {
+            return Some(&data[4..]);
+        }
+    }
+    None
 }
 
 /// 바이트 슬라이스의 선두 매직으로 이미지 포맷을 판별
@@ -257,11 +406,15 @@ fn extract_dib_as_bmp(data: &[u8]) -> Option<Vec<u8>> {
 ///
 /// 여기서는 EMR_HEADER 매직(record_type=0x00000001 + " EMF" @ offset +40)을
 /// 찾아서 그 위치부터 바이트를 반환한다. 매직을 찾지 못하면 `None`.
-fn strip_ole_presentation_header(data: &[u8]) -> Option<Vec<u8>> {
+pub fn strip_ole_presentation_header(data: &[u8]) -> Option<Vec<u8>> {
     // EMF record header: u32 type=1, u32 size, 16 bytes bounds, 16 bytes frame, u32 signature=" EMF"(0x464D4520)
     // signature(" EMF")는 EMR_HEADER의 offset 40부터
     if data.len() < 64 {
         return None;
+    }
+    // [#7266] EMF-in-WMF 가 먼저다. 아래 바이트 스캔은 `WMFC` 주석 헤더를 EMF 안에 남긴다.
+    if let Some(emf) = emf_from_wmf_comment_chunks(data) {
+        return Some(emf);
     }
     // 스캔 범위 제한 (OLE 헤더가 보통 수십~수백 바이트)
     let scan_limit = data.len().min(4096);
@@ -283,6 +436,11 @@ fn strip_ole_presentation_header(data: &[u8]) -> Option<Vec<u8>> {
 /// EMF 스트립과 동일한 스캔 방식 — 표준 WMF 매직(mtType=1|2, mtHeaderSize=9,
 /// mtVersion 0x0100|0x0300) 또는 placeable WMF 매직(`D7 CD C6 9A`)을 탐색한다.
 fn strip_ole_presentation_header_wmf(data: &[u8]) -> Option<Vec<u8>> {
+    wmf_start_offset(data).map(|at| data[at..].to_vec())
+}
+
+/// WMF 가 시작하는 offset — placeable 매직 또는 표준 METAHEADER 중 먼저 나오는 쪽.
+fn wmf_start_offset(data: &[u8]) -> Option<usize> {
     if data.len() < 26 {
         return None;
     }
@@ -290,7 +448,7 @@ fn strip_ole_presentation_header_wmf(data: &[u8]) -> Option<Vec<u8>> {
     for i in 0..(scan_limit.saturating_sub(8)) {
         // placeable WMF
         if data[i..i + 4] == [0xD7, 0xCD, 0xC6, 0x9A] {
-            return Some(data[i..].to_vec());
+            return Some(i);
         }
         // 표준 WMF: mtType(1=memory, 2=file) u16 + mtHeaderSize=9 u16 + mtVersion u16
         let mt_type = u16::from_le_bytes([data[i], data[i + 1]]);
@@ -300,10 +458,89 @@ fn strip_ole_presentation_header_wmf(data: &[u8]) -> Option<Vec<u8>> {
             && header_size == 9
             && (version == 0x0100 || version == 0x0300)
         {
-            return Some(data[i..].to_vec());
+            return Some(i);
         }
     }
     None
+}
+
+/// [#7266] `OlePres000` 이 EMF 를 WMF 주석 청크로 쪼개 담았으면 원본 EMF 를 복원한다.
+///
+/// 한컴·GDI+ 산출 프레젠테이션 스트림은 EMF 를 통째로 넣지 않고
+/// `META_ESCAPE`(func `0x0626`) + `META_ESCAPE_ENHANCED_METAFILE`(escape `0x000F`) 의
+/// `WMFC` 주석으로 나눠 싣는다 — 청크마다 44B 헤더(레코드 6B + escape/count 4B +
+/// `EmfComment` 34B) + 데이터 ≤ 8,192B.
+///
+/// `" EMF"` 를 바이트 스캔해 뒤를 통째로 복사하면 8,192바이트마다 그 44B 가 EMF 안에
+/// 박힌다. 2817919 는 `EMR_STRETCHDIBITS` 의 bottom-up DIB 가 44B ÷ 2B/px = 22px 씩
+/// 밀려 로고가 띠로 뭉개졌고, 156564340(#6896 fixture)은 선언 6,022,292B 중
+/// 6,022,272B 에서 레코드가 끊겼다 — #6896 이 "잘린 EMF" 로 본 것이 이 섞임이다.
+///
+/// 복원본이 첫 청크의 `EnhancedMetafileDataSize` 선언값과 `EMR_HEADER` 서명을 **함께**
+/// 만족할 때만 채택한다. 아니면 `None` 을 돌려 종전 바이트 스캔으로 내려간다.
+/// 10k 코퍼스 실측: 해당 40문서·246스트림 전부가 이 두 조건을 만족한다.
+fn emf_from_wmf_comment_chunks(data: &[u8]) -> Option<Vec<u8>> {
+    /// WMF 레코드 함수 코드 META_ESCAPE.
+    const META_ESCAPE: u16 = 0x0626;
+    /// Escape 함수 META_ESCAPE_ENHANCED_METAFILE.
+    const ENHANCED_METAFILE: u16 = 0x000F;
+    /// `EmfComment` 헤더: WMFC(4) + Type(4) + Version(4) + Checksum(2) + Flags(4)
+    /// + RecordCount(4) + CurrentRecordSize(4) + RemainingBytes(4) + TotalSize(4).
+    const EMF_COMMENT_HEADER: usize = 34;
+    /// `EnhancedMetafileDataSize` 의 `EmfComment` 헤더 안 offset.
+    const TOTAL_SIZE_AT: usize = 30;
+
+    let start = wmf_start_offset(data)?;
+    let placeable = data[start..].starts_with(&[0xD7, 0xCD, 0xC6, 0x9A]);
+    // placeable 헤더 22B 뒤에 METAHEADER 18B 가 온다.
+    let mut pos = start.checked_add(if placeable { 22 + 18 } else { 18 })?;
+
+    let mut emf: Vec<u8> = Vec::new();
+    let mut declared: Option<usize> = None;
+    while pos + 6 <= data.len() {
+        let size_words =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let function = u16::from_le_bytes([data[pos + 4], data[pos + 5]]);
+        // 최소 레코드(rdSize + rdFunction)는 3워드. 그보다 작으면 프레이밍이 깨진 것이다.
+        if size_words < 3 {
+            break;
+        }
+        let end = pos.checked_add(size_words.checked_mul(2)?)?;
+        if end > data.len() {
+            break;
+        }
+        if function == META_ESCAPE && size_words >= 5 {
+            let escape = u16::from_le_bytes([data[pos + 6], data[pos + 7]]);
+            let count = u16::from_le_bytes([data[pos + 8], data[pos + 9]]) as usize;
+            let body = pos + 10;
+            if escape == ENHANCED_METAFILE
+                && count >= EMF_COMMENT_HEADER
+                && body + count <= end
+                && &data[body..body + 4] == b"WMFC"
+            {
+                if declared.is_none() {
+                    let at = body + TOTAL_SIZE_AT;
+                    declared = Some(u32::from_le_bytes([
+                        data[at],
+                        data[at + 1],
+                        data[at + 2],
+                        data[at + 3],
+                    ]) as usize);
+                }
+                emf.extend_from_slice(&data[body + EMF_COMMENT_HEADER..body + count]);
+            }
+        }
+        pos = end;
+    }
+
+    if emf.len() < 44 || declared != Some(emf.len()) {
+        return None;
+    }
+    // EMR_HEADER: type=1, offset 40 에 `" EMF"`.
+    if u32::from_le_bytes([emf[0], emf[1], emf[2], emf[3]]) != 1 || &emf[40..44] != b" EMF" {
+        return None;
+    }
+    Some(emf)
 }
 
 #[cfg(test)]

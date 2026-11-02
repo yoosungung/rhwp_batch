@@ -6,17 +6,32 @@
 pub mod body_text;
 pub mod byte_writer;
 pub mod cfb_writer;
+pub(crate) mod char_shape;
+pub mod content_loss;
 pub mod control;
 pub mod doc_info;
+mod form_identity;
 pub mod header;
 pub mod hml;
 pub mod hwpx;
 pub mod mini_cfb;
+/// [#4100] 중첩 OLE CFB 의 스트림 교체 — 루트 CLSID 와 나머지 스트림을 보존한다.
+pub mod ole_container;
 pub mod record_writer;
 
-pub use cfb_writer::serialize_hwp;
+pub use cfb_writer::{
+    serialize_hwp, serialize_hwp_with_password, serialize_hwp_with_password_and_report,
+    serialize_hwp_with_report,
+};
+pub use content_loss::{
+    ContentLoss, ContentLossCode, ContentLossReason, ContentLossReport, ContentLossSubject,
+    SerializedDocument, SerializedFormat,
+};
 pub use hml::serialize_hml;
-pub use hwpx::serialize_hwpx;
+pub use hwpx::{
+    serialize_hwpx, serialize_hwpx_with_password, serialize_hwpx_with_password_and_report,
+    serialize_hwpx_with_report,
+};
 
 /// 직렬화 에러 (HWP + HWPX 공용)
 #[derive(Debug)]
@@ -31,6 +46,8 @@ pub enum SerializeError {
     XmlError(String),
     /// 지원하지 않는 입력 (예: HWP 소스를 HWPX 직렬화기에 넘긴 경우)
     UnsupportedInput(String),
+    /// 비밀번호 보호 패키지 생성 실패
+    CryptoError(String),
 }
 
 impl std::fmt::Display for SerializeError {
@@ -41,6 +58,7 @@ impl std::fmt::Display for SerializeError {
             SerializeError::ZipError(e) => write!(f, "ZIP 쓰기 실패: {}", e),
             SerializeError::XmlError(e) => write!(f, "XML 쓰기 실패: {}", e),
             SerializeError::UnsupportedInput(e) => write!(f, "지원하지 않는 입력: {}", e),
+            SerializeError::CryptoError(e) => write!(f, "비밀번호 암호화 실패: {}", e),
         }
     }
 }
@@ -79,6 +97,13 @@ impl DocumentSerializer for HwpxSerializer {
 /// 현재 지원 포맷(HWP)으로 직렬화
 pub fn serialize_document(doc: &Document) -> Result<Vec<u8>, SerializeError> {
     HwpSerializer.serialize(doc)
+}
+
+/// 현재 지원 HWP 형식으로 직렬화하고, 성공한 산출물의 내용 손실을 값으로 돌려준다.
+pub fn serialize_document_with_report(
+    doc: &Document,
+) -> Result<SerializedDocument, SerializeError> {
+    serialize_hwp_with_report(doc)
 }
 
 #[cfg(test)]

@@ -73,6 +73,49 @@ fn test_cell_new_empty() {
 }
 
 #[test]
+fn new_cell_template_never_promotes_a_layout_only_line() {
+    let mut template = Cell::new_empty(0, 0, 3_600, 1_000, 1);
+    template.paragraphs[0].line_segs = vec![crate::model::paragraph::LineSeg {
+        text_start: 77,
+        ..Default::default()
+    }];
+    template.paragraphs[0].layout_only_fill_lines = 1;
+
+    let created = Cell::new_from_template(1, 0, 3_600, 1_000, &template);
+    assert!(created.paragraphs[0].line_segs.is_empty());
+    assert!(created.paragraphs[0].serializable_line_segs().is_empty());
+}
+
+#[test]
+fn paragraph_frame_padding_keeps_all_zero_table_boundary() {
+    let cell = Cell {
+        padding: Padding {
+            left: 141,
+            right: 141,
+            top: 141,
+            bottom: 141,
+        },
+        apply_inner_margin: false,
+        ..Default::default()
+    };
+    let table_padding = Padding::default();
+
+    let frame = cell.paragraph_frame_padding(&table_padding);
+    assert_eq!(
+        (frame.left, frame.right, frame.top, frame.bottom),
+        (0, 0, 0, 0)
+    );
+    // #6101 정상 한컴 PDF 3쪽 표 높이150.24px와 전체 시각 검증에서
+    // 비활성 보존 여백은 수직에도 적용되지 않음을 확인했다.
+    // 측정 프레임과 실제 paint가 같은 유효 여백을 소비한다.
+    let paint = cell.effective_padding(&table_padding);
+    assert_eq!(
+        (paint.left, paint.right, paint.top, paint.bottom),
+        (0, 0, 0, 0)
+    );
+}
+
+#[test]
 fn test_get_column_widths() {
     let table = make_table(2, 3);
     let widths = table.get_column_widths();
@@ -161,6 +204,25 @@ fn test_insert_row_out_of_bounds() {
     assert!(table.insert_row(5, true).is_err());
 }
 
+#[test]
+fn test_insert_row_at_u16_max_rejects_without_mutation() {
+    // [#4264] row/row_span은 파일에서 그대로 온 u16이고 row_count도 별도의
+    // 손상 가능한 u16 필드라, row=60000·row_span=6000(합이 u16 상한 초과)인
+    // 셀이 row_count=65535인 손상된 문서에 실릴 수 있다. saturating_add 없이
+    // 더하면 오버플로 패닉했다.
+    let mut table = make_table(2, 2);
+    table.row_count = 65535;
+    if let Some(cell) = table.cells.iter_mut().find(|c| c.col == 0 && c.row == 0) {
+        cell.row = 60000;
+        cell.row_span = 6000;
+    }
+
+    let before_cells = table.cells.clone();
+    assert!(table.insert_row(60001, true).is_err());
+    assert_eq!(table.row_count, u16::MAX);
+    assert_eq!(table.cells.len(), before_cells.len());
+}
+
 // === insert_column 테스트 ===
 
 #[test]
@@ -237,6 +299,25 @@ fn test_insert_column_out_of_bounds() {
     assert!(table.insert_column(5, true).is_err());
 }
 
+#[test]
+fn test_insert_column_at_u16_max_rejects_without_mutation() {
+    // [#4264] insert_row 쪽과 대칭인 결함. col/col_span은 파일에서 그대로
+    // 온 u16이고 col_count도 별도로 손상 가능한 u16 필드라, col=60000·
+    // col_span=6000(합이 u16 상한 초과)인 셀이 col_count=65535인 손상된
+    // 문서에 실릴 수 있다. saturating_add 없이 더하면 오버플로 패닉했다.
+    let mut table = make_table(2, 2);
+    table.col_count = 65535;
+    if let Some(cell) = table.cells.iter_mut().find(|c| c.col == 0 && c.row == 0) {
+        cell.col = 60000;
+        cell.col_span = 6000;
+    }
+
+    let before_cells = table.cells.clone();
+    assert!(table.insert_column(60001, true).is_err());
+    assert_eq!(table.col_count, u16::MAX);
+    assert_eq!(table.cells.len(), before_cells.len());
+}
+
 // === set_column_widths 테스트 ===
 
 #[test]
@@ -282,6 +363,26 @@ fn test_set_column_widths_wrong_len() {
 // === merge_cells 테스트 ===
 
 #[test]
+fn test_merge_cells_zero_span_cell_does_not_panic() {
+    // 손상된 HWP5 문서에서 row_span/col_span이 0으로 파싱될 수 있다
+    // (src/parser/control.rs 참고). merge_cells()가 겹침 검사 시
+    // `row + row_span - 1`을 saturating 없이 계산하면 u16 언더플로로
+    // 패닉했다. 정상 표 안에 span 0인 셀이 섞여 있어도 패닉 없이
+    // 동작해야 한다 (회귀 방지).
+    let mut table = make_table(2, 2);
+    // 병합 대상 범위 밖의 셀에 span 0을 주입해, retain 이전의
+    // 겹침 검사 루프가 이 셀도 순회하도록 한다.
+    if let Some(cell) = table.cells.iter_mut().find(|c| c.col == 1 && c.row == 1) {
+        cell.row_span = 0;
+        cell.col_span = 0;
+    }
+
+    // 패닉하지 않고 정상적으로 (0,0)-(0,0) 병합(사실상 no-op)이 처리되어야 한다.
+    let result = table.merge_cells(0, 0, 0, 0);
+    assert!(result.is_ok());
+}
+
+#[test]
 fn test_merge_cells_2x2_full() {
     let mut table = make_table(2, 2);
 
@@ -300,6 +401,33 @@ fn test_merge_cells_2x2_full() {
     assert_eq!(merged.height, 2000); // 1000 * 2
                                      // row_sizes 갱신: 각 행에 셀 1개(행0만 주 셀), 행1은 0개
     assert_eq!(table.row_sizes, vec![1, 0]);
+}
+
+#[test]
+fn merge_preserves_layout_only_suffix_ownership_with_the_full_vector() {
+    let mut table = make_table(1, 2);
+    let secondary = table.cell_index_at(0, 1).expect("secondary cell");
+    let para = &mut table.cells[secondary].paragraphs[0];
+    para.text = "secondary".to_string();
+    para.char_count = 10;
+    para.line_segs = vec![
+        crate::model::paragraph::LineSeg {
+            text_start: 0,
+            ..Default::default()
+        },
+        crate::model::paragraph::LineSeg {
+            text_start: 9,
+            ..Default::default()
+        },
+    ];
+    para.layout_only_fill_lines = 1;
+
+    table.merge_cells(0, 0, 0, 1).expect("merge cells");
+    let merged = table.cell_at(0, 0).expect("merged cell");
+    let copied = merged.paragraphs.last().expect("secondary paragraph");
+    assert_eq!(copied.line_segs.len(), 2);
+    assert_eq!(copied.layout_only_fill_lines, 1);
+    assert_eq!(copied.serializable_line_segs().len(), 1);
 }
 
 #[test]
@@ -454,6 +582,38 @@ fn test_split_cell_not_merged() {
 }
 
 #[test]
+fn test_split_cell_zero_span_cell_does_not_panic() {
+    // [#4280] 손상된 HML 문서는 <CELL ColSpan="0" .../>처럼 span 0을 실어
+    // 보낼 수 있다(src/parser/hml/reader.rs 참고). split_cell()이 span 0을
+    // 거르지 않으면 orig_width / orig_col_span 0-나누기 또는 빈
+    // split_col_widths[0] 인덱싱으로 패닉했다. 에러로 거부되어야 한다(회귀 방지).
+    let mut table = make_table(2, 2);
+    if let Some(cell) = table.cells.iter_mut().find(|c| c.col == 0 && c.row == 0) {
+        cell.col_span = 0;
+        cell.row_span = 2;
+    }
+
+    let result = table.split_cell(0, 0);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_split_cell_overflowing_span_is_rejected_without_mutation() {
+    let mut table = make_table(2, 2);
+    table.col_count = u16::MAX;
+    let cell = table
+        .cells
+        .iter_mut()
+        .find(|c| c.col == 0 && c.row == 0)
+        .unwrap();
+    cell.col = u16::MAX - 1;
+    cell.col_span = 2;
+
+    assert!(table.split_cell(0, u16::MAX - 1).is_err());
+    assert_eq!(table.cells.len(), 4);
+}
+
+#[test]
 fn test_split_cell_width_distribution() {
     let mut table = make_table(2, 3);
     // 열 0~1 병합 (폭: 3600 + 3600 = 7200)
@@ -573,6 +733,22 @@ fn test_delete_row_out_of_bounds() {
     assert!(table.delete_row(5).is_err());
 }
 
+#[test]
+fn test_delete_row_near_u16_max_span_does_not_panic() {
+    // [#4264] delete_row 쪽 결함. row/row_span은 파일에서 그대로 온 u16이고
+    // row_count도 별도로 손상 가능한 u16 필드라, row=60000·row_span=6000
+    // (합이 u16 상한 초과)인 셀이 row_count=65535인 손상된 문서에 실릴 수
+    // 있다. saturating_add 없이 더하면 오버플로 패닉했다.
+    let mut table = make_table(2, 2);
+    table.row_count = 65535;
+    if let Some(cell) = table.cells.iter_mut().find(|c| c.col == 0 && c.row == 0) {
+        cell.row = 60000;
+        cell.row_span = 6000;
+    }
+
+    let _ = table.delete_row(60001);
+}
+
 // === delete_column 테스트 ===
 
 #[test]
@@ -671,6 +847,22 @@ fn test_delete_column_single_column_error() {
 fn test_delete_column_out_of_bounds() {
     let mut table = make_table(2, 2);
     assert!(table.delete_column(5).is_err());
+}
+
+#[test]
+fn test_delete_column_near_u16_max_span_does_not_panic() {
+    // [#4264] delete_row 쪽과 대칭인 결함. col/col_span은 파일에서 그대로
+    // 온 u16이고 col_count도 별도로 손상 가능한 u16 필드라, col=60000·
+    // col_span=6000(합이 u16 상한 초과)인 셀이 col_count=65535인 손상된
+    // 문서에 실릴 수 있다. saturating_add 없이 더하면 오버플로 패닉했다.
+    let mut table = make_table(2, 2);
+    table.col_count = 65535;
+    if let Some(cell) = table.cells.iter_mut().find(|c| c.col == 0 && c.row == 0) {
+        cell.col = 60000;
+        cell.col_span = 6000;
+    }
+
+    let _ = table.delete_column(60001);
 }
 
 // === cell_grid / cell_at 테스트 ===
@@ -849,6 +1041,16 @@ fn test_split_cell_into_noop() {
     table.split_cell_into(0, 0, 1, 1, true, false).unwrap();
     assert_eq!(table.col_count, 2);
     assert_eq!(table.row_count, 2);
+    assert_eq!(table.cells.len(), 4);
+}
+
+#[test]
+fn test_split_cell_into_rejects_table_count_overflow_without_mutation() {
+    let mut table = make_table(2, 2);
+    table.col_count = u16::MAX;
+
+    assert!(table.split_cell_into(0, 0, 1, 2, true, false).is_err());
+    assert_eq!(table.col_count, u16::MAX);
     assert_eq!(table.cells.len(), 4);
 }
 
@@ -1062,79 +1264,64 @@ fn test_leading_header_rows_none_and_all() {
 }
 
 #[test]
-fn inferred_local_resize_rows_rejects_degenerate_width_total() {
-    let mut table = make_table(3, 3);
-    let base_widths = [12_698, 1_940, 5_421];
-    for row in 0..3 {
-        for (col, width) in base_widths.into_iter().enumerate() {
-            let idx = table.cell_index_at(row, col as u16).unwrap();
-            table.cells[idx].width = width;
+fn paragraph_frame_owner_width_resolves_a_short_repeated_row_on_the_table_grid() {
+    let cell = |row, col, width| Cell {
+        row,
+        col,
+        row_span: 1,
+        col_span: 1,
+        width,
+        ..Default::default()
+    };
+    let mut table = Table {
+        row_count: 3,
+        col_count: 2,
+        cells: vec![
+            cell(0, 0, 22_393),
+            cell(0, 1, 22_396),
+            cell(1, 0, 22_393),
+            cell(1, 1, 22_393),
+            cell(2, 0, 22_393),
+            cell(2, 1, 22_393),
+        ],
+        ..Default::default()
+    };
+    table.common.width = 44_789;
+
+    assert_eq!(table.paragraph_frame_owner_widths()[2..4], [22_393, 22_396]);
+
+    table.cells[3].width = 22_400;
+    assert_eq!(table.paragraph_frame_owner_widths()[3], 22_400);
+}
+
+#[test]
+fn paragraph_frame_owner_widths_handles_the_large_document_table_shape_in_one_pass() {
+    const ROWS: u16 = 5_277;
+    const COLS: u16 = 10;
+    let mut cells = Vec::with_capacity(usize::from(ROWS) * usize::from(COLS));
+    for row in 0..ROWS {
+        for col in 0..COLS {
+            cells.push(Cell {
+                row,
+                col,
+                row_span: 1,
+                col_span: 1,
+                width: 1_000,
+                ..Default::default()
+            });
         }
     }
+    let mut table = Table {
+        row_count: ROWS,
+        col_count: COLS,
+        cells,
+        ..Default::default()
+    };
+    table.common.width = 10_000;
 
-    // issue #2439와 같은 HWP5 퇴화값: 첫 셀만 1 HU이고 나머지는 기준 행과 같다.
-    // 행 전체 폭이 보존되지 않으므로 보상 resize 결과가 아니다.
-    let first = table.cell_index_at(0, 0).unwrap();
-    table.cells[first].width = 1;
-    table.common.width = base_widths.into_iter().sum();
-
-    assert_eq!(table.inferred_local_resize_rows(), Vec::<u16>::new());
-    assert_eq!(table.base_grid_outlier_rows(), vec![0]);
-}
-
-#[test]
-fn oversized_width_outlier_is_excluded_from_base_grid_without_becoming_local_resize() {
-    let mut table = make_table(3, 2);
-    for cell in &mut table.cells {
-        cell.width = 100;
-    }
-    let oversized = table.cell_index_at(0, 0).unwrap();
-    table.cells[oversized].width = 150;
-    table.common.width = 200;
-
-    assert_eq!(table.base_grid_outlier_rows(), vec![0]);
-    assert_eq!(table.inferred_local_resize_rows(), Vec::<u16>::new());
-}
-
-#[test]
-fn inferred_local_resize_rows_keeps_compensated_independent_row() {
-    let mut table = make_table(3, 3);
-    for cell in &mut table.cells {
-        cell.width = 3_000;
-    }
-
-    // 첫 셀을 줄인 만큼 둘째 셀을 늘린 실제 보상 resize는 전체 폭을 유지한다.
-    let first = table.cell_index_at(0, 0).unwrap();
-    let second = table.cell_index_at(0, 1).unwrap();
-    table.cells[first].width = 2_500;
-    table.cells[second].width = 3_500;
-    table.common.width = 9_000;
-
-    assert_eq!(table.inferred_local_resize_rows(), vec![0]);
-}
-
-#[test]
-fn inferred_local_resize_rows_keeps_serialized_shift_row_matching_common_width() {
-    let mut table = make_table(4, 5);
-    let base_widths = [8_390, 8_390, 8_390, 8_956, 7_824];
-    for row in 0..4 {
-        for (col, width) in base_widths.into_iter().enumerate() {
-            let idx = table.cell_index_at(row, col as u16).unwrap();
-            table.cells[idx].width = width;
-        }
-    }
-
-    // 저장·복구된 Shift resize 행은 셀 간격이 흡수되어 기준 행 합이 아니라
-    // common.width와 일치할 수 있다. 셀별 반올림 누적(여기서는 4 HU)도 허용한다.
-    let shifted = [2_393, 15_630, 8_393, 8_955, 7_823];
-    for (col, width) in shifted.into_iter().enumerate() {
-        let idx = table.cell_index_at(1, col as u16).unwrap();
-        table.cells[idx].width = width;
-    }
-    table.cell_spacing = 310;
-    table.common.width = 43_190;
-
-    assert_eq!(table.inferred_local_resize_rows(), vec![1]);
+    let owners = table.paragraph_frame_owner_widths();
+    assert_eq!(owners.len(), 52_770);
+    assert!(owners.iter().all(|width| *width == 1_000));
 }
 
 /// 삽입 지점의 열(행)에 비병합 셀이 하나도 없으면 insert_row / insert_column 의
