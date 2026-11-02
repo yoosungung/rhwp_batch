@@ -3,11 +3,9 @@
 use super::super::page_layout::LayoutRect;
 use super::super::render_tree::*;
 use super::super::{
-    format_number, ArrowStyle, LineStyle, NumberFormat as NumFmt, PathCommand, ShapeStyle,
-    StrokeDash,
+    format_number, ArrowStyle, LineStyle, NumberFormat as NumFmt, ShapeStyle, StrokeDash,
 };
 use crate::model::bin_data::BinDataContent;
-use crate::model::footnote::NumberFormat;
 use crate::model::image::Picture;
 use crate::model::style::{HeadType, Numbering};
 
@@ -23,15 +21,57 @@ pub(crate) fn find_bin_data<'a>(
     bin_data_content: &'a [BinDataContent],
     bin_data_id: u16,
 ) -> Option<&'a BinDataContent> {
+    find_bin_data_index(bin_data_content, bin_data_id).map(|i| &bin_data_content[i])
+}
+
+/// [#4100] `find_bin_data` 와 **같은 규칙**으로 `bin_data_content` 안 인덱스를 돌려준다.
+///
+/// 차트 편집은 슬롯 바이트를 제자리에서 바꾸므로 참조가 아니라 인덱스가 필요하다.
+/// 인덱스↔id 이중성 지식을 복제하지 않도록 `find_bin_data` 가 이 함수에 위임한다 —
+/// 규칙이 갈리면 읽을 때와 쓸 때가 서로 다른 슬롯을 가리키게 된다.
+pub(crate) fn find_bin_data_index(
+    bin_data_content: &[BinDataContent],
+    bin_data_id: u16,
+) -> Option<usize> {
     if bin_data_id == 0 {
         return None;
     }
     // 1-indexed 순번으로 BinDataContent 배열 접근
-    if let Some(c) = bin_data_content.get((bin_data_id - 1) as usize) {
-        return Some(c);
+    let idx = (bin_data_id - 1) as usize;
+    if idx < bin_data_content.len() {
+        return Some(idx);
     }
     // 인덱스 범위 밖 (HWPX 차트 sparse id 60000+N 등) — id 직접 검색
-    bin_data_content.iter().find(|c| c.id == bin_data_id)
+    bin_data_content.iter().position(|c| c.id == bin_data_id)
+}
+
+/// [#2550] `find_bin_data` + 압축 해제 상한 로드.
+///
+/// 상한 초과(deflate bomb 포함)는 `None` — 이미지 누락과 같은 placeholder 경로로
+/// 접는다. 렌더 경로의 무제한 `load()` 는 이 함수로 대체한다.
+pub(crate) fn find_bin_data_bytes(
+    bin_data_content: &[BinDataContent],
+    bin_data_id: u16,
+) -> Option<Vec<u8>> {
+    find_bin_data(bin_data_content, bin_data_id).and_then(|c| {
+        c.data
+            .load_limited(crate::model::bin_data::MAX_BIN_DATA_BYTES)
+    })
+}
+
+/// 그림 자리에 **아무것도 그릴 수 없는** 상태인가 — "그림 미지정" 판정.
+///
+/// bin 참조 실패·빈 데이터뿐 아니라 **어느 백엔드도 디코드하지 못하는 바이트**도 같은
+/// 상태로 본다(프리뷰 없는 텍스트 EPS/AI 등). 지금까지 후자는 소리 없이 빈 공간이 됐지만,
+/// 한글은 둘을 구별하지 않고 편집 화면에 점선 테두리 + 그림-없음 아이콘을 그린다
+/// (인쇄 등가 출력에서는 둘 다 미출력). 형식 판정의 단일 권위는 `image_resolver` 다.
+pub(crate) fn picture_data_is_unusable(data: Option<&[u8]>) -> bool {
+    match data {
+        None => true,
+        Some(bytes) => {
+            bytes.is_empty() || !crate::renderer::image_resolver::is_displayable_image_data(bytes)
+        }
+    }
 }
 
 /// Picture의 렌더 표시 크기(HWPUNIT)를 반환한다.
@@ -39,7 +79,25 @@ pub(crate) fn find_bin_data<'a>(
 /// 일부 HWP5 그림은 `CommonObjAttr.width/height`보다
 /// `SHAPE_COMPONENT.current_width/current_height`가 실제 한컴 표시 크기에 가깝다.
 /// 기존 도형 경로와 동일하게 current 값이 더 큰 축만 채택해 축소 회귀 위험을 줄인다.
+///
+/// [Issue #5595] 단, 회전 그림에서는 축별 max 를 쓰지 않는다. 회전 그림의
+/// `common.width/height` 는 한컴이 저장한 **회전 후 외접 프레임**이고
+/// `current_width/current_height` 는 **회전 전 원본 표시 크기**다 — 저장 경로의
+/// `DocumentCore::refresh_picture_rotation_layout_for_save` 가 세우는 계약과 같다.
+/// 90°/270° 처럼 두 축이 뒤바뀐 그림에 축별 max 를 적용하면 긴 변이 두 축 모두에
+/// 들어가 **정사각형**이
+/// 되어(00493: 188.5×134.0mm 가 712×712px) 지면 밖으로 나간다. 프레임 값이 온전하면
+/// 회전 후 프레임(common)을 그대로 쓴다.
 pub(crate) fn picture_display_size_hu(picture: &Picture) -> (i32, i32) {
+    if picture.shape_attr.rotation_angle.rem_euclid(360) != 0
+        && picture.common.width > 0
+        && picture.common.height > 0
+        && picture.shape_attr.current_width > 0
+        && picture.shape_attr.current_height > 0
+    {
+        return (picture.common.width as i32, picture.common.height as i32);
+    }
+
     let mut width = picture.common.width as i32;
     let mut height = picture.common.height as i32;
 
@@ -79,6 +137,32 @@ pub(crate) fn picture_flow_frame_size_hu(picture: &Picture) -> (i32, i32) {
     }
 }
 
+/// [#7193] 그림 안쪽 여백을 개체 틀(`common`) 크기에 대한 비율로 돌려준다.
+///
+/// 한/글은 틀(`hp:sz`) 안에서 안쪽 여백(`hp:inMargin`)을 뺀 자리에 그림을 그린다 —
+/// 틀은 `curSz + inMargin` 이다(코퍼스 HWPX 에서 여백 있는 그림 6/6 이 이 관계). 틀은
+/// 흐름·선택의 기준이므로 바꾸지 않고, 비율로 넘겨 페인터가 실제 bbox 에 적용한다.
+///
+/// 적용하지 않는 경우(`None`): 여백이 모두 0, 틀 크기가 없음(묶음 자식 등), 회전 그림
+/// (틀이 회전 후 외접 사각형이라 축이 맞지 않는다), 여백이 틀을 다 덮는 손상 값.
+pub(crate) fn picture_content_inset(picture: &Picture) -> Option<[f64; 4]> {
+    let p = &picture.padding;
+    if p.left == 0 && p.right == 0 && p.top == 0 && p.bottom == 0 {
+        return None;
+    }
+    let (w, h) = (picture.common.width as f64, picture.common.height as f64);
+    if w <= 0.0 || h <= 0.0 || picture.shape_attr.rotation_angle.rem_euclid(360) != 0 {
+        return None;
+    }
+    let inset = [
+        f64::from(p.left.max(0)) / w,
+        f64::from(p.top.max(0)) / h,
+        f64::from(p.right.max(0)) / w,
+        f64::from(p.bottom.max(0)) / h,
+    ];
+    (inset[0] + inset[2] < 1.0 && inset[1] + inset[3] < 1.0).then_some(inset)
+}
+
 /// 문단의 실효 numbering_id를 반환한다.
 /// Outline 문단이고 para_style.numbering_id==0이면 구역의 outline_numbering_id로 fallback.
 pub fn resolve_numbering_id(
@@ -91,6 +175,24 @@ pub fn resolve_numbering_id(
     } else {
         para_numbering_id
     }
+}
+
+/// [#3307] 정의 없는 개요의 한컴 내장 기본 모양.
+///
+/// 개요 문단이 유효한 numbering 정의에 도달하지 못하면(문서에 `<hh:numbering>` 이
+/// 없고 `outlineShapeIDRef=0`) 한컴 2020 은 **전 수준 레벨 경로 + 후행 마침표**로
+/// 렌더한다 — level 0 `1.`, level 1 `2.1.`, … level 6 `2.5.1.1.1.2.1.`
+/// (fixture 수준 스윕을 한컴 2020 MCP 로 실측, task #3307 Stage 1). 이는 기존
+/// `^N` 제어코드와 동일하므로 형식 문자열만 합성한다. 기본 모양은 한컴이 파일에
+/// 실체화하지 않는 편집기 내장 동작이라(재저장 실험으로 확인) 합성이 유일한 경로다.
+pub(crate) fn default_outline_numbering() -> Numbering {
+    let mut n = Numbering::default();
+    for f in n.level_formats.iter_mut() {
+        *f = "^N".to_string();
+    }
+    n.start_number = 1;
+    n.level_start_numbers = [1; 7];
+    n
 }
 
 /// 번호 형식 문자열의 `^` 제어코드를 실제 번호로 치환.
@@ -111,7 +213,7 @@ pub(crate) fn expand_numbering_format(
         let counter_val = counters[idx];
         let start = start_numbers[idx];
         let num = if counter_val > 0 {
-            (start - 1) + counter_val
+            start.saturating_sub(1) + counter_val
         } else {
             start
         };
@@ -155,7 +257,7 @@ pub(crate) fn expand_numbering_format(
     result
 }
 
-/// HWP 표 43 번호 형식 코드 → NumberFormat 변환
+/// HWP 표 41 번호 형식 코드 → NumberFormat 변환
 pub(crate) fn numbering_format_to_number_format(code: u8) -> NumFmt {
     match code {
         0 => NumFmt::Digit,         // 1, 2, 3
@@ -165,6 +267,7 @@ pub(crate) fn numbering_format_to_number_format(code: u8) -> NumFmt {
         4 => NumFmt::LatinUpper,    // A, B, C
         5 => NumFmt::LatinLower,    // a, b, c
         8 => NumFmt::HangulGaNaDa,  // 가, 나, 다
+        10 => NumFmt::HangulJamo,   // ㄱ, ㄴ, ㄷ
         12 => NumFmt::HangulNumber, // 일, 이, 삼
         13 => NumFmt::HanjaNumber,  // 一, 二, 三
         _ => NumFmt::Digit,
@@ -246,12 +349,15 @@ pub(crate) fn drawing_to_shape_style(
             } else {
                 g.positions.iter().map(|&p| p as f64 / 100.0).collect()
             };
+            // [#6822] `step`(띠 개수)·`step_center`(전이 위치)를 stop 으로 편다.
+            let (colors, positions) =
+                super::super::expand_gradient_steps(&g.colors, &positions, g.blur, g.step_center);
             Box::new(GradientFillInfo {
                 gradient_type: g.gradient_type,
                 angle: g.angle,
                 center_x: g.center_x,
                 center_y: g.center_y,
-                colors: g.colors.clone(),
+                colors,
                 positions,
             })
         }),

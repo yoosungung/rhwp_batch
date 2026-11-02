@@ -1,5 +1,6 @@
 use crate::model::control::Control;
 use crate::model::document::Document;
+use crate::model::page::ColumnDef;
 use crate::model::paragraph::{ColumnBreakType, Paragraph};
 use crate::model::shape::{
     CommonObjAttr, RectangleShape, ShapeComponentAttr, ShapeObject, TextBox,
@@ -318,6 +319,9 @@ fn validate_paragraph(paragraph: &Paragraph, path: &str, blockers: &mut Vec<HmlS
                     "shape kind is not mapped by the HML reader",
                 )),
             },
+            Control::ColumnDef(column_def) => {
+                validate_column_def(column_def, &format!("{control_path}/COLDEF"), blockers)
+            }
             _ => blockers.push(unsupported(
                 control_path,
                 "control kind is not mapped by the HML reader",
@@ -352,8 +356,8 @@ fn validate_equation(
         blockers,
     );
     let common = &equation.common;
-    let packed_attr =
-        crate::document_core::converters::common_obj_attr_writer::pack_common_attr_bits(common);
+    // [#4400] pack_common_attr_bits 는 serializer 소유로 이동했다.
+    let packed_attr = crate::serializer::control::pack_common_attr_bits(common);
     let omitted = !matches!(common.attr, 0) && common.attr != packed_attr
         || common.vertical_offset != 0
         || common.horizontal_offset != 0
@@ -375,6 +379,26 @@ fn validate_equation(
         equation.unknown != 0 || !equation.raw_ctrl_data.is_empty(),
         path,
         "equation binary-only fields are not represented by HML EQUATION",
+        blockers,
+    );
+}
+
+/// [#4386] `COLDEF`은 `Count`/`Layout`/`SameGap`/`SameSize`/`Type`만 왕복한다(HML
+/// 실물에서 관찰된 속성 전부). `widths`/`gaps`(단별 개별 폭·간격) 및
+/// `separator_*`/`raw_attr`(단 구분선, HWPX `colLine`에 대응)는 HML `COLDEF`에 실을
+/// 자리가 없다 — 이 필드들이 기본값이 아니면 조용히 잘라내는 대신 export를 막는다.
+fn validate_column_def(column_def: &ColumnDef, path: &str, blockers: &mut Vec<HmlSaveBlocker>) {
+    let default = ColumnDef::default();
+    push_if(
+        !column_def.widths.is_empty()
+            || !column_def.gaps.is_empty()
+            || column_def.proportional_widths != default.proportional_widths
+            || column_def.separator_type != default.separator_type
+            || column_def.separator_width != default.separator_width
+            || column_def.separator_color != default.separator_color
+            || column_def.raw_attr != default.raw_attr,
+        path,
+        "column per-column widths/gaps/separator fields are not represented by HML COLDEF",
         blockers,
     );
 }
@@ -670,9 +694,11 @@ fn validate_table(table: &Table, path: &str, blockers: &mut Vec<HmlSaveBlocker>)
 }
 
 fn validate_cell(cell: &Cell, path: &str, blockers: &mut Vec<HmlSaveBlocker>) {
+    // [#3189] cell.vertical_align 은 이제 PARALIST@VertAlign 으로 왕복하므로
+    // 더 이상 blocker 가 아니다 (Top/Bottom 셀도 저장 가능). 글상자
+    // (`validate_text_box`) 쪽 vertical_align 은 아직 방출 경로가 없어 그대로 둔다.
     let omitted = cell.list_header_width_ref != 0
         || cell.text_direction != 0
-        || cell.vertical_align != VerticalAlign::Center
         || !cell.apply_inner_margin
         || cell.is_header
         || !cell.raw_list_extra.is_empty()

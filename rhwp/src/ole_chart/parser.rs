@@ -9,6 +9,9 @@ use std::fmt;
 use encoding_rs::EUC_KR;
 use serde::Serialize;
 
+use super::grid::{self, LegacyChartGrid};
+use super::orientation::{self, SeriesAxis, SeriesAxisEvidence};
+
 /// OLE `Contents`에서 추출한 차트 IR.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,6 +20,13 @@ pub struct OleChart {
     pub title: Option<String>,
     pub categories: Vec<String>,
     pub series: Vec<OleChartSeries>,
+    /// 그리드의 어느 축이 계열이었는가(#4098).
+    pub series_axis: SeriesAxis,
+    /// [`Self::series_axis`] 를 무엇으로 정했는가.
+    ///
+    /// [`SeriesAxisEvidence::Inconclusive`] 는 **판정이 아니라 관례 폴백**이라는 선언이다.
+    /// 소비자가 결정과 추정을 구별할 수 있어야 하므로 값과 함께 싣는다.
+    pub series_axis_evidence: SeriesAxisEvidence,
 }
 
 /// OLE `Contents` 차트 종류.
@@ -113,70 +123,82 @@ pub fn parse_ole_chart_contents(bytes: &[u8]) -> Result<OleChart, OleChartParseE
     })
 }
 
+/// 레거시 그리드를 차트 IR 로 옮긴다.
+///
+/// 권위 순서는 **① `VtObject` 가 명시한 치수가 모양 → ② 셀 인덱스가 배치 → ③ 라벨은
+/// 이름일 뿐** 이다(#4098). 예전에는 라벨 분류가 값 개수를 정했기 때문에 라벨을 잘못
+/// 가르면 값 탐색까지 같이 틀렸다.
 fn parse_legacy_hwp_chart_contents(
     bytes: &[u8],
     probe: &OleChartContentsProbe,
 ) -> Result<OleChart, OleChartParseError> {
-    let grid_marker_start = find_bytes(bytes, b"VtDataGrid\0").ok_or_else(|| {
-        unsupported_legacy_layout(probe, "legacy HWP chart data grid marker not found")
-    })?;
-    let grid_start = legacy_chart_object_data_start(bytes, grid_marker_start, b"VtDataGrid\0");
-    let grid_end = find_next_legacy_object_marker(bytes, grid_start).ok_or_else(|| {
-        unsupported_legacy_layout(probe, "legacy HWP chart data grid boundary not found")
-    })?;
+    let grid = grid::scan_legacy_grid(bytes)
+        .map_err(|error| unsupported_legacy_layout(probe, error.reason()))?;
+    let (series_axis, series_axis_evidence) = orientation::decide_series_axis(bytes, &grid);
 
-    let labels = extract_string_labels(bytes, grid_start, grid_end);
-    let mut series_names = Vec::new();
-    let mut categories = Vec::new();
-    let mut saw_category = false;
-
-    for label in labels {
-        if label.text.chars().any(|ch| ch.is_ascii_digit()) {
-            saw_category = true;
-            categories.push(label.text);
-        } else if !saw_category {
-            series_names.push(label.text);
-        }
-    }
-
-    series_names.dedup();
-    categories.dedup();
-
-    if series_names.is_empty() || categories.is_empty() {
-        return Err(unsupported_legacy_layout(
-            probe,
-            "legacy HWP chart data grid labels are incomplete",
-        ));
-    }
-
-    let series_count = series_names.len();
-    let expected_values = series_count * categories.len();
-    let values = extract_grid_values(bytes, grid_start, grid_end, expected_values);
-    if values.len() != expected_values {
-        return Err(unsupported_legacy_layout(
-            probe,
-            "legacy HWP chart data grid shape not recognized",
-        ));
-    }
-
-    let mut series = Vec::with_capacity(series_count);
-    for (series_idx, name) in series_names.into_iter().enumerate() {
-        let mut series_values = Vec::with_capacity(categories.len());
-        for category_idx in 0..categories.len() {
-            series_values.push(values[category_idx * series_count + series_idx]);
-        }
-        series.push(OleChartSeries {
-            name: Some(name),
-            values: series_values,
-        });
-    }
+    let (series_count, category_count) = match series_axis {
+        SeriesAxis::Rows => (grid.data_rows(), grid.data_cols()),
+        SeriesAxis::Columns => (grid.data_cols(), grid.data_rows()),
+    };
+    let labels: Vec<_> = (1..=category_count)
+        .map(|index| grid_category_label(&grid, series_axis, index))
+        .collect();
+    let has_labels = labels.iter().any(Option::is_some);
+    let categories = labels
+        .into_iter()
+        .enumerate()
+        .map(|(index, label)| match label {
+            Some(text) => text.to_string(),
+            None if has_labels => String::new(),
+            None => (index + 1).to_string(),
+        })
+        .collect();
 
     Ok(OleChart {
         chart_type: OleChartType::Unknown,
         title: extract_chart_title(bytes),
         categories,
-        series,
+        series: (1..=series_count)
+            .map(|index| OleChartSeries {
+                name: grid_series_name(&grid, series_axis, index),
+                values: (1..=category_count)
+                    .map(|category| grid_value(&grid, series_axis, index, category))
+                    .collect(),
+            })
+            .collect(),
+        series_axis,
+        series_axis_evidence,
     })
+}
+
+/// 계열 이름. 라벨 셀이 비어 있어도 파싱을 실패시키지 않는다 — 이름이 없는 것과 모양을
+/// 모르는 것은 다르다.
+fn grid_series_name(grid: &LegacyChartGrid, axis: SeriesAxis, index: usize) -> Option<String> {
+    let label = match axis {
+        SeriesAxis::Rows => grid.row_label(grid.data_row_at(index as u16)),
+        SeriesAxis::Columns => grid.column_label(grid.data_col_at(index as u16)),
+    };
+    label.map(str::to_string)
+}
+
+/// 카테고리 이름. 일부 눈금만 표시한 축의 빈 칸과 아예 이름 없는 축을 구분한다.
+fn grid_category_label(grid: &LegacyChartGrid, axis: SeriesAxis, index: usize) -> Option<&str> {
+    match axis {
+        SeriesAxis::Rows => grid.column_label(grid.data_col_at(index as u16)),
+        SeriesAxis::Columns => grid.row_label(grid.data_row_at(index as u16)),
+    }
+}
+
+/// 계열 `series` 의 카테고리 `category` 값.
+///
+/// 빈 데이터 칸은 결함이 아니므로(코퍼스 74개 중 5개) `None` 은 0 으로 채운다.
+fn grid_value(grid: &LegacyChartGrid, axis: SeriesAxis, series: usize, category: usize) -> f64 {
+    let (data_row, data_col) = match axis {
+        SeriesAxis::Rows => (series as u16, category as u16),
+        SeriesAxis::Columns => (category as u16, series as u16),
+    };
+    let (row, col) = (grid.data_row_at(data_row), grid.data_col_at(data_col));
+    grid.number(row, col).unwrap_or(0.0)
 }
 
 fn unsupported_legacy_layout(
@@ -211,8 +233,18 @@ pub fn probe_ole_chart_contents(bytes: &[u8]) -> Result<OleChartContentsProbe, O
     let has_ooxml_chart_marker = bytes
         .windows(b"chartSpace".len())
         .any(|w| w == b"chartSpace");
+    // [#6922] `w1 == w2` 를 요구하지 않는다.
+    //
+    // 종전 술어는 앞 16바이트 네 워드 중 **둘째·셋째가 같을 것**을 요구했다. 그 조건이
+    // 왜 성립해야 하는지는 근거로 적혀 있지 않았고, 실측하면 두 값은 **서로 다른 두
+    // 크기값**이다(148735526 `Contents`: `w1=0x3a65`(14,949) · `w2=0x22d4`(8,916)).
+    // 지금까지 표본에서 우연히 같았을 뿐이라, `VtChart`·`VtDataGrid` 표지를 둘 다 가진
+    // 진짜 레거시 한/글 차트가 `UNSUPPORTED_CONTENTS_LAYOUT` 으로 떨어졌다.
+    //
+    // 남는 술어는 그대로다 — `w0 == 0x0001_0000`, `w3`(개체 시작 오프셋)가 스트림 안의
+    // 합리적 값, 그리고 **`VtDataGrid` 표지**(아래 `likely_legacy_hwp_chart_contents`).
+    // `#5724`(StaticMetafile)·`#5725`(수식 OLE)는 그 표지가 없어 영향받지 않는다.
     let legacy_chart_object_start = if first_words_le[0] == 0x0001_0000
-        && first_words_le[1] == first_words_le[2]
         && first_words_le[3] >= 0x20
         && (first_words_le[3] as usize) < bytes.len()
     {
@@ -317,78 +349,6 @@ fn is_plausible_chart_label(text: &str) -> bool {
     has_data_char
 }
 
-fn extract_grid_values(bytes: &[u8], start: usize, end: usize, expected_count: usize) -> Vec<f64> {
-    if expected_count == 0 || start >= end || end > bytes.len() {
-        return Vec::new();
-    }
-
-    let mut best = Vec::new();
-    let scan_end = end.saturating_sub(8);
-    for offset in start..=scan_end {
-        let value = read_f64(bytes, offset);
-        if !is_plausible_grid_value(value) {
-            continue;
-        }
-
-        let mut run = Vec::new();
-        let mut cursor = offset;
-        while cursor + 8 <= end {
-            let value = read_f64(bytes, cursor);
-            if !is_plausible_grid_value(value) {
-                break;
-            }
-            run.push(value);
-            cursor += 8;
-        }
-
-        if run.len() == expected_count {
-            return run;
-        }
-        if run.len() > best.len() {
-            best = run;
-        }
-    }
-
-    if best.len() >= expected_count {
-        best.truncate(expected_count);
-        best
-    } else {
-        extract_sparse_grid_values(bytes, start, end, expected_count)
-    }
-}
-
-fn extract_sparse_grid_values(
-    bytes: &[u8],
-    start: usize,
-    end: usize,
-    expected_count: usize,
-) -> Vec<f64> {
-    let mut values = Vec::new();
-    let mut offset = start;
-    while offset + 8 <= end {
-        let value = read_f64(bytes, offset);
-        if is_plausible_grid_value(value) {
-            values.push(value);
-            offset += 8;
-            continue;
-        }
-        offset += 1;
-    }
-
-    if values.len() == expected_count {
-        values
-    } else {
-        Vec::new()
-    }
-}
-
-fn is_plausible_grid_value(value: f64) -> bool {
-    value.is_finite()
-        && value >= 1.0
-        && value <= 1_000_000.0
-        && (value.fract().abs() < 1e-9 || (1.0 - value.fract()).abs() < 1e-9)
-}
-
 fn extract_chart_title(bytes: &[u8]) -> Option<String> {
     let title_marker = find_title_marker(bytes, 0)?;
     let title_start =
@@ -424,19 +384,8 @@ fn find_title_marker(bytes: &[u8], start: usize) -> Option<MarkerMatch> {
 }
 
 fn find_next_legacy_object_marker(bytes: &[u8], start: usize) -> Option<usize> {
-    const MARKERS: &[&[u8]] = &[
-        b"VtBackdrop\0",
-        b"VtBackDrop\0",
-        b"VtChartSection\0",
-        b"VtFootnote\0",
-        b"VtLegend\0",
-        b"VtPlot\0",
-        b"VtPrintInformation\0",
-        b"VtChartTitle\0",
-        b"VtTitle\0",
-    ];
-
-    find_first_marker(bytes, start, MARKERS).map(|marker| marker.start)
+    // 마커 목록의 정본은 `grid` 다(#4098 중복 제거).
+    grid::next_object_marker(bytes, start)
 }
 
 fn find_first_marker(bytes: &[u8], start: usize, markers: &[&'static [u8]]) -> Option<MarkerMatch> {
@@ -464,10 +413,6 @@ fn find_bytes_from(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
-}
-
-fn read_f64(bytes: &[u8], offset: usize) -> f64 {
-    f64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
 #[cfg(test)]
@@ -540,29 +485,74 @@ mod tests {
         assert_eq!(text, "연금 재정 전망");
     }
 
+    /// 값 필터가 사라졌으므로 소수·0·음수가 그대로 살아 나온다(#4098 결함 1).
+    ///
+    /// 예전 `is_plausible_grid_value` 는 이 중 어느 것도 통과시키지 못했고, 값을 거르는
+    /// 데 그치지 않고 연속 런을 끊어 **파싱 전체**를 실패시켰다.
     #[test]
-    fn legacy_grid_values_require_dense_f64_run() {
-        let mut bytes = vec![0u8; 96];
-        bytes[4..12].copy_from_slice(&999.0f64.to_le_bytes());
-        bytes[17..25].copy_from_slice(&1.0f64.to_le_bytes());
-        bytes[25..33].copy_from_slice(&2.0f64.to_le_bytes());
-        bytes[33..41].copy_from_slice(&3.0f64.to_le_bytes());
+    fn legacy_grid_reads_values_the_old_filter_rejected() {
+        use crate::ole_chart::grid::tests::{synth_grid, Cell};
 
-        let values = extract_grid_values(&bytes, 0, bytes.len(), 3);
-        assert_eq!(values, [1.0, 2.0, 3.0]);
+        let mut bytes = vec![0u8; 0x60];
+        bytes[0..4].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&0x0000_0020u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&0x0000_0020u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&0x0000_0060u32.to_le_bytes());
+        bytes.extend_from_slice(&synth_grid(
+            2,
+            4,
+            &[
+                Cell::Text(2, "봄"),
+                Cell::Text(3, "여름"),
+                Cell::Text(4, "가을"),
+                Cell::Text(5, "판매"),
+                Cell::Num(6, 4.3),
+                Cell::Num(7, 0.0),
+                Cell::Num(8, -2.5),
+            ],
+        ));
+
+        let chart = parse_ole_chart_contents(&bytes).expect("parse");
+        assert_eq!(chart.categories, ["봄", "여름", "가을"]);
+        assert_eq!(chart.series.len(), 1);
+        assert_eq!(chart.series[0].name.as_deref(), Some("판매"));
+        assert_eq!(chart.series[0].values, [4.3, 0.0, -2.5]);
     }
 
+    /// 라벨에 숫자가 섞여 있어도 계열·카테고리가 뒤바뀌지 않는다(#4098 결함 3).
+    ///
+    /// 예전 digit 휴리스틱은 `항목 1`·`계열 1` 을 전부 카테고리로 몰아 계열을 0개로
+    /// 만들었고, 코퍼스 28종이 전건 이 경로로 실패했다.
     #[test]
-    fn legacy_grid_values_fall_back_to_exact_sparse_candidates() {
-        let mut bytes = vec![0u8; 96];
-        bytes[7..15].copy_from_slice(&1.0f64.to_le_bytes());
-        bytes[29..37].copy_from_slice(&2.0f64.to_le_bytes());
-        bytes[53..61].copy_from_slice(&3.0f64.to_le_bytes());
+    fn numeric_labels_do_not_collapse_series_and_categories() {
+        use crate::ole_chart::grid::tests::{synth_grid, Cell};
 
-        let values = extract_grid_values(&bytes, 0, bytes.len(), 3);
-        assert_eq!(values, [1.0, 2.0, 3.0]);
+        let mut bytes = vec![0u8; 0x60];
+        bytes[0..4].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&0x0000_0020u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&0x0000_0020u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&0x0000_0060u32.to_le_bytes());
+        bytes.extend_from_slice(&synth_grid(
+            3,
+            3,
+            &[
+                Cell::Text(2, "항목 1"),
+                Cell::Text(3, "항목 2"),
+                Cell::Text(4, "계열 1"),
+                Cell::Num(5, 1.5),
+                Cell::Num(6, 2.5),
+                Cell::Text(7, "계열 2"),
+                Cell::Num(8, 3.5),
+                Cell::Num(9, 4.5),
+            ],
+        ));
 
-        let values = extract_grid_values(&bytes, 0, bytes.len(), 2);
-        assert!(values.is_empty());
+        let chart = parse_ole_chart_contents(&bytes).expect("parse");
+        assert_eq!(chart.categories, ["항목 1", "항목 2"]);
+        assert_eq!(chart.series.len(), 2);
+        assert_eq!(chart.series[0].name.as_deref(), Some("계열 1"));
+        assert_eq!(chart.series[0].values, [1.5, 2.5]);
+        assert_eq!(chart.series[1].name.as_deref(), Some("계열 2"));
+        assert_eq!(chart.series[1].values, [3.5, 4.5]);
     }
 }

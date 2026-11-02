@@ -267,7 +267,13 @@ fn escape_xml_text(value: &str) -> String {
             '>' => escaped.push_str("&gt;"),
             '"' => escaped.push_str("&quot;"),
             '\'' => escaped.push_str("&apos;"),
-            _ => escaped.push(ch),
+            // XML 1.0 허용 문자: #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+            // 그 외(제어문자, U+FFFE, U+FFFF 등)는 제거 — 방출된 SVG 가 불법 XML 이 되지 않도록 (#3382)
+            '\u{09}' | '\u{0A}' | '\u{0D}' => escaped.push(ch),
+            '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}' => {
+                escaped.push(ch)
+            }
+            _ => {} // XML 무효 문자 제거
         }
     }
     escaped
@@ -292,7 +298,7 @@ fn finite_or(value: f64, fallback: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ole_chart::{OleChartSeries, OleChartType};
+    use crate::ole_chart::{OleChartSeries, OleChartType, SeriesAxis, SeriesAxisEvidence};
 
     fn sample_chart() -> OleChart {
         OleChart {
@@ -303,6 +309,8 @@ mod tests {
                 name: Some("적립금".to_string()),
                 values: vec![328.0, 812.0],
             }],
+            series_axis: SeriesAxis::Columns,
+            series_axis_evidence: SeriesAxisEvidence::ColumnLabelsEchoed,
         }
     }
 

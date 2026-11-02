@@ -1,7 +1,7 @@
 use super::*;
 use crate::model::bin_data::{BinDataCompression, BinDataStatus};
 use crate::model::style::{
-    Alignment, BorderLine, CenterLine, DiagonalLine, Fill, ImageFill, ImageFillMode,
+    Alignment, BorderLine, CenterLine, CharShape, DiagonalLine, Fill, ImageFill, ImageFillMode,
     LineSpacingType, NumberingHead, SolidFill,
 };
 use crate::parser::doc_info::parse_doc_info;
@@ -199,6 +199,46 @@ fn test_serialize_char_shape_roundtrip() {
 }
 
 #[test]
+fn serialize_char_shape_preserves_inactive_model_fields() {
+    let cs = CharShape {
+        bold: true,
+        shadow_color: 0x00b2_b2b2,
+        ..Default::default()
+    };
+
+    let data = serialize_char_shape(&cs);
+    let attr = u32::from_le_bytes(data[46..50].try_into().unwrap());
+    let shadow_color = u32::from_le_bytes(data[64..68].try_into().unwrap());
+
+    assert_eq!(attr, 0x02);
+    assert_eq!(shadow_color, 0x00b2_b2b2);
+}
+
+#[test]
+fn serialize_char_shape_preserves_active_line_and_shadow_fields() {
+    let cs = CharShape {
+        underline_type: crate::model::style::UnderlineType::Bottom,
+        underline_shape: 3,
+        strikethrough: true,
+        strike_shape: 4,
+        shadow_type: 1,
+        shadow_color: 0x0012_3456,
+        ..Default::default()
+    };
+
+    let data = serialize_char_shape(&cs);
+    let attr = u32::from_le_bytes(data[46..50].try_into().unwrap());
+    let shadow_color = u32::from_le_bytes(data[64..68].try_into().unwrap());
+
+    assert_eq!((attr >> 2) & 0x03, 1);
+    assert_eq!((attr >> 4) & 0x0f, 3);
+    assert_eq!((attr >> 18) & 0x07, 2);
+    assert_eq!((attr >> 26) & 0x0f, 4);
+    assert_eq!((attr >> 11) & 0x03, 1);
+    assert_eq!(shadow_color, 0x0012_3456);
+}
+
+#[test]
 fn test_serialize_char_shape_use_font_space_bit() {
     let mut cs = CharShape {
         base_size: 1000,
@@ -248,6 +288,8 @@ fn test_serialize_para_shape_roundtrip() {
         head_type: crate::model::style::HeadType::None,
         para_level: 0,
         break_latin_word: None,
+        hwpx_plain_para_margin: false,
+        hwpx_plain_para_margin_physical: false,
     };
 
     let data = serialize_para_shape(&ps);
@@ -636,6 +678,8 @@ fn test_serialize_doc_info_roundtrip() {
         head_type: crate::model::style::HeadType::None,
         para_level: 0,
         break_latin_word: None,
+        hwpx_plain_para_margin: false,
+        hwpx_plain_para_margin_physical: false,
     });
     doc_info.styles.push(Style {
         raw_data: None,
@@ -791,4 +835,49 @@ fn test_serialize_bullet_layout_and_roundtrip() {
     assert_eq!(parsed_info.bullets[0].bullet_char, '-');
     assert_eq!(parsed_info.bullets[0].char_shape_id, 2);
     assert_eq!(parsed_info.bullets[0].text_distance, 50);
+}
+
+/// [#4898] HWPX 출처 글꼴은 `default_name` 이 비어 있다 — 한글은 그 자리에 영문 기본
+/// 이름을 싣는다. 실측표로 같은 값을 채워 FACE_NAME 이 한컴 저장본과 같은 모양이 되게 한다.
+///
+/// 실측: 09254 의 FACE_NAME 33개가 한글 오라클 37~65바이트 vs rhwp 19~23바이트였고,
+/// 표 적용 후 크기가 일치했다(일치 레코드 399 → 410).
+/// 표 자체는 한컴 저장 `.hwp` 796건에서 모은 36,351쌍의 이름별 최빈값이다.
+#[test]
+fn issue4898_face_name_fills_measured_default_font_name() {
+    let mut font = Font {
+        name: "굴림체".to_string(),
+        ..Default::default()
+    };
+    font.default_name = None;
+
+    let bytes = serialize_face_name(&font);
+    // attr bit 0x20 = 기본 글꼴 이름 있음
+    assert_ne!(bytes[0] & 0x20, 0, "기본 글꼴 이름 플래그가 서야 한다");
+
+    let parsed = crate::parser::doc_info::parse_face_name(&bytes).expect("FACE_NAME 재파싱");
+    assert_eq!(
+        parsed.default_name.as_deref(),
+        Some("GulimChe"),
+        "한글이 싣는 영문 기본 이름과 같아야 한다"
+    );
+
+    // 원본이 이미 값을 갖고 있으면 그 값이 이긴다(표가 덮어쓰지 않는다).
+    let mut explicit = Font {
+        name: "굴림체".to_string(),
+        ..Default::default()
+    };
+    explicit.default_name = Some("Explicit".to_string());
+    let parsed = crate::parser::doc_info::parse_face_name(&serialize_face_name(&explicit))
+        .expect("FACE_NAME 재파싱");
+    assert_eq!(parsed.default_name.as_deref(), Some("Explicit"));
+
+    // 표에 없는 이름은 종전대로 비운다.
+    let unknown = Font {
+        name: "존재하지않는글꼴".to_string(),
+        ..Default::default()
+    };
+    let parsed = crate::parser::doc_info::parse_face_name(&serialize_face_name(&unknown))
+        .expect("FACE_NAME 재파싱");
+    assert_eq!(parsed.default_name, None);
 }

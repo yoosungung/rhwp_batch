@@ -12,6 +12,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+use crate::diagnostics::{read_hwp5_doc_info_limited, MAX_HWP5_DIAGNOSTIC_STREAM_OUTPUT_BYTES};
 use crate::parser::cfb_reader::CfbReader;
 use crate::parser::header;
 use crate::parser::tags;
@@ -79,10 +80,17 @@ struct BorderFillView {
     hash: String,
 }
 
-pub fn run(args: &[String]) {
-    if args.is_empty() || matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
+pub fn run(args: &[String]) -> i32 {
+    // 종료 코드 계약(mydocs/manual/cli_commands.md): 명시적 `--help` 만 성공(0)이고,
+    // 인자 누락·파싱 실패는 사용법 오류(2), 실행 실패는 런타임 오류(1)다. 종전에는
+    // 반환형이 `()` 라 main 의 exit_with 를 통과하지 못해 무슨 일이 나든 0으로 끝났다.
+    if matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
         print_usage();
-        return;
+        return super::EXIT_OK;
+    }
+    if args.is_empty() {
+        print_usage();
+        return super::EXIT_USAGE;
     }
 
     let options = match parse_args(args) {
@@ -90,13 +98,15 @@ pub fn run(args: &[String]) {
         Err(message) => {
             eprintln!("{message}");
             print_usage();
-            return;
+            return super::EXIT_USAGE;
         }
     };
 
     if let Err(error) = run_inner(options) {
         eprintln!("오류: {error}");
+        return super::EXIT_RUNTIME;
     }
+    super::EXIT_OK
 }
 
 fn parse_args(args: &[String]) -> Result<Options, String> {
@@ -135,8 +145,12 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
 }
 
 fn print_usage() {
-    println!("사용법:");
-    println!("  rhwp hwp5-borderfill-diagonal-probe <oracle.hwp> <generated.hwp> --out-dir <폴더>");
+    // 안내는 stderr 로 나간다(계약). stdout 은 프로브 데이터 전용이라
+    // 섞이면 JSONL 을 파이프로 받는 소비자가 파싱에서 깨진다.
+    eprintln!("사용법:");
+    eprintln!(
+        "  rhwp hwp5-borderfill-diagonal-probe <oracle.hwp> <generated.hwp> --out-dir <폴더>"
+    );
 }
 
 fn run_inner(options: Options) -> Result<(), String> {
@@ -429,7 +443,7 @@ fn read_all_streams(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut streams = BTreeMap::new();
     for path in paths {
         let data = cfb
-            .read_stream_raw(&path)
+            .read_stream_raw_limited(&path, MAX_HWP5_DIAGNOSTIC_STREAM_OUTPUT_BYTES)
             .map_err(|error| format!("스트림 읽기 실패 - {path}: {error}"))?;
         streams.insert(path, data);
     }
@@ -438,8 +452,12 @@ fn read_all_streams(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
 
 fn read_decompressed_doc_info(bytes: &[u8], compressed: bool) -> Result<Vec<u8>, String> {
     let mut cfb = CfbReader::open(bytes).map_err(|error| format!("CFB 열기 실패: {error}"))?;
-    cfb.read_doc_info(compressed)
-        .map_err(|error| format!("DocInfo 읽기 실패: {error}"))
+    read_hwp5_doc_info_limited(
+        &mut cfb,
+        compressed,
+        MAX_HWP5_DIAGNOSTIC_STREAM_OUTPUT_BYTES,
+    )
+    .map_err(|error| format!("DocInfo 읽기 실패: {error}"))
 }
 
 fn compress_stream(data: &[u8]) -> Result<Vec<u8>, String> {

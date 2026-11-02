@@ -1,8 +1,8 @@
 use std::fmt::Write as _;
 
-use base64::Engine;
-
-use crate::document_core::helpers::{color_ref_to_css, json_escape as raw_json_escape};
+use crate::document_core::helpers::{
+    color_ref_to_css, json_escape as raw_json_escape, write_json_base64,
+};
 use crate::model::control::FormType;
 use crate::model::image::ImageEffect;
 use crate::model::style::{ImageFillMode, UnderlineType};
@@ -64,17 +64,60 @@ const KNOWN_TEXT_FEATURES: &[&str] = &[
     "text.tabLeaderOp.bounded",
     "text.decorationOp",
     "text.decorationOp.bounded",
+    "text.visualSourceBinding",
+    "text.decorationOp.producerExtent",
+    "paint.controlLabel",
     "text.displayText",
     "text.vertical.mixedPerGlyph",
 ];
 
+/// 레이어 트리 JSON 직렬화 옵션 (Task #3315).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayerJsonOptions {
+    /// 그림 바이트를 base64 로 싣지 않는다.
+    ///
+    /// `sourceImageKey` 를 낼 수 있는 op 만 대상이다 — 키가 없으면 소비자가 바이트를 되찾을
+    /// 길이 없으므로 그 op 은 종전대로 base64 를 싣는다.
+    ///
+    /// 그래서 **한 문서 안에 생략된 op 과 인라인 op 이 섞일 수 있다.** 최상위 `imageBytes` 는
+    /// "이렇게 요청했다"는 **모드**이고, op 마다 실제로 생략됐는지는 `imageBytesOmitted` 가
+    /// 말한다 — 소비자는 후자를 봐야 한다. `imageBytes:"byKey"` 를 "모든 op 에 base64 가
+    /// 없다"로 읽으면 키 없는 합성 그림에서 어긋난다.
+    ///
+    /// 기본값은 `false` 이고, 그때 그림 op 의 payload(`mime`·`base64`)는 종전과 같다. 다만
+    /// **JSON 전체가 종전과 같지는 않다** — 이 기능이 최상위 `imageBytes` 를 더하고 schema
+    /// minor 를 21 로 올렸다. 계약은 "기존 그림 payload 유지 + schema minor 상승과 새 메타데이터"
+    /// 이지 바이트 동일이나 모든 기존 필드 불변이 아니다.
+    pub omit_image_bytes: bool,
+    /// Portable font blob bytes를 `resources.fontBlobs`에 inline하지 않는다.
+    ///
+    /// `fontResources.blobs[].dataRef.id`와 `resources.fontBlobKeys`는 그대로 남아 소비자가
+    /// exact key로 bytes를 다시 받을 수 있다. 기본값은 `false`이며 이때 기존 JSON bytes를
+    /// 바꾸지 않는다.
+    pub omit_font_bytes: bool,
+}
+
+/// 직렬화 도중 트리 아래로 흘려야 하는 값. 그림 op 하나를 쓰려면 문서 세대(키 발급)와
+/// 생략 여부가 함께 필요해 한 덩이로 옮겼다.
+#[derive(Debug, Clone, Copy)]
+struct JsonWriteContext {
+    bin_data_epoch: u32,
+    options: LayerJsonOptions,
+}
+
 impl PageLayerTree {
     pub fn to_json(&self) -> String {
+        self.to_json_with_options(LayerJsonOptions::default())
+    }
+
+    /// [Task #3315/#4969] 그림·font base64 생략을 각각 켤 수 있는 직렬화.
+    /// `to_json()`은 두 payload를 모두 inline하는 기본 옵션 위임이다.
+    pub fn to_json_with_options(&self, options: LayerJsonOptions) -> String {
         let mut buf = String::with_capacity(32_768);
         buf.push('{');
         let _ = write!(
             buf,
-            "\"schemaVersion\":{},\"schemaMinorVersion\":{},\"schema\":{{\"major\":{},\"minor\":{}}},\"resourceTableVersion\":{},\"resourceTableMinorVersion\":{},\"resourceTable\":{{\"major\":{},\"minor\":{}}},\"unit\":{},\"coordinateSystem\":{},\"profile\":{},\"buildOptions\":{{\"showTransparentBorders\":{},\"clipEnabled\":{}}},\"debugOptions\":{{\"debugOverlay\":{}}},\"outputOptions\":{{\"showParagraphMarks\":{},\"showControlCodes\":{},\"showTransparentBorders\":{},\"clipEnabled\":{},\"debugOverlay\":{}}},\"pageWidth\":{:.3},\"pageHeight\":{:.3},\"root\":",
+            "\"schemaVersion\":{},\"schemaMinorVersion\":{},\"schema\":{{\"major\":{},\"minor\":{}}},\"resourceTableVersion\":{},\"resourceTableMinorVersion\":{},\"resourceTable\":{{\"major\":{},\"minor\":{}}},\"unit\":{},\"coordinateSystem\":{},\"profile\":{},\"imageBytes\":{},\"buildOptions\":{{\"showTransparentBorders\":{},\"clipEnabled\":{}}},\"debugOptions\":{{\"debugOverlay\":{}}},\"outputOptions\":{{\"showParagraphMarks\":{},\"showControlCodes\":{},\"showTransparentBorders\":{},\"clipEnabled\":{},\"debugOverlay\":{}}},\"pageWidth\":{:.3},\"pageHeight\":{:.3},\"root\":",
             LAYER_TREE_SCHEMA.schema_version,
             LAYER_TREE_SCHEMA.schema_minor_version,
             LAYER_TREE_SCHEMA.schema_version,
@@ -86,6 +129,17 @@ impl PageLayerTree {
             json_escape(LAYER_TREE_SCHEMA.unit),
             json_escape(LAYER_TREE_SCHEMA.coordinate_system),
             json_escape(render_profile_str(self.profile)),
+            // [#3315] 이 문서를 어떤 **모드**로 요청했는지 — `inline` 이면 바이트가 op 안에,
+            // `byKey` 면 키로 따로 받는다.
+            //
+            // op 단위의 사실은 `imageBytesOmitted` 다. 키를 낼 수 없는 합성 그림은 `byKey`
+            // 모드에서도 base64 를 싣기 때문에, 이 값만 보고 "base64 가 하나도 없다"고 단정할
+            // 수 없다. 모드와 op 단위 사실을 한 필드에 겹쳐 담지 않는다.
+            json_escape(if options.omit_image_bytes {
+                "byKey"
+            } else {
+                "inline"
+            }),
             self.output_options.show_transparent_borders,
             self.output_options.clip_enabled,
             self.output_options.debug_overlay,
@@ -98,14 +152,21 @@ impl PageLayerTree {
             self.page_height
         );
         let mut text_source_state = TextSourceExportState::default();
-        self.root
-            .write_json(&mut buf, &mut text_source_state, &self.resources);
+        self.root.write_json(
+            &mut buf,
+            &mut text_source_state,
+            &self.resources,
+            JsonWriteContext {
+                bin_data_epoch: self.resources.source_image_epoch(),
+                options,
+            },
+        );
         buf.push_str(",\"textSources\":");
         write_text_source_entries(&mut buf, &self.text_sources);
         buf.push_str(",\"fontResources\":");
         write_font_resources(&mut buf, self.resources.font_resources());
         buf.push_str(",\"resources\":");
-        write_visual_resources(&mut buf, &self.resources);
+        write_visual_resources(&mut buf, &self.resources, options);
         write_text_export_metadata(&mut buf, &self.root, &self.resources);
         buf.push_str(",\"textV2\":");
         TextV2Diagnostics::from_layer_tree(self).write_json(&mut buf);
@@ -116,6 +177,17 @@ impl PageLayerTree {
 
 fn write_text_export_metadata(buf: &mut String, root: &LayerNode, resources: &ResourceArena) {
     let externalized_visuals = externalized_text_visuals(root);
+    let has_producer_decoration_extent = layer_tree_has_op(root, |op| {
+        matches!(
+            op,
+            PaintOp::TextDecoration {
+                trim_trailing_spaces,
+                ..
+            } if *trim_trailing_spaces > 0
+        )
+    });
+    let has_control_labels =
+        layer_tree_has_op(root, |op| matches!(op, PaintOp::ControlLabel { .. }));
     let text_variant_features = collect_text_variant_features(root, resources);
     let has_variant_groups = text_variant_features.has_variant_groups();
     let has_glyph_runs = text_variant_features.has_glyph_runs;
@@ -171,6 +243,20 @@ fn write_text_export_metadata(buf: &mut String, root: &LayerNode, resources: &Re
     }
     if externalized_visuals.contains(&"decorations") {
         buf.push_str(",\"text.decorationOp\",\"text.decorationOp.bounded\"");
+    }
+    if externalized_visuals.iter().any(|visual| {
+        matches!(
+            *visual,
+            "charOverlap" | "controlMarks" | "tabLeaders" | "decorations"
+        )
+    }) {
+        buf.push_str(",\"text.visualSourceBinding\"");
+    }
+    if has_producer_decoration_extent {
+        buf.push_str(",\"text.decorationOp.producerExtent\"");
+    }
+    if has_control_labels {
+        buf.push_str(",\"paint.controlLabel\"");
     }
     let mut optional_features = Vec::new();
     if has_glyph_runs || has_glyph_outlines {
@@ -372,12 +458,26 @@ fn externalized_text_visuals(root: &LayerNode) -> Vec<&'static str> {
     visuals
 }
 
+fn layer_tree_has_op(root: &LayerNode, predicate: impl Fn(&PaintOp) -> bool) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match &node.kind {
+            LayerNodeKind::Group { children, .. } => stack.extend(children),
+            LayerNodeKind::ClipRect { child, .. } => stack.push(child),
+            LayerNodeKind::Leaf { ops } if ops.iter().any(&predicate) => return true,
+            LayerNodeKind::Leaf { .. } => {}
+        }
+    }
+    false
+}
+
 impl LayerNode {
     fn write_json(
         &self,
         buf: &mut String,
         text_sources: &mut TextSourceExportState,
         resources: &ResourceArena,
+        ctx: JsonWriteContext,
     ) {
         buf.push('{');
         buf.push_str("\"bounds\":");
@@ -407,7 +507,7 @@ impl LayerNode {
                     if idx > 0 {
                         buf.push(',');
                     }
-                    child.write_json(buf, text_sources, resources);
+                    child.write_json(buf, text_sources, resources, ctx);
                 }
                 buf.push(']');
             }
@@ -424,7 +524,7 @@ impl LayerNode {
                     json_escape(clip_kind_str(*clip_kind))
                 );
                 buf.push_str(",\"child\":");
-                child.write_json(buf, text_sources, resources);
+                child.write_json(buf, text_sources, resources, ctx);
             }
             LayerNodeKind::Leaf { ops } => {
                 buf.push_str(",\"kind\":\"leaf\",\"ops\":[");
@@ -433,7 +533,7 @@ impl LayerNode {
                     if idx > 0 {
                         buf.push(',');
                     }
-                    op.write_json(buf, text_sources, &leaf_visuals, resources);
+                    op.write_json(buf, text_sources, &leaf_visuals, resources, ctx);
                 }
                 buf.push(']');
             }
@@ -449,6 +549,7 @@ impl PaintOp {
         text_sources: &mut TextSourceExportState,
         leaf_visuals: &LeafTextVisualOps,
         resources: &ResourceArena,
+        ctx: JsonWriteContext,
     ) {
         match self {
             PaintOp::PageBackground { bbox, background } => {
@@ -475,21 +576,21 @@ impl PaintOp {
                     write_gradient(buf, gradient);
                 }
                 if let Some(image) = &background.image {
-                    let base64_data = base64::engine::general_purpose::STANDARD.encode(&image.data);
                     let _ = write!(
                         buf,
-                        ",\"image\":{{\"fillMode\":{},\"base64\":{}}}",
+                        ",\"image\":{{\"fillMode\":{},\"base64\":",
                         json_escape(image_fill_mode_str(image.fill_mode)),
-                        json_escape(&base64_data),
                     );
+                    write_json_base64(buf, &image.data[..]);
+                    buf.push('}');
                 }
                 buf.push('}');
             }
-            PaintOp::TextRun { bbox, run } => {
+            PaintOp::TextRun { bbox, run, source } => {
                 buf.push('{');
                 buf.push_str("\"type\":\"textRun\",\"bbox\":");
                 write_bbox(buf, *bbox);
-                let source = text_sources.next_text_run_span(run);
+                let source = text_sources.next_text_run_span(run, source.as_ref());
                 let display_text = display_text_for_text_run(run);
                 let _ = write!(
                     buf,
@@ -534,7 +635,7 @@ impl PaintOp {
                     if display_text.is_empty() {
                         buf.push_str("[]");
                     } else {
-                        write_text_positions_for_text(buf, display_text, &run.style);
+                        write_text_positions_for_text(buf, run, display_text);
                     }
                 }
                 if !run.style.tab_leaders.is_empty() {
@@ -646,11 +747,11 @@ impl PaintOp {
                 write_glyph_run_diagnostics(buf, &outline.diagnostics);
                 buf.push('}');
             }
-            PaintOp::CharOverlap { bbox, run } => {
+            PaintOp::CharOverlap { bbox, run, source } => {
                 buf.push('{');
                 buf.push_str("\"type\":\"charOverlap\",\"bbox\":");
                 write_bbox(buf, *bbox);
-                if let Some(source) = text_sources.last_source.as_ref() {
+                if let Some(source) = source {
                     buf.push_str(",\"source\":");
                     write_text_source_span(buf, source);
                 }
@@ -674,11 +775,11 @@ impl PaintOp {
                 write_char_overlap(buf, run.char_overlap.as_ref());
                 buf.push('}');
             }
-            PaintOp::TextControlMark { bbox, run } => {
+            PaintOp::TextControlMark { bbox, run, source } => {
                 buf.push('{');
                 buf.push_str("\"type\":\"textControlMark\",\"bbox\":");
                 write_bbox(buf, *bbox);
-                if let Some(source) = text_sources.last_source.as_ref() {
+                if let Some(source) = source {
                     buf.push_str(",\"source\":");
                     write_text_source_span(buf, source);
                 }
@@ -699,11 +800,11 @@ impl PaintOp {
                 }
                 buf.push('}');
             }
-            PaintOp::TabLeader { bbox, run } => {
+            PaintOp::TabLeader { bbox, run, source } => {
                 buf.push('{');
                 buf.push_str("\"type\":\"tabLeader\",\"bbox\":");
                 write_bbox(buf, *bbox);
-                if let Some(source) = text_sources.last_source.as_ref() {
+                if let Some(source) = source {
                     buf.push_str(",\"source\":");
                     write_text_source_span(buf, source);
                 }
@@ -721,17 +822,33 @@ impl PaintOp {
                     run.is_vertical,
                 );
             }
-            PaintOp::TextDecoration { bbox, run, kind } => {
+            PaintOp::TextDecoration {
+                bbox,
+                run,
+                kind,
+                trim_trailing_spaces,
+                source,
+            } => {
                 buf.push('{');
                 buf.push_str("\"type\":\"textDecoration\",\"bbox\":");
                 write_bbox(buf, *bbox);
-                if let Some(source) = text_sources.last_source.as_ref() {
+                if let Some(source) = source {
                     buf.push_str(",\"source\":");
                     write_text_source_span(buf, source);
                 }
                 buf.push_str(",\"decoration\":");
-                write_text_decoration(buf, *kind, run);
+                write_text_decoration(buf, *kind, run, *trim_trailing_spaces);
                 buf.push('}');
+            }
+            PaintOp::ControlLabel { bbox, label } => {
+                buf.push('{');
+                buf.push_str("\"type\":\"controlLabel\",\"bbox\":");
+                write_bbox(buf, *bbox);
+                let _ = write!(
+                    buf,
+                    ",\"label\":{},\"fontSize\":10,\"color\":\"#cc3333\"}}",
+                    json_escape(label)
+                );
             }
             PaintOp::FootnoteMarker { bbox, marker } => {
                 buf.push('{');
@@ -827,58 +944,50 @@ impl PaintOp {
             } => {
                 buf.push('{');
                 buf.push_str("\"type\":\"image\",\"bbox\":");
-                write_bbox(buf, *bbox);
+                // [#7193] 소비자가 그리는 자리 — 틀에서 그림 안쪽 여백을 뺀 사각형.
+                write_bbox(buf, image.paint_bbox(bbox));
+                // [#3315] 키가 있는 op 만 base64 를 생략할 수 있다 — 소비자가 그 키로
+                // `getSourceImageBytes` 를 불러 같은 바이트를 받는다. 키를 낼 수 없는 합성
+                // 그림(`bin_data_id == 0`)은 되찾을 길이 없으므로 종전대로 싣는다.
+                let source_image_key = crate::paint::source_image_key(ctx.bin_data_epoch, image);
+                let omit_bytes = ctx.options.omit_image_bytes && source_image_key.is_some();
                 if let Some(payload) = resolved.as_deref() {
-                    let base64_data =
-                        base64::engine::general_purpose::STANDARD.encode(&payload.data);
-                    let _ = write!(
-                        buf,
-                        ",\"mime\":\"{}\",\"base64\":{}",
-                        payload.mime,
-                        json_escape(&base64_data)
-                    );
+                    if omit_bytes {
+                        let _ = write!(
+                            buf,
+                            ",\"mime\":\"{}\",\"imageBytesOmitted\":true",
+                            payload.mime
+                        );
+                    } else {
+                        let _ = write!(buf, ",\"mime\":\"{}\",\"base64\":", payload.mime);
+                        write_json_base64(buf, &payload.data[..]);
+                    }
                     if matches!(payload.kind, ResolvedImageKind::BakedWatermark) {
                         buf.push_str(",\"bakedWatermark\":true");
                     }
                 } else if let Some(data) = &image.data {
                     // Task #516 Stage 5.2: overlay layer 의 <img> data URL 생성용 mime 노출.
                     // PCX 등 비표준은 PNG 변환 후 emit (CLI SVG 와 동일 정책 적용).
-                    let mime = crate::renderer::svg::detect_image_mime_type(data);
-                    let (final_mime, final_data): (&str, std::borrow::Cow<[u8]>) = if mime
-                        == "image/x-pcx"
-                    {
-                        match crate::renderer::svg::pcx_bytes_to_png_bytes(data) {
-                            Some(png) => ("image/png", std::borrow::Cow::Owned(png)),
-                            None => (mime, std::borrow::Cow::Borrowed(data.as_slice())),
-                        }
-                    } else if mime == "image/bmp" {
-                        match crate::renderer::svg::bmp_bytes_to_png_bytes(data) {
-                            Some(png) => ("image/png", std::borrow::Cow::Owned(png)),
-                            None => (mime, std::borrow::Cow::Borrowed(data.as_slice())),
-                        }
-                    } else if mime == "image/tiff" {
-                        match crate::renderer::image_resolver::tiff_bytes_to_png_bytes(data) {
-                            Some(png) => ("image/png", std::borrow::Cow::Owned(png)),
-                            None => (mime, std::borrow::Cow::Borrowed(data.as_slice())),
-                        }
-                    } else if mime == "image/jpeg" {
-                        match crate::renderer::image_resolver::grayscale_jpeg_bytes_to_png_bytes(
+                    // [#3315] 변환 사슬의 단일 권위는 `emitted_image_bytes` 다 — 키로 바이트를
+                    // 되돌려주는 경로가 같은 함수를 써야 두 결과가 갈라지지 않는다.
+                    let (final_mime, final_data) =
+                        crate::renderer::image_resolver::emitted_image_bytes(
                             data,
-                        ) {
-                            Some(png) => ("image/png", std::borrow::Cow::Owned(png)),
-                            None => (mime, std::borrow::Cow::Borrowed(data.as_slice())),
-                        }
+                            crate::renderer::image_resolver::is_watermark_image(image),
+                        );
+                    if omit_bytes {
+                        let _ = write!(
+                            buf,
+                            ",\"mime\":\"{}\",\"imageBytesOmitted\":true",
+                            final_mime
+                        );
                     } else {
-                        (mime, std::borrow::Cow::Borrowed(data.as_slice()))
-                    };
-                    let base64_data =
-                        base64::engine::general_purpose::STANDARD.encode(&*final_data);
-                    let _ = write!(
-                        buf,
-                        ",\"mime\":\"{}\",\"base64\":{}",
-                        final_mime,
-                        json_escape(&base64_data)
-                    );
+                        let _ = write!(buf, ",\"mime\":\"{}\",\"base64\":", final_mime);
+                        write_json_base64(buf, &final_data);
+                    }
+                }
+                if let Some(key) = source_image_key {
+                    let _ = write!(buf, ",\"sourceImageKey\":{}", json_escape(&key));
                 }
                 if let Some(fill_mode) = image.fill_mode {
                     let _ = write!(
@@ -904,12 +1013,17 @@ impl PaintOp {
                 if let Some((width, height)) = image.original_size_hu {
                     let _ = write!(buf, ",\"originalSizeHu\":[{},{}]", width, height);
                 }
+                let (effect, brightness, contrast) =
+                    crate::renderer::image_resolver::resolved_image_effects(
+                        image,
+                        resolved.as_deref(),
+                    );
                 let _ = write!(
                     buf,
                     ",\"effect\":{},\"brightness\":{},\"contrast\":{}",
-                    json_escape(image_effect_str(image.effect)),
-                    image.brightness,
-                    image.contrast
+                    json_escape(image_effect_str(effect)),
+                    brightness,
+                    contrast
                 );
                 let opacity = image.opacity.clamp(0.0, 1.0);
                 if opacity < 1.0 {
@@ -959,11 +1073,18 @@ impl PaintOp {
                     ",\"formType\":{},\"caption\":{},\"text\":{},\"foreColor\":{},\"backColor\":{},\"value\":{},\"enabled\":{}",
                     json_escape(form_type_str(form.form_type)),
                     json_escape(&form.caption),
-                    json_escape(&form.text),
+                    json_escape(form.display_or_text()),
                     json_escape(&form.fore_color),
                     json_escape(&form.back_color),
                     form.value,
                     form.enabled,
+                );
+                // CanvasKit는 backend 자체에서 크기/여백을 다시 추측하지 않는다.
+                let drawing = crate::renderer::form_appearance::form_drawing(form, *bbox);
+                let _ = write!(
+                    buf,
+                    ",\"drawing\":{}",
+                    serde_json::to_string(&drawing).expect("finite form drawing")
                 );
                 buf.push('}');
             }
@@ -1013,14 +1134,15 @@ struct TextSourceExportState {
 }
 
 impl TextSourceExportState {
-    fn next_text_run_span(&mut self, run: &TextRunNode) -> TextSourceSpan {
-        let span = TextSourceSpan {
-            id: TextSourceId(self.next_id),
-            utf8_range: TextSourceRange::new(0, run.text.len() as u32),
-            utf16_range: TextSourceRange::new(0, run.text.encode_utf16().count() as u32),
-            stable_source_key: stable_text_source_key(run),
-        };
-        self.next_id = self.next_id.saturating_add(1);
+    fn next_text_run_span(
+        &mut self,
+        run: &TextRunNode,
+        source: Option<&TextSourceSpan>,
+    ) -> TextSourceSpan {
+        let span = source
+            .cloned()
+            .unwrap_or_else(|| TextSourceSpan::for_text_run(self.next_id, run));
+        self.next_id = self.next_id.max(span.id.0.saturating_add(1));
         self.last_source = Some(span.clone());
         span
     }
@@ -1167,7 +1289,7 @@ fn write_font_resources(buf: &mut String, table: &FontResourceTable) {
     buf.push_str("]}");
 }
 
-fn write_visual_resources(buf: &mut String, resources: &ResourceArena) {
+fn write_visual_resources(buf: &mut String, resources: &ResourceArena, options: LayerJsonOptions) {
     let _ = write!(
         buf,
         "{{\"tableId\":{},\"images\":[",
@@ -1177,8 +1299,7 @@ fn write_visual_resources(buf: &mut String, resources: &ResourceArena) {
         if index > 0 {
             buf.push(',');
         }
-        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-        buf.push_str(&json_escape(&encoded));
+        write_json_base64(buf, bytes);
     }
     buf.push_str("],\"imageKeys\":[");
     for index in 0..resources.image_count() {
@@ -1204,6 +1325,25 @@ fn write_visual_resources(buf: &mut String, resources: &ResourceArena) {
         }
         let key = resources
             .svg_resource_key(crate::paint::SvgResourceId(index))
+            .unwrap_or("");
+        buf.push_str(&json_escape(key));
+    }
+    buf.push_str("],\"fontBlobs\":[");
+    if !options.omit_font_bytes {
+        for (index, (_, bytes)) in resources.font_blob_resources().enumerate() {
+            if index > 0 {
+                buf.push(',');
+            }
+            write_json_base64(buf, bytes);
+        }
+    }
+    buf.push_str("],\"fontBlobKeys\":[");
+    for index in 0..resources.font_blob_count() {
+        if index > 0 {
+            buf.push(',');
+        }
+        let key = resources
+            .font_blob_resource_key(crate::paint::FontBlobResourceId(index))
             .unwrap_or("");
         buf.push_str(&json_escape(key));
     }
@@ -1455,6 +1595,9 @@ fn write_text_style(buf: &mut String, style: &TextStyle) {
         json_escape(&color_ref_to_css(style.shade_color)),
         style.emphasis_dot,
     );
+    if style.kerning {
+        buf.push_str(",\"kerning\":true");
+    }
     buf.push('}');
 }
 
@@ -1491,11 +1634,11 @@ fn write_paint_text_style(buf: &mut String, style: &PaintTextStyle) {
 }
 
 fn write_text_positions(buf: &mut String, run: &TextRunNode) {
-    write_text_positions_for_text(buf, &run.text, &run.style);
+    write_text_positions_for_text(buf, run, &run.text);
 }
 
-fn write_text_positions_for_text(buf: &mut String, text: &str, style: &TextStyle) {
-    let positions = compute_char_positions(text, style);
+fn write_text_positions_for_text(buf: &mut String, run: &TextRunNode, text: &str) {
+    let positions = run.replay_positions_for(text);
     write_position_values(buf, &positions);
 }
 
@@ -1544,13 +1687,7 @@ fn effective_text_font_size_and_baseline(run: &TextRunNode) -> (f64, f64) {
     } else {
         12.0
     };
-    if run.style.superscript {
-        (base_font_size * 0.7, run.baseline - base_font_size * 0.3)
-    } else if run.style.subscript {
-        (base_font_size * 0.7, run.baseline + base_font_size * 0.15)
-    } else {
-        (base_font_size, run.baseline)
-    }
+    run.style.script_draw_metrics(base_font_size, run.baseline)
 }
 
 fn write_tab_leaders(buf: &mut String, leaders: &[TabLeaderInfo]) {
@@ -1570,7 +1707,7 @@ fn write_tab_leaders(buf: &mut String, leaders: &[TabLeaderInfo]) {
 
 fn write_clamped_tab_leaders(buf: &mut String, run: &TextRunNode) -> bool {
     let (display_text, text_complete) = bounded_display_text_for_run(run);
-    let positions = compute_char_positions(&display_text, &run.style);
+    let positions = run.replay_positions_prefix_for(run.display_or_text(), &display_text);
     let (font_size, _) = effective_text_font_size_and_baseline(run);
     let leaders_complete =
         run.style.tab_leaders.len() <= crate::paint::MAX_POSITIONED_CONTROL_MARKS_PER_RUN;
@@ -1598,7 +1735,7 @@ fn write_clamped_tab_leaders(buf: &mut String, run: &TextRunNode) -> bool {
 
 fn write_text_control_marks(buf: &mut String, bbox: BoundingBox, run: &TextRunNode) -> bool {
     let (bounded_text, mut complete) = bounded_text_prefix(&run.text);
-    let positions = compute_char_positions(&bounded_text, &run.style);
+    let positions = run.replay_positions_prefix_for(&run.text, &bounded_text);
     let font_size = if run.style.font_size > 0.0 {
         run.style.font_size
     } else {
@@ -1839,7 +1976,7 @@ fn write_affine_transform(buf: &mut String, transform: LayerAffineTransform) {
 }
 
 fn write_text_clusters(buf: &mut String, run: &TextRunNode) {
-    let positions = compute_char_positions(&run.text, &run.style);
+    let positions = run.replay_positions_for(&run.text);
     let mut utf16_start = 0_u32;
     let chars = run
         .text
@@ -2493,14 +2630,16 @@ fn write_glyph_run_diagnostics(buf: &mut String, diagnostics: &GlyphRunDiagnosti
     buf.push('}');
 }
 
-fn write_text_decoration(buf: &mut String, kind: TextDecorationKind, run: &TextRunNode) {
+fn write_text_decoration(
+    buf: &mut String,
+    kind: TextDecorationKind,
+    run: &TextRunNode,
+    trim_trailing_spaces: usize,
+) {
     let (color, shape, underline, emphasis_dot) = match kind {
         TextDecorationKind::Underline => (
-            if run.style.underline_color != 0 {
-                run.style.underline_color
-            } else {
-                run.style.color
-            },
+            // COLORREF 0 은 미지정이 아니라 검정 — svg.rs 와 같은 계약.
+            run.style.underline_color,
             run.style.underline_shape,
             run.style.underline,
             0,
@@ -2524,7 +2663,14 @@ fn write_text_decoration(buf: &mut String, kind: TextDecorationKind, run: &TextR
     };
     let (font_size, baseline) = effective_text_font_size_and_baseline(run);
     let (bounded_text, complete) = bounded_display_text_for_run(run);
-    let positions = compute_char_positions(&bounded_text, &run.style);
+    let positions = run.replay_positions_prefix_for(run.display_or_text(), &bounded_text);
+    let trailing = bounded_text
+        .chars()
+        .rev()
+        .take_while(|ch| *ch == ' ')
+        .count();
+    let trim = trim_trailing_spaces.min(trailing);
+    let position_count = positions.len().saturating_sub(trim);
     let _ = write!(
         buf,
         "{{\"kind\":{},\"baseline\":{:.3},\"rotation\":{:.3},\"isVertical\":{},\"fontSize\":{:.3},\"ratio\":{:.6},\"color\":{},\"shape\":{},\"underline\":{},\"emphasisDot\":{},\"positions\":[",
@@ -2539,7 +2685,7 @@ fn write_text_decoration(buf: &mut String, kind: TextDecorationKind, run: &TextR
         json_escape(underline_type_str(underline)),
         emphasis_dot,
     );
-    for (idx, position) in positions.iter().enumerate() {
+    for (idx, position) in positions.iter().take(position_count).enumerate() {
         if idx > 0 {
             buf.push(',');
         }
@@ -2635,7 +2781,7 @@ fn write_gradient(buf: &mut String, gradient: &GradientFillInfo) {
 fn write_line_style(buf: &mut String, style: &LineStyle) {
     let _ = write!(
         buf,
-        "{{\"color\":{},\"width\":{:.3},\"dash\":{},\"lineType\":{},\"startArrow\":{},\"endArrow\":{},\"startArrowSize\":{},\"endArrowSize\":{}}}",
+        "{{\"color\":{},\"width\":{:.3},\"dash\":{},\"lineType\":{},\"startArrow\":{},\"endArrow\":{},\"startArrowSize\":{},\"endArrowSize\":{}",
         json_escape(&color_ref_to_css(style.color)),
         style.width,
         json_escape(stroke_dash_str(style.dash)),
@@ -2645,6 +2791,11 @@ fn write_line_style(buf: &mut String, style: &LineStyle) {
         style.start_arrow_size,
         style.end_arrow_size,
     );
+    if let Some(shadow) = &style.shadow {
+        buf.push_str(",\"shadow\":");
+        write_shadow_style(buf, shadow);
+    }
+    buf.push('}');
 }
 
 fn write_transform(buf: &mut String, transform: ShapeTransform) {
@@ -2982,6 +3133,7 @@ fn image_fill_mode_str(value: ImageFillMode) -> &'static str {
         ImageFillMode::TileVertLeft => "tileVertLeft",
         ImageFillMode::TileVertRight => "tileVertRight",
         ImageFillMode::FitToSize => "fitToSize",
+        ImageFillMode::Zoom => "zoom",
         ImageFillMode::Total => "total",
         ImageFillMode::Center => "center",
         ImageFillMode::CenterTop => "centerTop",
@@ -3085,10 +3237,12 @@ mod tests {
     use crate::renderer::composer::CharOverlapInfo;
     use crate::renderer::equation::layout::{LayoutBox, LayoutKind};
     use crate::renderer::render_tree::{
-        EquationNode, FieldMarkerType, ImageNode, PathNode, PlaceholderNode, RawSvgNode,
-        RenderLayerInfo, TextRunNode,
+        EquationNode, FieldMarkerType, ImageNode, PageBackgroundImage, PageBackgroundNode,
+        PathNode, PlaceholderNode, RawSvgNode, RenderLayerInfo, TextRunNode,
     };
     use serde_json::Value;
+
+    const FIXTURE_TTC: &[u8] = include_bytes!("../../tests/fixtures/fonts/RHWPExactFaceSmoke.ttc");
 
     #[test]
     fn serializes_text_and_shape_ops_for_browser_replay() {
@@ -3124,6 +3278,7 @@ mod tests {
                 border_fill_id: 0,
                 baseline: 13.0,
                 field_marker: FieldMarkerType::FieldBegin,
+                layout_positions: None,
                 display_text: None,
             },
         );
@@ -3265,6 +3420,7 @@ mod tests {
                 border_fill_id: 0,
                 baseline: 13.0,
                 field_marker: FieldMarkerType::None,
+                layout_positions: None,
                 display_text: None,
             },
         );
@@ -3328,6 +3484,7 @@ mod tests {
                 border_fill_id: 0,
                 baseline: 13.0,
                 field_marker: FieldMarkerType::None,
+                layout_positions: None,
                 display_text: None,
             },
         );
@@ -3382,6 +3539,7 @@ mod tests {
             border_fill_id: 0,
             baseline: 11.0,
             field_marker: FieldMarkerType::FieldEnd,
+            layout_positions: None,
             display_text: None,
         };
         let bbox = BoundingBox::new(10.0, 20.0, 40.0, 16.0);
@@ -3475,6 +3633,7 @@ mod tests {
             border_fill_id: 0,
             baseline: 20.0,
             field_marker: FieldMarkerType::None,
+            layout_positions: None,
             display_text: None,
         };
         let bbox = BoundingBox::new(0.0, 0.0, 80.0, 24.0);
@@ -3528,6 +3687,7 @@ mod tests {
             border_fill_id: 0,
             baseline: 13.0,
             field_marker: FieldMarkerType::None,
+            layout_positions: None,
             display_text: None,
         };
         let tree = PageLayerTree::new(
@@ -3590,6 +3750,7 @@ mod tests {
             border_fill_id: 0,
             baseline: 10.0,
             field_marker: FieldMarkerType::None,
+            layout_positions: None,
             display_text: None,
         };
         let bbox = BoundingBox::new(0.0, 0.0, 100.0, 14.0);
@@ -3703,6 +3864,7 @@ mod tests {
                 border_fill_id: 0,
                 baseline: 12.0,
                 field_marker: FieldMarkerType::None,
+                layout_positions: None,
                 display_text: None,
             },
         );
@@ -3751,7 +3913,7 @@ mod tests {
                     flags: Vec::new(),
                 }],
                 direction: TextDirection::Ltr,
-                bidi_level: None,
+                bidi_level: Some(0),
                 writing_mode: WritingMode::HorizontalTb,
                 orientation: GlyphRunOrientation::Horizontal,
                 glyph_transforms: None,
@@ -3782,8 +3944,8 @@ mod tests {
     }
 
     fn add_portable_font_resources(resources: &mut ResourceArena) {
-        let font_bytes = [0_u8, 1, 2, 3];
-        resources.intern_font_blob_bytes(&font_bytes);
+        let font_bytes = FIXTURE_TTC;
+        resources.intern_font_blob_bytes(font_bytes);
         let blob_key = FontBlobKey("blob-0".to_string());
         let face_key = FontFaceKey("face-0".to_string());
         let digest_value = resource_digest_hex(font_bytes);
@@ -3846,6 +4008,8 @@ mod tests {
         assert!(json.contains("\"fontResources\":{\"blobs\":["));
         assert!(json.contains("\"portability\":\"portableBlob\""));
         assert!(json.contains("\"faces\":["));
+        assert!(json.contains("\"fontBlobs\":[\"dHRjZg"));
+        assert!(json.contains("\"fontBlobKeys\":[\"font:blake3:1752:"));
         assert!(json.contains("\"optionalFeatures\":[\"fontResources\",\"text.glyphRun\"]"));
         assert!(json.contains("\"variants\":[\"textRun\",\"glyphRun\"]"));
         assert!(json.contains("\"strictVariantAvailable\":true"));
@@ -3883,6 +4047,7 @@ mod tests {
                 border_fill_id: 0,
                 baseline: 12.0,
                 field_marker: FieldMarkerType::None,
+                layout_positions: None,
                 display_text: None,
             },
         );
@@ -4300,7 +4465,11 @@ mod tests {
 
         let json = tree.to_json();
 
-        assert!(json.contains("\"schemaMinorVersion\":19"));
+        // 상수에서 끌어온다 — 숫자를 박아 두면 schema minor 를 올릴 때마다 무관한 테스트가 깨진다.
+        assert!(json.contains(&format!(
+            "\"schemaMinorVersion\":{}",
+            LAYER_TREE_SCHEMA.schema_minor_version
+        )));
         assert!(json.contains("\"payloadResourceKey\":\"glyphPayload:bitmapGlyph:imageRef:0"));
         assert!(json.contains("placement:0.123,0.568,10.988,10.543"));
         assert!(json.contains(&format!(":resource:{image_resource_key}\"")));
@@ -4322,6 +4491,59 @@ mod tests {
         assert!(json.contains("\"svgFragments\":[\"<path d=\\\"M0 0H10V10Z\\\"/>\"]"));
     }
 
+    /// 그림 바이트는 base64 로 나가므로 이스케이프 대상이 없다 — 그 전제로 이스케이프
+    /// 스캔을 없앴으니, 제어문자·따옴표·역슬래시를 포함한 바이트도 JSON 파서를 통과해
+    /// 원본으로 되돌아오는지 왕복으로 고정한다 (Task #3315).
+    #[test]
+    fn image_bytes_survive_json_round_trip_for_every_byte_value() {
+        use base64::Engine;
+
+        let image_bytes: Vec<u8> = (0..=255u8).collect();
+        let background = PageBackgroundNode {
+            background_color: None,
+            border_color: None,
+            border_width: 0.0,
+            gradient: None,
+            image: Some(PageBackgroundImage {
+                data: image_bytes.clone(),
+                fill_mode: ImageFillMode::FitToSize,
+                brightness: 0,
+                contrast: 0,
+                effect: ImageEffect::RealPic,
+            }),
+        };
+
+        let tree = PageLayerTree::new(
+            120.0,
+            80.0,
+            LayerNode::leaf(
+                BoundingBox::new(0.0, 0.0, 120.0, 80.0),
+                None,
+                vec![
+                    PaintOp::page_background(BoundingBox::new(0.0, 0.0, 120.0, 80.0), background),
+                    PaintOp::image(
+                        BoundingBox::new(3.0, 4.0, 30.0, 20.0),
+                        ImageNode::new(7, Some(image_bytes.clone())),
+                        None,
+                    ),
+                ],
+            ),
+        );
+
+        let value: Value = serde_json::from_str(&tree.to_json()).expect("valid layer JSON");
+        let ops = value["root"]["ops"].as_array().expect("ops");
+
+        let decode = |op: &Value, pointer: &str| {
+            let encoded = op.pointer(pointer).and_then(Value::as_str).expect(pointer);
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .expect("base64 왕복")
+        };
+
+        assert_eq!(decode(&ops[0], "/image/base64"), image_bytes);
+        assert_eq!(decode(&ops[1], "/base64"), image_bytes);
+    }
+
     #[test]
     fn known_text_features_are_unique() {
         let mut seen = std::collections::BTreeSet::new();
@@ -4341,7 +4563,12 @@ mod tests {
             None,
         );
         path.connector_endpoints = Some((1.0, 2.0, 3.0, 4.0));
-        path.line_style = Some(LineStyle::default());
+        path.line_style = Some(LineStyle {
+            color: 0x0056_3412,
+            width: 2.0,
+            dash: StrokeDash::DashDot,
+            ..Default::default()
+        });
 
         let mut image = ImageNode::new(7, Some(vec![1, 2, 3]));
         image.effect = ImageEffect::BlackWhite;
@@ -4374,6 +4601,7 @@ mod tests {
                             color_str: "#000000".to_string(),
                             color: 0x00000000,
                             font_size: 12.0,
+                            script: String::new(),
                             section_index: None,
                             para_index: None,
                             control_index: None,
@@ -4395,9 +4623,14 @@ mod tests {
         );
 
         let json = tree.to_json();
+        let value: Value = serde_json::from_str(&json).expect("valid layer JSON");
+        let path_op = &value["root"]["ops"][0];
 
         assert!(json.contains("\"connectorEndpoints\":{\"x1\":1.000"));
         assert!(json.contains("\"lineStyle\":"));
+        assert_eq!(path_op["lineStyle"]["color"], "#123456");
+        assert_eq!(path_op["lineStyle"]["width"], 2.0);
+        assert_eq!(path_op["lineStyle"]["dash"], "dashDot");
         assert!(json.contains("\"effect\":\"blackWhite\""));
         assert!(json.contains("\"brightness\":-50"));
         assert!(json.contains("\"contrast\":70"));
@@ -4500,5 +4733,100 @@ mod tests {
             parsed["outputOptions"]["debugOverlay"].as_bool(),
             Some(true)
         );
+    }
+}
+
+#[cfg(test)]
+mod image_bytes_mode_tests {
+    //! Task #3315: `imageBytes` 최상위 값과 op 단위 `imageBytesOmitted` 의 관계를 못박는다.
+    //!
+    //! 생략은 신원 키를 낼 수 있는 op 만 대상이므로 **한 문서 안에 두 종류가 섞일 수 있다.**
+    //! 그 상태에서 최상위 값이 무엇을 뜻하는지가 열려 있었다 — 요청 모드인가, 모든 op 의 실제
+    //! 저장 방식인가. 여기서 **요청 모드**로 확정하고, 그러므로 소비자는 op 단위 표식을 봐야
+    //! 한다는 것을 고정한다.
+    //!
+    //! samples 전수에 키 없는 그림이 섞인 문서가 없어(전 표본 `cacheable:true`) 문서 단위
+    //! 테스트로는 이 상태를 만들 수 없다. 그래서 트리를 직접 조립한다.
+
+    use super::LayerJsonOptions;
+    use crate::paint::{LayerNode, PageLayerTree, PaintOp};
+    use crate::renderer::render_tree::{BoundingBox, ImageNode};
+    use serde_json::Value;
+
+    /// 키를 낼 수 있는 그림(`bin_data_id != 0`)과 낼 수 없는 합성 그림(`0`)을 함께 담은 트리.
+    fn mixed_tree() -> PageLayerTree {
+        let png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        PageLayerTree::new(
+            120.0,
+            80.0,
+            LayerNode::leaf(
+                BoundingBox::new(0.0, 0.0, 120.0, 80.0),
+                None,
+                vec![
+                    PaintOp::image(
+                        BoundingBox::new(0.0, 0.0, 10.0, 10.0),
+                        ImageNode::new(7, Some(png.clone())),
+                        None,
+                    ),
+                    PaintOp::image(
+                        BoundingBox::new(20.0, 0.0, 10.0, 10.0),
+                        ImageNode::new(0, Some(png)),
+                        None,
+                    ),
+                ],
+            ),
+        )
+    }
+
+    fn image_ops(json: &str) -> Vec<Value> {
+        let value: Value = serde_json::from_str(json).expect("valid layer JSON");
+        value["root"]["ops"]
+            .as_array()
+            .expect("ops")
+            .iter()
+            .filter(|op| op.get("type").and_then(Value::as_str) == Some("image"))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn issue_3315_top_level_image_bytes_is_the_requested_mode_not_a_per_op_guarantee() {
+        let json = mixed_tree().to_json_with_options(LayerJsonOptions {
+            omit_image_bytes: true,
+            ..LayerJsonOptions::default()
+        });
+        let ops = image_ops(&json);
+        assert_eq!(ops.len(), 2);
+
+        assert!(
+            json.contains("\"imageBytes\":\"byKey\""),
+            "요청한 모드를 최상위에 싣는다"
+        );
+
+        // 키가 있는 op — 생략됐고 키로 받아야 한다.
+        assert!(ops[0].get("base64").is_none(), "키 있는 op 은 생략된다");
+        assert_eq!(ops[0]["imageBytesOmitted"].as_bool(), Some(true));
+        assert!(ops[0].get("sourceImageKey").is_some());
+
+        // 키가 없는 합성 op — 되찾을 길이 없으므로 base64 를 유지한다.
+        assert!(
+            ops[1].get("base64").is_some(),
+            "키 없는 op 의 바이트를 빼면 소비자가 그 그림을 되찾을 방법이 없다"
+        );
+        assert!(
+            ops[1].get("imageBytesOmitted").is_none(),
+            "생략하지 않은 op 에 생략 표식을 달면 소비자가 헛되게 키를 찾는다"
+        );
+        assert!(ops[1].get("sourceImageKey").is_none());
+    }
+
+    #[test]
+    fn issue_3315_inline_mode_marks_no_op_as_omitted() {
+        let json = mixed_tree().to_json();
+        assert!(json.contains("\"imageBytes\":\"inline\""));
+        assert!(!json.contains("\"imageBytesOmitted\""));
+        for op in image_ops(&json) {
+            assert!(op.get("base64").is_some());
+        }
     }
 }

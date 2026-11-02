@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "rhwp",
+    "rhwp/crates/*",
     "rhwp-batch",
 ]
 resolver = "2"

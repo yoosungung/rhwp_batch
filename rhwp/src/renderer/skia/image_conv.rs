@@ -61,6 +61,8 @@ pub fn draw_svg_fragment(
         None,
         None,
         ImageEffect::RealPic,
+        0,
+        0,
         sampling,
     )
 }
@@ -77,8 +79,14 @@ pub fn draw_image_bytes(
     crop: Option<(i32, i32, i32, i32)>,
     crop_reference_size: Option<(u32, u32)>,
     effect: ImageEffect,
+    brightness: i8,
+    contrast: i8,
     sampling: ImageSampling,
 ) -> bool {
+    // 빈 자르기 선택은 정상적인 빈 출력이며 누락 그림 대체 표시 대상이 아니다.
+    if crop.is_some_and(|(l, t, r, b)| r <= l || b <= t) {
+        return true;
+    }
     let is_valid_destination_rect = |x: f32, y: f32, width: f32, height: f32| {
         x.is_finite()
             && y.is_finite()
@@ -107,6 +115,20 @@ pub fn draw_image_bytes(
         ImageEffect::GrayScale => Some(grayscale_filter(1.0, 0.0)),
         ImageEffect::BlackWhite => Some(grayscale_filter(255.0, -127.5)),
         ImageEffect::Pattern8x8 => Some(grayscale_filter(1.0, 0.0)),
+    };
+    let brightness_contrast_filter = |brightness: i8, contrast: i8| {
+        let brightness = brightness.clamp(-100, 100) as f32 / 100.0;
+        let slope = (100.0 + contrast.clamp(-100, 100) as f32) / 100.0;
+        // Skia color-matrix의 translation 열은 0..255 색상 범위를 쓴다.
+        // SVG filter의 정규화된 intercept와 동일한 색조가 되도록 변환한다.
+        let intercept = ((0.5 - 0.5 * slope) + brightness) * 255.0;
+        color_filters::matrix_row_major(
+            &[
+                slope, 0.0, 0.0, 0.0, intercept, 0.0, slope, 0.0, 0.0, intercept, 0.0, 0.0, slope,
+                0.0, intercept, 0.0, 0.0, 0.0, 1.0, 0.0,
+            ],
+            None,
+        )
     };
     let resolve_image_placement = |fill_mode: ImageFillMode,
                                    x: f32,
@@ -154,6 +176,16 @@ pub fn draw_image_bytes(
     if !is_valid_destination_rect(x, y, width, height) {
         return false;
     }
+    // [#3460] HWPX BinData 는 SVG 를 그대로 담는다(`<hc:img>` → `Format="svg"`). skia 디코더는
+    // SVG 를 읽지 못해 종전에는 회색 자리표시자만 남았다. 같은 모듈의 resvg 로 목적지 크기에
+    // 맞춰 먼저 래스터화하면 이후 크롭·채움·효과 경로를 그대로 탈 수 있다.
+    let svg_raster = if crate::renderer::svg_fragment::is_svg_prefix(bytes) {
+        rasterize_svg_document_to_png(bytes, width, height, canvas_raster_scale(canvas))
+    } else {
+        None
+    };
+    let bytes = svg_raster.as_deref().unwrap_or(bytes);
+
     let normalized_bytes = if detect_image_mime_type(bytes) == "image/jpeg" {
         grayscale_jpeg_bytes_to_png_bytes(bytes)
     } else {
@@ -169,7 +201,16 @@ pub fn draw_image_bytes(
     let dst = Rect::from_xywh(x, y, width, height);
     let mut paint = Paint::default();
     paint.set_anti_alias(true);
-    if let Some(color_filter) = image_effect_filter(effect) {
+    let effect_filter = image_effect_filter(effect);
+    let adjustment_filter = (brightness != 0 || contrast != 0)
+        .then(|| brightness_contrast_filter(brightness, contrast));
+    let color_filter = match (effect_filter, adjustment_filter) {
+        (Some(effect), Some(adjustment)) => color_filters::compose(adjustment, effect),
+        (Some(effect), None) => Some(effect),
+        (None, Some(adjustment)) => Some(adjustment),
+        (None, None) => None,
+    };
+    if let Some(color_filter) = color_filter {
         paint.set_color_filter(color_filter);
     }
 
@@ -218,11 +259,31 @@ pub fn draw_image_bytes(
         }
     };
 
-    if matches!(
-        mode,
-        ImageFillMode::FitToSize | ImageFillMode::Total | ImageFillMode::None
-    ) {
+    if matches!(mode, ImageFillMode::FitToSize | ImageFillMode::Total) {
         draw_image_rect(crop_src, dst);
+        return true;
+    }
+    if matches!(mode, ImageFillMode::None | ImageFillMode::Zoom) {
+        // [#7235] 채우기 유형 15(NONE): 종횡비를 지켜 영역 가운데에 맞춘다.
+        let (source_width, source_height) = crop_src
+            .map(|src| (src.width(), src.height()))
+            .unwrap_or((decoded_width, decoded_height));
+        if !is_valid_image_size(source_width, source_height) {
+            draw_missing_image_placeholder(x, y, width, height);
+            return false;
+        }
+        let scale = (width / source_width).min(height / source_height);
+        let fit_width = source_width * scale;
+        let fit_height = source_height * scale;
+        draw_image_rect(
+            crop_src,
+            Rect::from_xywh(
+                x + (width - fit_width) / 2.0,
+                y + (height - fit_height) / 2.0,
+                fit_width,
+                fit_height,
+            ),
+        );
         return true;
     }
 
@@ -340,6 +401,63 @@ pub fn draw_image_bytes(
 
     canvas.restore();
     true
+}
+
+/// [#3460] 캔버스 변환에서 래스터 배율을 얻는다 (확대 출력에서 SVG 가 뭉개지지 않게).
+fn canvas_raster_scale(canvas: &skia_safe::Canvas) -> f32 {
+    let matrix = canvas.local_to_device_as_3x3();
+    let scale = matrix.scale_x().abs().max(matrix.scale_y().abs());
+    if scale.is_finite() && scale > 0.0 {
+        scale.clamp(1.0, 4.0)
+    } else {
+        1.0
+    }
+}
+
+/// [#3460] 완결된 SVG 문서(BinData 그림)를 목적지 크기에 맞춰 PNG 로 래스터화한다.
+///
+/// 조각(fragment) 경로와 달리 원본이 자체 `viewBox`/크기를 가진 문서이므로, 트리 크기를
+/// 목적지 픽셀 크기로 맞추는 스케일 변환만 적용한다.
+fn rasterize_svg_document_to_png(
+    bytes: &[u8],
+    width: f32,
+    height: f32,
+    raster_scale: f32,
+) -> Option<Vec<u8>> {
+    if bytes.is_empty()
+        || bytes.len() > MAX_SVG_FRAGMENT_BYTES
+        || !width.is_finite()
+        || !height.is_finite()
+        || !raster_scale.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || raster_scale <= 0.0
+    {
+        return None;
+    }
+    let raster_width = (width * raster_scale).ceil().max(1.0) as u64;
+    let raster_height = (height * raster_scale).ceil().max(1.0) as u64;
+    if raster_width
+        .checked_mul(raster_height)
+        .is_none_or(|pixels| pixels > MAX_SVG_RASTER_PIXELS)
+    {
+        return None;
+    }
+
+    let options = svg_parse_options();
+    let tree = usvg::Tree::from_data(bytes, &options).ok()?;
+    let size = tree.size();
+    if !(size.width() > 0.0 && size.height() > 0.0) {
+        return None;
+    }
+
+    let mut pixmap = tiny_skia::Pixmap::new(raster_width as u32, raster_height as u32)?;
+    let transform = tiny_skia::Transform::from_scale(
+        raster_width as f32 / size.width(),
+        raster_height as f32 / size.height(),
+    );
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    pixmap.encode_png().ok()
 }
 
 fn rasterize_svg_fragment_to_png(

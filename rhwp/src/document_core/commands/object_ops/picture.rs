@@ -9,6 +9,48 @@ use crate::model::event::DocumentEvent;
 use crate::model::paragraph::Paragraph;
 use crate::model::shape::{common_obj_offsets, ShapeObject};
 
+/// [Issue #6204] 어울림 배제 밴드를 결정하는 개체 기하의 지문.
+///
+/// 이 값이 그대로면 밴드도 그대로이므로 저장 `LINE_SEG` 를 다시 새길 필요가 없다.
+/// 밴드는 **위치·크기·기준·정렬·어울림 종류·바깥 여백**이 함께 정하므로 전부 넣는다.
+/// 글자처럼 취급(`treat_as_char`)은 밴드를 만들지 않지만, 그 토글 자체가 밴드의
+/// 유무를 바꾸므로 포함한다.
+#[derive(PartialEq, Eq)]
+struct PictureBandGeometry {
+    horizontal_offset: i32,
+    vertical_offset: i32,
+    width: u32,
+    height: u32,
+    horz_rel_to: u8,
+    vert_rel_to: u8,
+    horz_align: u8,
+    vert_align: u8,
+    treat_as_char: bool,
+    text_wrap: u8,
+    margin: (i16, i16, i16, i16),
+}
+
+fn picture_band_geometry(common: &crate::model::shape::CommonObjAttr) -> PictureBandGeometry {
+    PictureBandGeometry {
+        horizontal_offset: common.horizontal_offset as i32,
+        vertical_offset: common.vertical_offset as i32,
+        width: common.width,
+        height: common.height,
+        horz_rel_to: common.horz_rel_to as u8,
+        vert_rel_to: common.vert_rel_to as u8,
+        horz_align: common.horz_align as u8,
+        vert_align: common.vert_align as u8,
+        treat_as_char: common.treat_as_char,
+        text_wrap: common.text_wrap as u8,
+        margin: (
+            common.margin.left,
+            common.margin.right,
+            common.margin.top,
+            common.margin.bottom,
+        ),
+    }
+}
+
 impl DocumentCore {
     fn resolve_picture_control_ref(
         &self,
@@ -60,7 +102,7 @@ impl DocumentCore {
             )),
         }
     }
-    fn resolve_picture_control_mut(
+    pub(crate) fn resolve_picture_control_mut(
         &mut self,
         section_idx: usize,
         parent_para_idx: usize,
@@ -172,17 +214,18 @@ impl DocumentCore {
             pic.crop.bottom = bottom.max(0);
         }
     }
-    fn picture_props_touch_shape_transform(props_json: &str) -> bool {
-        const TRANSFORM_KEYS: [&str; 7] = [
-            "\"width\"",
-            "\"height\"",
-            "\"vertOffset\"",
-            "\"horzOffset\"",
-            "\"rotationAngle\"",
-            "\"horzFlip\"",
-            "\"vertFlip\"",
-        ];
-        TRANSFORM_KEYS.iter().any(|key| props_json.contains(key))
+    /// [#5890] 변환 파생 상태(`raw_rendering`·render_*)의 무효화 판정 근거.
+    ///
+    /// 종전에는 props JSON 에 변환 키가 **등장하는지**만 텍스트로 훑어
+    /// (`"width"`·`"height"`·`"vertOffset"`·`"horzOffset"`·`"rotationAngle"`·
+    /// `"horzFlip"`·`"vertFlip"`) 같은 값을 다시 지정하기만 해도 한컴 원본
+    /// 렌더링 행렬을 파괴했다 — getter 가 낸 봉지를 그대로 재적용해도 마찬가지였다.
+    /// 그 키들이 실제로 쓰는 IR 필드를 지문으로 떠서 값 변화로 판정한다.
+    fn picture_transform_fingerprint(
+        pic: &crate::model::image::Picture,
+    ) -> (u32, u32, u32, u32, u32, u32, i16, bool, bool) {
+        // [#6740] 판정은 도형 경로와 공용이다 — 둘이 갈라지면 같은 결함이 한쪽에만 남는다.
+        super::common::shape_transform_fingerprint(&pic.common, &pic.shape_attr)
     }
     pub(crate) fn picture_rotated_bounds(width: u32, height: u32, angle: i16) -> (u32, u32) {
         if width == 0 || height == 0 || angle.rem_euclid(360) == 0 {
@@ -239,8 +282,16 @@ impl DocumentCore {
 
         pic.shape_attr.rotation_center.x = (pic.common.width / 2) as i32;
         pic.shape_attr.rotation_center.y = (pic.common.height / 2) as i32;
-        pic.shape_attr.rotate_image = true;
-        pic.shape_attr.flip |= 0x0008_0000;
+        // `rotate_image` 와 `flip` bit19(0x0008_0000)는 **여기서 건드리지 않는다.**
+        // 종전에는 각도와 무관하게 둘을 세웠고, 회전을 0 으로 되돌려도 남아 되돌릴 경로가
+        // 없었다. 한컴 오라클(`tools/hangul_rotation_oracle/EVIDENCE.md`)이 잰 결과 둘은
+        // 회전 상태의 함수가 아니다:
+        //   - 한컴 저장본 5660개 개체에서 bit19 는 회전 개체 569건 중 559건이 **꺼져** 있고
+        //     비회전 개체 5091건 중 4416건이 **켜져** 있다(회전과 반대 방향).
+        //   - 한글 2024 는 회전 0 그림의 bit19 를 그대로 켜 두고, 34° 회전 그림의
+        //     `rotateimage` 를 0 으로 둔다.
+        // 세우는 것도 지우는 것도 근거가 없으므로 파싱된 값을 보존한다. HWP5 저장에는
+        // `flip` 만 나가고 `rotate_image` 는 HWPX `rotateimage` 의 원천이다.
     }
     fn apply_picture_display_width(pic: &mut crate::model::image::Picture, width: u32) {
         let old_common_width = pic.common.width;
@@ -460,6 +511,14 @@ impl DocumentCore {
     ) -> Result<String, HwpError> {
         // JSON 파싱 (serde_json 사용 대신 수동 파싱 — 기존 패턴)
         // [Task #825] 픽쳐 속성 mutation 은 helper 로 분리 (머리말/꼬리말 path 와 공유).
+        // [Issue #6204] 개체의 **배제 밴드 기하**를 변경 전에 찍어 둔다. 위치·크기가
+        // 바뀌면 그 개체가 만드는 어울림 배제 밴드도 바뀌므로, 그 밴드에 되감긴 본문
+        // 문단의 저장 `LINE_SEG` 는 더는 유효하지 않다.
+        let band_geometry_before = self
+            .resolve_picture_control_ref(section_idx, parent_para_idx, control_idx)
+            .ok()
+            .map(|pic| picture_band_geometry(&pic.common));
+
         let (
             caption_created,
             caption_removed,
@@ -473,6 +532,9 @@ impl DocumentCore {
             let had_caption = pic.caption.is_some();
             let caption_created = Self::apply_picture_props_inner(pic, props_json);
             let now_tac = pic.common.treat_as_char;
+            // tac 토글이 enum 에만 반영되고 packed attr 이 낡으면 직렬화가 옛 앵커를
+            // 되살린다 — 여기서 즉시 동기화 (migrate 경로는 rel_to 갱신 후 재동기화).
+            crate::serializer::control::sync_anchor_bits(&mut pic.common);
             (
                 caption_created,
                 had_caption && pic.caption.is_none(),
@@ -571,6 +633,28 @@ impl DocumentCore {
             para.char_offsets = vec![0, 1, 2, 11];
             para.char_count = 13;
         }
+        // [Issue #6204] 배제 밴드 기하가 바뀌었으면 그 밴드에 되감긴 문단들의 저장
+        // `LINE_SEG` 를 새 위치 기준으로 다시 새긴다.
+        //
+        // 종전에는 `horzOffset` 만 바뀌고 사다리는 그대로 남아, 본문이 **옛 그림
+        // 위치**에 되감긴 채 굳었다(156483689 1쪽: 그림을 297.7px 로 옮겨도 줄 우단이
+        // 564.5 그대로 → 그림이 글자를 덮음). 게다가 그 사다리가 파일에 실려
+        // **저장 → 새로 열기로도 재현**됐다.
+        //
+        // 텍스트 편집이 쓰는 picture-band 재투영 경로를 그대로 태운다 — 속성 변경은
+        // 이미 문서에 적용됐으므로 편집 클로저는 no-op 이고, `layout_picture_band` 가
+        // **새 기하**로 밴드를 다시 계산한다. 밴드를 못 만드는 형상(그림 없음/미지원)
+        // 이면 `Ok(false)` 로 조용히 지나가 종전 경로가 그대로 남는다.
+        let band_geometry_after = self
+            .resolve_picture_control_ref(section_idx, parent_para_idx, control_idx)
+            .ok()
+            .map(|pic| picture_band_geometry(&pic.common));
+        if band_geometry_before != band_geometry_after {
+            // 재투영 실패는 이 편집의 실패가 아니다 — 밴드를 만들 수 없는 형상이면
+            // 종전대로 recompose 에 맡긴다.
+            let _ = self.apply_body_edit_through_picture_band(section_idx, parent_para_idx, |_| {});
+        }
+
         // 리플로우
         let section = &mut self.document.sections[section_idx];
         section.raw_stream = None;
@@ -669,6 +753,9 @@ impl DocumentCore {
             let was_tac = pic.common.treat_as_char;
             caption_created = Self::apply_picture_props_inner(pic, props_json);
             let now_tac = pic.common.treat_as_char;
+            // 본문 setter 와 같은 이유로 여기서도 packed attr 을 동기화한다 —
+            // 머리말/꼬리말 경로도 같은 tac 토글 마이그레이션을 수행한다 (Issue #3781).
+            crate::serializer::control::sync_anchor_bits(&mut pic.common);
             if !was_tac && now_tac {
                 if let crate::model::control::Control::Picture(pic_box) =
                     &mut inner_para.controls[inner_control_idx]
@@ -725,6 +812,9 @@ impl DocumentCore {
         pic.common.vert_rel_to = VertRelTo::Para;
         pic.common.horizontal_offset = 0;
         pic.common.vertical_offset = 0;
+        // stale packed attr 동기화 — 없으면 바이너리 왕복에서 Paper 앵커 부활
+        // (treatAsChar=1 + PAPER 모순 → 한글 렌더 깨짐, Issue #3781 실측).
+        crate::serializer::control::sync_anchor_bits(&mut pic.common);
 
         let picture_height_hu = pic.common.height as i32;
         let baseline = (picture_height_hu as f64 * 0.85).round() as i32;
@@ -807,11 +897,7 @@ impl DocumentCore {
     fn tac_control_height_for_empty_picture_para(ctrl: &Control) -> Option<i32> {
         match ctrl {
             Control::Picture(pic) if pic.common.treat_as_char => Some(pic.common.height as i32),
-            Control::Shape(shape) if shape.common().treat_as_char => {
-                let common_h = shape.common().height as i32;
-                let current_h = shape.shape_attr().current_height as i32;
-                Some(common_h.max(current_h))
-            }
+            Control::Shape(shape) if shape.common().treat_as_char => Some(shape.flow_height_hu()),
             Control::Table(table) if table.common.treat_as_char => Some(table.common.height as i32),
             Control::Equation(eq) if eq.common.treat_as_char => Some(eq.common.height as i32),
             _ => None,
@@ -898,15 +984,21 @@ impl DocumentCore {
     ) -> bool {
         use crate::document_core::helpers::{json_bool, json_i16, json_i32, json_str, json_u32};
 
-        let transform_changed = Self::picture_props_touch_shape_transform(props_json);
+        let transform_before = Self::picture_transform_fingerprint(pic);
         let mut rotation_changed = false;
 
-        // 크기 변경
+        // 크기 변경 — [#6806] 키가 있어도 값이 같으면 건드리지 않는다. 종전에는 게터가 낸
+        // 봉지를 그대로 되먹여도 `current_*` 가 `common.*` 로 덮여(파싱값이 1 어긋난 문서가
+        // corpus 에 69건) 지문이 흔들리고 한컴 원본 렌더링 행렬이 지워졌다.
         if let Some(w) = json_u32(props_json, "width") {
-            Self::apply_picture_display_width(pic, w);
+            if w != pic.common.width {
+                Self::apply_picture_display_width(pic, w);
+            }
         }
         if let Some(h) = json_u32(props_json, "height") {
-            Self::apply_picture_display_height(pic, h);
+            if h != pic.common.height {
+                Self::apply_picture_display_height(pic, h);
+            }
         }
 
         // 위치 속성
@@ -989,10 +1081,13 @@ impl DocumentCore {
                 pic.common.attr &= !(1 << 20);
             }
         }
-        if pic.common.flow_with_text {
-            pic.common.allow_overlap = false;
-            pic.common.attr &= !(1 << 14);
-        }
+        // [#6806] 「쪽 영역 안으로 제한」이 켜졌다는 이유로 「서로 겹침 허용」을 끄지
+        // 않는다 — 한컴은 두 플래그를 **동시에 켜서 저장**한다(코퍼스: 그림 518 중 70,
+        // 도형 894 중 12, 표 5428 중 39). 이 강제는 봉지에 무엇이 있든 돌아서, 게터가
+        // 내보낸 `allowOverlap:true` 를 되먹이기만 해도 false 로 뒤집었다(get∘set 비항등).
+        // 사용자가 실제로 「쪽 영역 제한」을 켜는 편집은 위 `restrictInPage` 갈래가
+        // 종전대로 겹침을 끄므로 그 계약은 그대로다. 도형·수식이 쓰는 공용 경로
+        // (`apply_common_obj_attr_from_json`)에는 이 강제가 이미 없다.
         if let Some(v) = json_i32(props_json, "vertOffset") {
             pic.common.vertical_offset = v as u32;
         }
@@ -1000,15 +1095,6 @@ impl DocumentCore {
             pic.common.horizontal_offset = v as u32;
         }
         Self::sync_common_obj_attr_known_bits(&mut pic.common);
-        if transform_changed {
-            pic.shape_attr.raw_rendering.clear();
-            pic.shape_attr.render_tx = pic.shape_attr.offset_x as f64;
-            pic.shape_attr.render_ty = pic.shape_attr.offset_y as f64;
-            pic.shape_attr.render_sx = 1.0;
-            pic.shape_attr.render_sy = 1.0;
-            pic.shape_attr.render_b = 0.0;
-            pic.shape_attr.render_c = 0.0;
-        }
 
         // 이미지 속성
         if let Some(v) = json_i32(props_json, "brightness") {
@@ -1029,10 +1115,14 @@ impl DocumentCore {
             };
         }
 
-        // 회전/대칭
+        // 회전/대칭 — [#6806] "키 존재" 가 아니라 "값 변화" 가 회전 변경이다. 게터는 이 키를
+        // 항상 내보내므로, 종전에는 같은 각도를 되먹여도 `refresh_picture_rotation_layout_for_save`
+        // 가 돌아 `common` 을 `current` 로 다시 세웠다(#6355 지문 판정을 앞단에서 무력화).
         if let Some(v) = json_i16(props_json, "rotationAngle") {
-            pic.shape_attr.rotation_angle = v;
-            rotation_changed = true;
+            if v != pic.shape_attr.rotation_angle {
+                pic.shape_attr.rotation_angle = v;
+                rotation_changed = true;
+            }
         }
         if let Some(v) = json_bool(props_json, "horzFlip") {
             pic.shape_attr.horz_flip = v;
@@ -1052,6 +1142,21 @@ impl DocumentCore {
         }
         if rotation_changed {
             Self::refresh_picture_rotation_layout_for_save(pic);
+        }
+
+        // [#5890] 변환 파생 상태 무효화 — 실제로 변환이 바뀐 뒤에만 한다.
+        // `refresh_picture_rotation_layout_for_save` 가 크기·위치를 다시 세우므로
+        // 그 뒤에 지문을 비교한다. 변화가 없으면 한컴 원본 렌더링 행렬을 그대로 둔다
+        // (직렬화기는 `raw_rendering` 이 비어 있을 때만 행렬을 새로 만든다 —
+        // src/serializer/control.rs 의 rendering 블록).
+        if Self::picture_transform_fingerprint(pic) != transform_before {
+            pic.shape_attr.raw_rendering.clear();
+            pic.shape_attr.render_tx = pic.shape_attr.offset_x as f64;
+            pic.shape_attr.render_ty = pic.shape_attr.offset_y as f64;
+            pic.shape_attr.render_sx = 1.0;
+            pic.shape_attr.render_sy = 1.0;
+            pic.shape_attr.render_b = 0.0;
+            pic.shape_attr.render_c = 0.0;
         }
 
         // 자르기: HWP 내부 crop은 원본 이미지의 source rect 좌표이고,
@@ -1272,6 +1377,21 @@ impl DocumentCore {
         if control_idx < para.ctrl_data_records.len() {
             para.ctrl_data_records.remove(control_idx);
         }
+        // 컨트롤 배열이 줄어도 뒤 누름틀의 범위는 같은 필드를 가리켜야 한다.
+        for range in &mut para.field_ranges {
+            if range.control_idx > control_idx {
+                range.control_idx -= 1;
+            }
+        }
+        if let Some(active) = self.active_field.as_mut() {
+            if active.section_idx == section_idx
+                && active.para_idx == parent_para_idx
+                && active.cell_path.is_none()
+                && active.control_idx > control_idx
+            {
+                active.control_idx -= 1;
+            }
+        }
 
         // char_count 갱신
         if para.char_count >= 8 {
@@ -1300,7 +1420,7 @@ impl DocumentCore {
     /// 최댓값+1 로 채번한다 — 순번 채번은 storage id 에 구멍이 있는 문서에서
     /// 기존 이미지와 스트림 이름이 충돌해 저장 시 이미지가 뒤바뀌거나
     /// 소실된다. (insert_picture_native 와 그림 지정이 규칙 공유.)
-    fn register_embedded_bin_data(&mut self, image_data: &[u8], extension: &str) -> u16 {
+    pub(crate) fn register_embedded_bin_data(&mut self, image_data: &[u8], extension: &str) -> u16 {
         use crate::model::bin_data::{
             BinData, BinDataCompression, BinDataContent, BinDataStatus, BinDataType,
         };
@@ -1308,7 +1428,7 @@ impl DocumentCore {
         let storage_id = self.document.next_bin_data_storage_id();
         self.document.bin_data_content.push(BinDataContent {
             id: storage_id,
-            data: image_data.to_vec().into(),
+            data: crate::model::bin_data::BinDataBytes::from_shared(image_data.to_vec()),
             extension: extension.to_string(),
         });
         // attr: bits 0-3=1(Embedding), bits 4-5=0(Default), bits 8-9=1(Success)
@@ -1325,6 +1445,8 @@ impl DocumentCore {
             extension: Some(extension.to_string()),
         });
         self.document.doc_info.raw_stream = None; // DocInfo 재직렬화
+                                                  // [#3315] 여기서 bin_data_epoch 를 올리지 않는다 — 새 id 를 덧붙일 뿐 기존
+                                                  // id→바이트는 그대로다. 올리면 무관한 그림의 소비자 캐시까지 함께 버려진다.
         position_id
     }
 
@@ -1428,6 +1550,35 @@ impl DocumentCore {
     /// — 기존 동작 + API caller 호환. studio drag 좌표 기반 호출은 `Some` 으로 전달.
     /// 본문 inline 분기 (cell_path 비어있음) 는 본 매개변수를 사용하지 않는다.
     #[allow(clippy::too_many_arguments)]
+    /// [#4347] 확장 컨트롤이 끼어들 `controls` 자리 — **글자 차례**를 따른다.
+    ///
+    /// 끝에 붙이면 자리표가 뒤죽박죽이 된다. 새 번호·수식·각주 경로가 쓰는 규약과 같다.
+    fn control_insert_index(
+        paragraph: &crate::model::paragraph::Paragraph,
+        char_offset: usize,
+    ) -> usize {
+        let positions = crate::document_core::helpers::find_control_text_positions(paragraph);
+        positions
+            .iter()
+            .position(|&pos| pos > char_offset)
+            .unwrap_or(paragraph.controls.len())
+    }
+
+    /// [#4347] 넣은 컨트롤이 **스트림에서 차지한 8칸**을 문단 좌표에 남긴다.
+    ///
+    /// 파서는 확장 컨트롤에 보이는 글자를 안 남기므로, 그 컨트롤의 자리는
+    /// `control_text_positions()` 가 `char_offsets` 의 **갭**으로 되짚는다. 삽입이 그 갭을
+    /// 안 만들면 컨트롤이 자리를 잃고 문단 끝 폴백으로 떨어진다 — 그림 앵커가 20 대신 406
+    /// 이던 것이 그 탓이다. 수식·각주 경로가 이미 이 꼴이다.
+    fn leave_coordinate_trace(
+        paragraph: &mut crate::model::paragraph::Paragraph,
+        control_idx: usize,
+        char_offset: usize,
+    ) {
+        paragraph.shift_for_inline_control_insert(control_idx, char_offset);
+        paragraph.char_count += 8;
+    }
+
     pub fn insert_picture_native(
         &mut self,
         section_idx: usize,
@@ -1507,6 +1658,20 @@ impl DocumentCore {
             right: (natural_width_px * 75) as i32,
             bottom: (natural_height_px * 75) as i32,
         };
+        // [#3719 §6-5] crop 이 기준으로 삼는 전체 좌표 범위를 IR 에도 남긴다.
+        //
+        // 종전에는 `img_dim` 을 기본값 (0,0) 으로 두었는데, HWP5 직렬화기는 그 경우
+        // `crop.right/bottom` 을 원본 크기 자리에 기록하고(control.rs 의 #1929 폴백)
+        // HWP5 파서는 그 값을 다시 `img_dim` 으로 적재한다. 그래서 **삽입 직후 IR 과
+        // 저장본 재파싱 IR 이 항상 이 한 필드만큼 어긋났다** — `edit insert-image
+        // --verify` 가 정상 삽입에도 exit 3 을 내는 형태였다(실측 diffCount=1,
+        // `imgDim: expected=(0,0) actual=(3000,1500)`).
+        //
+        // 값은 직렬화기가 이미 쓰던 것과 같고, 렌더러의 폴백(`compute_image_crop_src`
+        // 는 imgDim 이 없으면 crop.right/bottom 을 같은 자리에 쓴다)과도 같은 배율이라
+        // 그림이 놓이는 결과는 바뀌지 않는다. HWPX 산출은 종전 `imgDim 0/0` 대신 실제
+        // 좌표 범위를 얻는다(HWP5 산출과의 비대칭 해소).
+        let img_dim = ((natural_width_px * 75), (natural_height_px * 75));
         let image_attr = ImageAttr {
             bin_data_id: position_id,
             brightness: 0,
@@ -1555,6 +1720,7 @@ impl DocumentCore {
                     border_x: bx,
                     border_y: by,
                     crop,
+                    img_dim,
                     image_attr,
                     ..Default::default()
                 };
@@ -1564,9 +1730,17 @@ impl DocumentCore {
                     section.raw_stream = None;
                     let target_para =
                         Self::resolve_cell_paragraph_mut(section, para_idx, cell_path)?;
-                    let new_ctrl_idx = target_para.controls.len();
-                    target_para.controls.push(Control::Picture(Box::new(pic)));
-                    target_para.ctrl_data_records.push(None);
+                    // [#4347] **글상자 문단은 글자를 담는다.** 표 문단(글자 없음)과 달리 여기서는
+                    // 갭이 없으면 자리가 어긋난다 — 글자 일곱 개짜리 글상자의 자리 3 에 그림을
+                    // 넣어도 스트림 대응이 그대로였고(4→4), 캐럿이 설 수 있는 첫 자리가 0 에서
+                    // 7 로 튀었다. 본문 문단과 같은 자취를 남긴다.
+                    let new_ctrl_idx = Self::control_insert_index(target_para, char_offset);
+                    target_para.align_ctrl_data_records();
+                    target_para
+                        .controls
+                        .insert(new_ctrl_idx, Control::Picture(Box::new(pic)));
+                    target_para.ctrl_data_records.insert(new_ctrl_idx, None);
+                    target_para.shift_for_inline_control_insert(new_ctrl_idx, char_offset);
                     target_para.control_mask |= 0x00000800;
                     let logical_positions =
                         crate::document_core::helpers::find_logical_control_positions(target_para);
@@ -1631,11 +1805,16 @@ impl DocumentCore {
                 border_x: bx,
                 border_y: by,
                 crop,
+                img_dim,
                 image_attr,
                 ..Default::default()
             };
 
             // table 같은 paragraph 의 sibling control 로 append.
+            //
+            // [#4347] 이 경로는 **글자 없는 표 문단**에 붙는 자리라 좌표 자취가 필요 없다 —
+            // 폴백 셈(`ci × 8`)이 곧 정답이다(실측 `표@0 그림@8`). 그런데도 길이를 더하면
+            // 표 배치가 흔들린다(글자처럼 그림 둘의 줄 넘김 테스트가 깨진다). 건드리지 않는다.
             self.document.sections[section_idx].raw_stream = None;
             let parent = &mut self.document.sections[section_idx].paragraphs[para_idx];
             let new_ctrl_idx = parent.controls.len();
@@ -1649,15 +1828,9 @@ impl DocumentCore {
                 .unwrap_or_else(|| parent.text.chars().count())
                 + 1;
 
-            // outer table dirty 마킹 (재측정 유도)
+            // 최외곽 표 host 문단의 측정 revision을 무효화한다.
             let outer_ctrl = cell_path[0].0;
-            if let Some(Control::Table(t)) = self.document.sections[section_idx].paragraphs
-                [para_idx]
-                .controls
-                .get_mut(outer_ctrl)
-            {
-                t.dirty = true;
-            }
+            self.mark_cell_control_dirty(section_idx, para_idx, outer_ctrl);
             self.mark_section_dirty(section_idx);
             self.paginate_if_needed();
             // [Task #1151 v9 결함 F] page tree cache invalidate — v5 와 동일 결함 (다른
@@ -1713,16 +1886,21 @@ impl DocumentCore {
             border_x: bx,
             border_y: by,
             crop,
+            img_dim,
             image_attr,
             ..Default::default()
         };
 
-        // 현재 paragraph 의 sibling control 로 append (새 paragraph 생성 X).
+        // 현재 paragraph 의 sibling control 로 끼운다 (새 paragraph 생성 X).
         self.document.sections[section_idx].raw_stream = None;
         let parent = &mut self.document.sections[section_idx].paragraphs[para_idx];
-        let new_ctrl_idx = parent.controls.len();
-        parent.controls.push(Control::Picture(Box::new(pic)));
-        parent.ctrl_data_records.push(None);
+        let new_ctrl_idx = Self::control_insert_index(parent, char_offset);
+        parent.align_ctrl_data_records();
+        parent
+            .controls
+            .insert(new_ctrl_idx, Control::Picture(Box::new(pic)));
+        parent.ctrl_data_records.insert(new_ctrl_idx, None);
+        Self::leave_coordinate_trace(parent, new_ctrl_idx, char_offset);
         let logical_positions =
             crate::document_core::helpers::find_logical_control_positions(parent);
         let logical_after = logical_positions
@@ -1730,6 +1908,7 @@ impl DocumentCore {
             .copied()
             .unwrap_or_else(|| parent.text.chars().count())
             + 1;
+        self.shift_active_field_for_control_insert(section_idx, para_idx, new_ctrl_idx);
 
         self.mark_section_dirty(section_idx);
         self.paginate_if_needed();
@@ -1780,6 +1959,7 @@ mod issue_1151_cell_picture_insert_tests {
             },
             paragraphs: vec![Paragraph::default()],
             raw_stream: None,
+            raw_provenance: None,
         });
         let mut core = DocumentCore::new_empty();
         core.set_document(doc);
@@ -2479,6 +2659,7 @@ mod issue_1151_v2_tac_toggle_tests {
             },
             paragraphs: vec![Paragraph::default()],
             raw_stream: None,
+            raw_provenance: None,
         });
         let mut core = DocumentCore::new_empty();
         core.set_document(doc);
@@ -3558,6 +3739,7 @@ mod issue_1280_textbox_creation_tests {
             },
             paragraphs: vec![Paragraph::default()],
             raw_stream: None,
+            raw_provenance: None,
         });
         let mut core = DocumentCore::new_empty();
         core.set_document(doc);
@@ -4059,7 +4241,7 @@ mod bindata_storage_id_collision_tests {
             .map(|c| c.data.load())
             .collect();
         assert!(
-            datas.iter().any(|d| d.as_slice() == EXISTING_IMAGE),
+            datas.iter().any(|d| &d[..] == EXISTING_IMAGE),
             "저장 왕복 후 기존 이미지가 소실됨 (스트림 이름 충돌): {:?}",
             reloaded
                 .document()
@@ -4069,8 +4251,154 @@ mod bindata_storage_id_collision_tests {
                 .collect::<Vec<_>>()
         );
         assert!(
-            datas.iter().any(|d| *d == minimal_png().as_slice()),
+            datas.iter().any(|d| &d[..] == minimal_png().as_slice()),
             "저장 왕복 후 신규 이미지가 소실됨"
         );
+    }
+}
+
+#[cfg(test)]
+mod issue_4347_insert_leaves_coordinate_trace {
+    //! [#4347] 그림 삽입이 `char_offsets` 에 갭을 안 남겨 개체 좌표가 문단 끝으로 떨어졌다.
+    //!
+    //! 파서는 확장 컨트롤을 만나면 8 코드 유닛을 건너뛰고 **보이는 글자를 안 남긴다**. 그래서
+    //! 컨트롤의 자리는 `control_text_positions()` 가 `char_offsets` 의 **갭**으로 되짚는다.
+    //! 삽입 경로가 그 갭을 만들지 않으면 그 컨트롤은 자리를 잃고 문단 끝 폴백으로 떨어진다.
+    //! 수식·각주·새 번호 경로는 이미 `shift_for_inline_control_insert` 로 갭을 만든다.
+
+    use super::*;
+    use crate::model::document::{Document, Section};
+    use crate::model::paragraph::Paragraph;
+
+    fn core_with_two_leading_controls() -> DocumentCore {
+        // 앞머리에 확장 컨트롤 둘(구역·단 정의처럼 16칸)이 있고 그 뒤로 글자 열이 오는 문단.
+        let mut para = Paragraph {
+            text: "0123456789".to_string(),
+            char_offsets: (16..26).collect(),
+            char_count: 27,
+            ..Default::default()
+        };
+        para.controls.push(Control::SectionDef(Default::default()));
+        para.controls.push(Control::ColumnDef(Default::default()));
+        para.ctrl_data_records.push(None);
+        para.ctrl_data_records.push(None);
+        let mut doc = Document::default();
+        doc.sections.push(Section {
+            paragraphs: vec![para],
+            ..Default::default()
+        });
+        let mut core = DocumentCore::new_empty();
+        core.set_document(doc);
+        core
+    }
+
+    fn png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89,
+        ]
+    }
+
+    /// 글상자 문단은 **글자를 담는다** — 표 문단(글자 없음)과 달리 갭이 없으면 자리가 어긋난다.
+    #[test]
+    fn inserted_picture_in_a_textbox_keeps_its_place_too() {
+        let mut core = DocumentCore::new_empty();
+        let mut doc = Document::default();
+        doc.sections.push(Section {
+            paragraphs: vec![Paragraph::default()],
+            ..Default::default()
+        });
+        core.set_document(doc);
+        // 글상자를 만들고 그 안에 글자 일곱을 넣는다.
+        let made = core
+            .create_shape_control_native(
+                0,
+                0,
+                0,
+                20000,
+                10000,
+                0,
+                0,
+                true,
+                "square",
+                "textbox",
+                false,
+                false,
+                &[],
+            )
+            .expect("글상자");
+        let ctrl_idx =
+            crate::document_core::helpers::json_u32(&made, "controlIdx").unwrap() as usize;
+        core.insert_text_in_cell_native(0, 0, ctrl_idx, 0, 0, 0, "가나다라마바사")
+            .expect("글상자에 글");
+
+        core.insert_picture_native(
+            0,
+            0,
+            3,
+            &[(ctrl_idx, 0, 0)],
+            &png(),
+            100,
+            100,
+            1,
+            1,
+            "png",
+            "",
+            None,
+            None,
+        )
+        .expect("글상자 안 그림");
+
+        let shape = match &core.document.sections[0].paragraphs[0].controls[ctrl_idx] {
+            Control::Shape(s) => s,
+            other => panic!("글상자가 아니다: {:?}", other),
+        };
+        let tb = shape
+            .drawing()
+            .and_then(|d| d.text_box.as_ref())
+            .expect("글상자 안");
+        let para = &tb.paragraphs[0];
+        assert_eq!(
+            para.char_offsets[2], 2,
+            "넣은 자리 앞 글자는 그대로여야 한다"
+        );
+        assert_eq!(
+            para.char_offsets[3], 11,
+            "넣은 자리 뒤 글자는 컨트롤 몫 8칸만큼 밀려야 한다"
+        );
+        assert_eq!(
+            para.control_text_positions().first().copied(),
+            Some(3),
+            "그림은 넣은 글자 자리에 있어야 한다"
+        );
+    }
+
+    #[test]
+    fn inserted_picture_keeps_its_place_not_the_paragraph_end() {
+        let mut core = core_with_two_leading_controls();
+        core.insert_picture_native(0, 0, 4, &[], &png(), 100, 100, 1, 1, "png", "", None, None)
+            .expect("그림 삽입");
+
+        let para = &core.document.sections[0].paragraphs[0];
+        // 넣은 자리 뒤 글자들은 8칸 밀려야 한다 — 그 갭이 곧 그림의 자리다.
+        assert_eq!(
+            para.char_offsets[3], 19,
+            "넣은 자리 앞 글자는 그대로여야 한다"
+        );
+        assert_eq!(
+            para.char_offsets[4], 28,
+            "넣은 자리 뒤 글자는 컨트롤 몫 8칸만큼 밀려야 한다"
+        );
+        assert_eq!(para.char_count, 35, "문단 길이도 8칸 늘어야 한다");
+
+        // 그 갭 덕분에 컨트롤 자리가 되짚어진다 — 문단 끝이 아니라 넣은 자리다.
+        let positions = para.control_text_positions();
+        assert_eq!(
+            positions.len(),
+            3,
+            "구역 정의·단 정의·그림 셋의 자리가 나와야 한다"
+        );
+        assert_eq!(positions[2], 4, "그림은 넣은 글자 자리에 있어야 한다");
     }
 }

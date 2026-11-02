@@ -9,8 +9,12 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+use crate::diagnostics::{
+    read_hwp5_body_text_section_limited, read_hwp5_doc_info_limited,
+    MAX_HWP5_DIAGNOSTIC_STREAM_OUTPUT_BYTES,
+};
 use crate::parser::cfb_reader::CfbReader;
 use crate::parser::header;
 use crate::parser::tags;
@@ -23,6 +27,7 @@ struct Options {
     generated: PathBuf,
     out_dir: PathBuf,
     section: Option<u32>,
+    only_char_shape_defaults: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +35,7 @@ enum ProbeAxis {
     IdMappings,
     MemoShape,
     ShapeCtrlData,
+    CharShapeDefaults,
 }
 
 impl ProbeAxis {
@@ -38,6 +44,7 @@ impl ProbeAxis {
             Self::IdMappings => "id_mappings",
             Self::MemoShape => "memo_shape",
             Self::ShapeCtrlData => "shape_ctrl_data",
+            Self::CharShapeDefaults => "char_shape_defaults",
         }
     }
 }
@@ -53,6 +60,9 @@ struct PatchCounts {
     id_mappings: usize,
     memo_shape: usize,
     shape_ctrl_data: usize,
+    char_shape_defaults: usize,
+    char_shape_unmatched: usize,
+    char_shape_ambiguous: usize,
     docinfo_touched: usize,
     sections_touched: usize,
 }
@@ -75,10 +85,17 @@ struct RecordMeta {
     data_offset: usize,
 }
 
-pub fn run(args: &[String]) {
-    if args.is_empty() || matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
+pub fn run(args: &[String]) -> i32 {
+    // 종료 코드 계약(mydocs/manual/cli_commands.md): 명시적 `--help` 만 성공(0)이고,
+    // 인자 누락·파싱 실패는 사용법 오류(2), 실행 실패는 런타임 오류(1)다. 종전에는
+    // 반환형이 `()` 라 main 의 exit_with 를 통과하지 못해 무슨 일이 나든 0으로 끝났다.
+    if matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
         print_usage();
-        return;
+        return super::EXIT_OK;
+    }
+    if args.is_empty() {
+        print_usage();
+        return super::EXIT_USAGE;
     }
 
     let options = match parse_args(args) {
@@ -86,19 +103,22 @@ pub fn run(args: &[String]) {
         Err(message) => {
             eprintln!("{message}");
             print_usage();
-            return;
+            return super::EXIT_USAGE;
         }
     };
 
     if let Err(error) = run_inner(options) {
         eprintln!("오류: {error}");
+        return super::EXIT_RUNTIME;
     }
+    super::EXIT_OK
 }
 
 fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut inputs = Vec::new();
     let mut out_dir = None;
     let mut section = None;
+    let mut only_char_shape_defaults = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -121,6 +141,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 );
                 i += 2;
             }
+            "--only-char-shape-defaults" => {
+                only_char_shape_defaults = true;
+                i += 1;
+            }
             value if value.starts_with('-') => {
                 return Err(format!("알 수 없는 옵션: {value}"));
             }
@@ -140,13 +164,16 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         generated: inputs[1].clone(),
         out_dir: out_dir.ok_or_else(|| "--out-dir 경로가 필요합니다".to_string())?,
         section,
+        only_char_shape_defaults,
     })
 }
 
 fn print_usage() {
-    println!("사용법:");
-    println!(
-        "  rhwp hwp5-contract-probe <oracle.hwp> <generated.hwp> --out-dir <폴더> [--section N]"
+    // 안내는 stderr 로 나간다(계약). stdout 은 프로브 데이터 전용이라
+    // 섞이면 JSONL 을 파이프로 받는 소비자가 파싱에서 깨진다.
+    eprintln!("사용법:");
+    eprintln!(
+        "  rhwp hwp5-contract-probe <oracle.hwp> <generated.hwp> --out-dir <폴더> [--section N] [--only-char-shape-defaults]"
     );
 }
 
@@ -176,6 +203,10 @@ fn run_inner(options: Options) -> Result<(), String> {
 
     let mut results = Vec::new();
     for variant in contract_probe_variants() {
+        if options.only_char_shape_defaults && !variant.axes.contains(&ProbeAxis::CharShapeDefaults)
+        {
+            continue;
+        }
         let (bytes, counts) = build_probe_file(
             &oracle_bytes,
             oracle_compressed,
@@ -246,6 +277,10 @@ fn contract_probe_variants() -> &'static [Variant] {
             name: "07_id_mappings_memo_shape_ctrl_data",
             axes: &[IdMappings, MemoShape, ShapeCtrlData],
         },
+        Variant {
+            name: "08_char_shape_defaults_only",
+            axes: &[CharShapeDefaults],
+        },
     ]
 }
 
@@ -261,12 +296,17 @@ fn build_probe_file(
     let section_count = generated_section_count(generated_bytes)?;
     let mut counts = PatchCounts::default();
 
-    if axes.contains(&ProbeAxis::IdMappings) || axes.contains(&ProbeAxis::MemoShape) {
+    if axes.contains(&ProbeAxis::IdMappings)
+        || axes.contains(&ProbeAxis::MemoShape)
+        || axes.contains(&ProbeAxis::CharShapeDefaults)
+    {
         let oracle_doc_info = read_decompressed_doc_info(oracle_bytes, oracle_compressed)?;
         let generated_doc_info = read_decompressed_doc_info(generated_bytes, generated_compressed)?;
         let (patched_doc_info, doc_counts) =
             patch_doc_info(&oracle_doc_info, &generated_doc_info, axes);
-        if doc_counts.id_mappings + doc_counts.memo_shape > 0 {
+        counts.char_shape_unmatched += doc_counts.char_shape_unmatched;
+        counts.char_shape_ambiguous += doc_counts.char_shape_ambiguous;
+        if doc_counts.id_mappings + doc_counts.memo_shape + doc_counts.char_shape_defaults > 0 {
             let stream_bytes = if generated_compressed {
                 compress_stream(&patched_doc_info)?
             } else {
@@ -275,6 +315,7 @@ fn build_probe_file(
             stream_map.insert("/DocInfo".to_string(), stream_bytes);
             counts.id_mappings += doc_counts.id_mappings;
             counts.memo_shape += doc_counts.memo_shape;
+            counts.char_shape_defaults += doc_counts.char_shape_defaults;
             counts.docinfo_touched = 1;
         }
     }
@@ -349,8 +390,23 @@ fn patch_doc_info(
     let insert_memo_after = generated_records
         .iter()
         .rposition(|record| record.tag == tags::HWPTAG_STYLE);
+    let (char_shape_replacements, char_shape_unmatched, char_shape_ambiguous) =
+        if axes.contains(&ProbeAxis::CharShapeDefaults) {
+            build_char_shape_replacements(
+                &oracle_records,
+                oracle_raw,
+                &generated_records,
+                generated_raw,
+            )
+        } else {
+            (BTreeMap::new(), 0, 0)
+        };
 
-    let mut counts = PatchCounts::default();
+    let mut counts = PatchCounts {
+        char_shape_unmatched,
+        char_shape_ambiguous,
+        ..PatchCounts::default()
+    };
     let mut out = Vec::with_capacity(generated_raw.len() + oracle_memo_shapes.len() * 64);
     let mut cursor = 0usize;
 
@@ -373,6 +429,12 @@ fn patch_doc_info(
                 record_payload(oracle_raw, oracle_record),
             ));
             counts.id_mappings += 1;
+        } else if let Some(replacement) = char_shape_replacements.get(&index) {
+            let mut payload = record_payload(generated_raw, record).to_vec();
+            payload[46..50].copy_from_slice(&replacement[..4]);
+            payload[64..68].copy_from_slice(&replacement[4..]);
+            out.extend_from_slice(&build_record(record.tag, record.level, &payload));
+            counts.char_shape_defaults += 1;
         } else {
             out.extend_from_slice(&generated_raw[record.offset..record_end(record)]);
         }
@@ -399,6 +461,75 @@ fn patch_doc_info(
     }
 
     (out, counts)
+}
+
+/// HWPX의 logical charPr와 한컴 HWP 저장본의 차이는 비활성 underline/strikeout/shadow의
+/// sentinel에 집중된다. 다른 semantic field가 같은 경우에만 oracle의 attr과 shadow color를
+/// 이식해, sentinel 자체가 한컴 PDF 출력에 미치는 영향을 격리한다.
+fn build_char_shape_replacements(
+    oracle_records: &[RecordMeta],
+    oracle_raw: &[u8],
+    generated_records: &[RecordMeta],
+    generated_raw: &[u8],
+) -> (BTreeMap<usize, [u8; 8]>, usize, usize) {
+    let mut oracle_values: BTreeMap<Vec<u8>, std::collections::BTreeSet<[u8; 8]>> = BTreeMap::new();
+    for record in oracle_records
+        .iter()
+        .filter(|record| record.tag == tags::HWPTAG_CHAR_SHAPE)
+    {
+        let payload = record_payload(oracle_raw, record);
+        let (Some(key), Some(values)) = (
+            char_shape_semantic_key(payload),
+            char_shape_patch_values(payload),
+        ) else {
+            continue;
+        };
+        oracle_values.entry(key).or_default().insert(values);
+    }
+
+    let mut replacements = BTreeMap::new();
+    let mut unmatched = 0;
+    let mut ambiguous = 0;
+    for (index, record) in generated_records.iter().enumerate() {
+        if record.tag != tags::HWPTAG_CHAR_SHAPE {
+            continue;
+        }
+        let payload = record_payload(generated_raw, record);
+        let Some(key) = char_shape_semantic_key(payload) else {
+            unmatched += 1;
+            continue;
+        };
+        match oracle_values.get(&key) {
+            Some(values) if values.len() == 1 => {
+                replacements.insert(index, *values.first().expect("non-empty set"));
+            }
+            Some(_) => ambiguous += 1,
+            None => unmatched += 1,
+        }
+    }
+    (replacements, unmatched, ambiguous)
+}
+
+/// HWP5 CharShape payload의 attr(46..50)와 shadow color(64..68)를 제외한 stable key다.
+fn char_shape_semantic_key(payload: &[u8]) -> Option<Vec<u8>> {
+    if payload.len() < 74 {
+        return None;
+    }
+    let mut key = Vec::with_capacity(payload.len() - 8);
+    key.extend_from_slice(&payload[..46]);
+    key.extend_from_slice(&payload[50..64]);
+    key.extend_from_slice(&payload[68..]);
+    Some(key)
+}
+
+fn char_shape_patch_values(payload: &[u8]) -> Option<[u8; 8]> {
+    if payload.len() < 74 {
+        return None;
+    }
+    let mut values = [0u8; 8];
+    values[..4].copy_from_slice(&payload[46..50]);
+    values[4..].copy_from_slice(&payload[64..68]);
+    Some(values)
 }
 
 fn patch_missing_ctrl_data(oracle_raw: &[u8], generated_raw: &[u8]) -> (Vec<u8>, usize) {
@@ -484,7 +615,7 @@ fn read_all_streams(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut streams = BTreeMap::new();
     for path in paths {
         let data = cfb
-            .read_stream_raw(&path)
+            .read_stream_raw_limited(&path, MAX_HWP5_DIAGNOSTIC_STREAM_OUTPUT_BYTES)
             .map_err(|error| format!("스트림 읽기 실패 - {path}: {error}"))?;
         streams.insert(path, data);
     }
@@ -493,8 +624,12 @@ fn read_all_streams(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
 
 fn read_decompressed_doc_info(bytes: &[u8], compressed: bool) -> Result<Vec<u8>, String> {
     let mut cfb = CfbReader::open(bytes).map_err(|error| format!("CFB 열기 실패: {error}"))?;
-    cfb.read_doc_info(compressed)
-        .map_err(|error| format!("DocInfo 읽기 실패: {error}"))
+    read_hwp5_doc_info_limited(
+        &mut cfb,
+        compressed,
+        MAX_HWP5_DIAGNOSTIC_STREAM_OUTPUT_BYTES,
+    )
+    .map_err(|error| format!("DocInfo 읽기 실패: {error}"))
 }
 
 fn read_decompressed_section(
@@ -503,7 +638,13 @@ fn read_decompressed_section(
     compressed: bool,
 ) -> Result<Option<Vec<u8>>, String> {
     let mut cfb = CfbReader::open(bytes).map_err(|error| format!("CFB 열기 실패: {error}"))?;
-    match cfb.read_body_text_section(section, compressed, false) {
+    match read_hwp5_body_text_section_limited(
+        &mut cfb,
+        section,
+        compressed,
+        false,
+        MAX_HWP5_DIAGNOSTIC_STREAM_OUTPUT_BYTES,
+    ) {
         Ok(data) => Ok(Some(data)),
         Err(_) => Ok(None),
     }
@@ -665,20 +806,28 @@ fn render_generation_report(
     if let Some(section) = options.section {
         let _ = writeln!(report, "- section filter: `{}`", section);
     }
+    let _ = writeln!(
+        report,
+        "- only char shape defaults: `{}`",
+        options.only_char_shape_defaults
+    );
     let _ = writeln!(report);
 
     let _ = writeln!(report, "## 2. 생성 파일");
     let _ = writeln!(report);
     let _ = writeln!(
         report,
-        "| file | bytes | hash | rhwp reload | ID_MAPPINGS | MEMO_SHAPE | CTRL_DATA | DocInfo | sections | axes |"
+        "| file | bytes | hash | rhwp reload | ID_MAPPINGS | MEMO_SHAPE | CTRL_DATA | CHAR_SHAPE defaults | unmatched | ambiguous | DocInfo | sections | axes |"
     );
-    let _ = writeln!(report, "|---|---:|---|---|---:|---:|---:|---:|---:|---|");
+    let _ = writeln!(
+        report,
+        "|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"
+    );
     for result in results {
         let axes = display_axes_for_file(&result.file_name);
         let _ = writeln!(
             report,
-            "| `{}` | {} | `{}` | {} | {} | {} | {} | {} | {} | `{}` |",
+            "| `{}` | {} | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | `{}` |",
             result.file_name,
             result.bytes,
             result.hash,
@@ -689,6 +838,9 @@ fn render_generation_report(
             result.counts.id_mappings,
             result.counts.memo_shape,
             result.counts.shape_ctrl_data,
+            result.counts.char_shape_defaults,
+            result.counts.char_shape_unmatched,
+            result.counts.char_shape_ambiguous,
             result.counts.docinfo_touched,
             result.counts.sections_touched,
             axes
@@ -731,6 +883,98 @@ fn display_axes_for_file(file_name: &str) -> &'static str {
         "05_id_mappings_ctrl_data" => "ID_MAPPINGS + CTRL_DATA",
         "06_memo_shape_ctrl_data" => "MEMO_SHAPE + CTRL_DATA",
         "07_id_mappings_memo_shape_ctrl_data" => "ID_MAPPINGS + MEMO_SHAPE + CTRL_DATA",
+        "08_char_shape_defaults_only" => "CHAR_SHAPE_DEFAULTS",
         _ => "-",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args_selects_only_char_shape_defaults() {
+        let args = [
+            "oracle.hwp",
+            "generated.hwp",
+            "--out-dir",
+            "out",
+            "--only-char-shape-defaults",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+        let options = parse_args(&args).expect("valid options");
+
+        assert!(options.only_char_shape_defaults);
+        assert_eq!(options.out_dir, PathBuf::from("out"));
+    }
+
+    fn char_shape_payload(marker: u8, attr: [u8; 4], shadow_color: [u8; 4]) -> Vec<u8> {
+        let mut payload = vec![marker; 74];
+        payload[46..50].copy_from_slice(&attr);
+        payload[64..68].copy_from_slice(&shadow_color);
+        payload
+    }
+
+    fn doc_info_with_char_shapes(payloads: &[Vec<u8>]) -> Vec<u8> {
+        payloads
+            .iter()
+            .flat_map(|payload| build_record(tags::HWPTAG_CHAR_SHAPE, 1, payload))
+            .collect()
+    }
+
+    #[test]
+    fn char_shape_defaults_patch_unique_semantic_match() {
+        let oracle_payload = char_shape_payload(7, [0xfa, 0, 4, 0x3c], [0xc0; 4]);
+        let generated_payload = char_shape_payload(7, [2, 0, 0, 0], [0xb2; 4]);
+        let oracle = doc_info_with_char_shapes(std::slice::from_ref(&oracle_payload));
+        let generated = doc_info_with_char_shapes(&[generated_payload]);
+
+        let (patched, counts) =
+            patch_doc_info(&oracle, &generated, &[ProbeAxis::CharShapeDefaults]);
+        let records = parse_records(&patched);
+        let payload = record_payload(&patched, &records[0]);
+
+        assert_eq!(counts.char_shape_defaults, 1);
+        assert_eq!(counts.char_shape_unmatched, 0);
+        assert_eq!(counts.char_shape_ambiguous, 0);
+        assert_eq!(&payload[46..50], &oracle_payload[46..50]);
+        assert_eq!(&payload[64..68], &oracle_payload[64..68]);
+    }
+
+    #[test]
+    fn char_shape_defaults_skip_ambiguous_oracle_values() {
+        let oracle = doc_info_with_char_shapes(&[
+            char_shape_payload(7, [0xfa, 0, 4, 0x3c], [0xc0; 4]),
+            char_shape_payload(7, [0xf8, 0, 4, 0x3c], [0xb2; 4]),
+        ]);
+        let generated_payload = char_shape_payload(7, [2, 0, 0, 0], [0xb2; 4]);
+        let generated = doc_info_with_char_shapes(std::slice::from_ref(&generated_payload));
+
+        let (patched, counts) =
+            patch_doc_info(&oracle, &generated, &[ProbeAxis::CharShapeDefaults]);
+        let records = parse_records(&patched);
+
+        assert_eq!(counts.char_shape_defaults, 0);
+        assert_eq!(counts.char_shape_ambiguous, 1);
+        assert_eq!(record_payload(&patched, &records[0]), generated_payload);
+    }
+
+    #[test]
+    fn char_shape_defaults_skip_different_semantic_payload() {
+        let oracle =
+            doc_info_with_char_shapes(&[char_shape_payload(7, [0xfa, 0, 4, 0x3c], [0xc0; 4])]);
+        let generated_payload = char_shape_payload(8, [2, 0, 0, 0], [0xb2; 4]);
+        let generated = doc_info_with_char_shapes(std::slice::from_ref(&generated_payload));
+
+        let (patched, counts) =
+            patch_doc_info(&oracle, &generated, &[ProbeAxis::CharShapeDefaults]);
+        let records = parse_records(&patched);
+
+        assert_eq!(counts.char_shape_defaults, 0);
+        assert_eq!(counts.char_shape_unmatched, 1);
+        assert_eq!(record_payload(&patched, &records[0]), generated_payload);
     }
 }

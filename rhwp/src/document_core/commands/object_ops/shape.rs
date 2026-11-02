@@ -1,15 +1,13 @@
 //! 도형 생성/속성/그룹 native 명령 (object_ops 분할, #1904).
 
 use super::MIN_SHAPE_SIZE;
-use crate::document_core::helpers::{get_textbox_from_shape, get_textbox_from_shape_mut};
+use crate::document_core::helpers::get_textbox_from_shape;
 use crate::document_core::DocumentCore;
 use crate::error::HwpError;
 use crate::model::control::Control;
 use crate::model::event::DocumentEvent;
 use crate::model::paragraph::Paragraph;
-use crate::model::shape::{
-    common_obj_offsets, Caption, CaptionDirection, CaptionVertAlign, ShapeObject,
-};
+use crate::model::shape::{Caption, CaptionDirection, CaptionVertAlign, ShapeObject};
 
 impl DocumentCore {
     fn shape_caption_ref(shape: &ShapeObject) -> Option<&Caption> {
@@ -391,43 +389,44 @@ impl DocumentCore {
 
         let shape = self.resolve_shape_control_mut(section_idx, parent_para_idx, control_idx)?;
 
+        // [#6740] 변환 파생 상태 무효화 판정용 — 어떤 대입보다 먼저 잰다.
+        let transform_before =
+            super::common::shape_transform_fingerprint(shape.common(), shape.shape_attr());
+
         // CommonObjAttr 업데이트
         // 리사이즈 핸들을 반대편으로 끌어당길 때 studio가 width/height=0 을 보내
         // 도형이 렌더러상 사라지는 버그 방어: 최소 크기 clamp.
         let c = shape.common_mut();
+        // [#6806] 클램프는 퇴화값 0(리사이즈 핸들을 반대편으로 넘긴 경우)에만 건다.
+        // 한컴 문서의 가로선은 높이 3·4 로 저장되어 있어(corpus 도형 894 중 95건이 200 미만)
+        // `max(200)` 은 되먹임·undo 봉지의 정당한 값을 200 으로 부풀렸다.
+        let width_before = c.width;
+        let height_before = c.height;
+        let restore_stored_zero = json_bool(props_json, "restoreStoredZero") == Some(true);
         let new_w = crate::document_core::helpers::json_u32(props_json, "width")
-            .map(|w| w.max(MIN_SHAPE_SIZE));
+            .map(|w| super::clamp_degenerate_size(w, width_before, restore_stored_zero));
         let new_h = crate::document_core::helpers::json_u32(props_json, "height")
-            .map(|h| h.max(MIN_SHAPE_SIZE));
+            .map(|h| super::clamp_degenerate_size(h, height_before, restore_stored_zero));
         Self::apply_common_obj_attr_from_json(c, props_json);
-
-        // Polygon/Curve: original_width/height는 생성 시 값으로 유지해야 렌더러의
-        // 스케일 팩터(sx = current/original)가 올바르게 동작한다.
-        let is_polygon_or_curve = matches!(
-            shape,
-            crate::model::shape::ShapeObject::Polygon(_)
-                | crate::model::shape::ShapeObject::Curve(_)
-        );
-        let saved_orig_w = if is_polygon_or_curve {
-            shape.drawing().map(|d| d.shape_attr.original_width)
-        } else {
-            None
-        };
-        let saved_orig_h = if is_polygon_or_curve {
-            shape.drawing().map(|d| d.shape_attr.original_height)
-        } else {
-            None
-        };
 
         // ShapeComponentAttr 크기/회전/채우기 동기화
         if let Some(d) = shape.drawing_mut() {
-            if let Some(w) = new_w {
+            // [#6806] 값이 실제로 바뀔 때만 `current_*` 를 따라가게 한다.
+            // 게터가 내보내는 `width` 는 `common.width` 라, 종전에는 같은 봉지를 되먹여도
+            // 크기가 다시 대입됐다.
+            //
+            // `original_*` 는 **생성 시 크기**(HWP5 SHAPE_COMPONENT offset 20/24)이고
+            // 도형의 로컬 좌표계 크기다 — 렌더러는 끝점·꼭짓점을 `current/original` 로
+            // 스케일한다(`layout/shape_layout.rs` Line 1388·Arc 1684·Rectangle 1156,
+            // 글상자 글꼴 비 2691). 리사이즈는 상자만 바꾸고 로컬 좌표는 그대로 두므로
+            // 여기서 `original_*` 를 다시 쓰면 분모가 분자를 따라가 스케일이 1 로 무너진다.
+            // 묶음(아래)과 Polygon·Curve 는 이미 이 규칙을 지키고 있었고, 같은 렌더러
+            // 의존을 가진 Line·Arc·Rectangle 만 빠져 있었다.
+            if let Some(w) = new_w.filter(|&w| w != width_before) {
                 d.shape_attr.current_width = w;
-                d.shape_attr.original_width = w;
             }
-            if let Some(h) = new_h {
+            if let Some(h) = new_h.filter(|&h| h != height_before) {
                 d.shape_attr.current_height = h;
-                d.shape_attr.original_height = h;
             }
 
             // 회전/기울임
@@ -604,31 +603,30 @@ impl DocumentCore {
 
         let caption_changed = Self::apply_shape_caption_props(shape, props_json);
 
-        // Polygon/Curve: original_width/height 복원 (생성 시 값 유지 → 렌더러 스케일 팩터 정상화)
-        if let Some(d) = shape.drawing_mut() {
-            if let Some(w) = saved_orig_w {
-                d.shape_attr.original_width = w;
-            }
-            if let Some(h) = saved_orig_h {
-                d.shape_attr.original_height = h;
-            }
-        }
-
         // Group 리사이즈: original_width 유지, current_width만 변경 (렌더러가 스케일 적용)
         // 한컴 방식: 자식은 변경하지 않고, 컨테이너의 current/original 비율로 스케일 결정
         if let crate::model::shape::ShapeObject::Group(ref mut group) = shape {
-            if let Some(nw) = new_w {
+            // [#6806] 묶음도 값이 바뀔 때만 — 파싱값이 `current ≠ common` 인 묶음(corpus 36건)은
+            // 같은 봉지를 되먹이면 지문이 흔들려 원본 변환 행렬(#6740)이 지워졌다.
+            if let Some(nw) = new_w.filter(|&w| w != width_before) {
                 group.shape_attr.current_width = nw;
                 // original_width는 유지 (스케일 기준)
             }
-            if let Some(nh) = new_h {
+            if let Some(nh) = new_h.filter(|&h| h != height_before) {
                 group.shape_attr.current_height = nh;
             }
-            // 회전 중심 갱신
+            // 회전 중심 갱신 — common 에서 다시 세우므로 무변경 시 멱등이다.
             group.shape_attr.rotation_center.x = (group.common.width / 2) as i32;
             group.shape_attr.rotation_center.y = (group.common.height / 2) as i32;
-            // raw_rendering 초기화 → 직렬화 시 스케일 행렬 재생성
-            group.shape_attr.raw_rendering = Vec::new();
+            // [#6740] raw_rendering 초기화는 **실제로 변환이 바뀐 뒤에만** 한다.
+            // 종전에는 `if let Some(..)` 가드 밖에서 무조건 비웠기 때문에, 크기 키가
+            // 없는 속성(예: 빈 JSON)이나 같은 값 재적용에도 한컴 원본 행렬이 사라졌다.
+            // 판정 형태는 #6355(그림)와 같다.
+            if super::common::shape_transform_fingerprint(&group.common, &group.shape_attr)
+                != transform_before
+            {
+                group.shape_attr.raw_rendering = Vec::new();
+            }
         }
 
         if caption_changed {
@@ -772,37 +770,31 @@ impl DocumentCore {
     ) -> bool {
         use crate::document_core::helpers::{json_bool, json_i32, json_str};
 
+        // [#6740] 변환 파생 상태 무효화 판정용 — 어떤 대입보다 먼저 잰다.
+        let transform_before =
+            super::common::shape_transform_fingerprint(shape.common(), shape.shape_attr());
+
         let c = shape.common_mut();
+        // [#6806] 클램프는 퇴화값 0(리사이즈 핸들을 반대편으로 넘긴 경우)에만 건다.
+        // 한컴 문서의 가로선은 높이 3·4 로 저장되어 있어(corpus 도형 894 중 95건이 200 미만)
+        // `max(200)` 은 되먹임·undo 봉지의 정당한 값을 200 으로 부풀렸다.
+        let width_before = c.width;
+        let height_before = c.height;
+        let restore_stored_zero = json_bool(props_json, "restoreStoredZero") == Some(true);
         let new_w = crate::document_core::helpers::json_u32(props_json, "width")
-            .map(|w| w.max(MIN_SHAPE_SIZE));
+            .map(|w| super::clamp_degenerate_size(w, width_before, restore_stored_zero));
         let new_h = crate::document_core::helpers::json_u32(props_json, "height")
-            .map(|h| h.max(MIN_SHAPE_SIZE));
+            .map(|h| super::clamp_degenerate_size(h, height_before, restore_stored_zero));
         Self::apply_common_obj_attr_from_json(c, props_json);
 
-        let is_polygon_or_curve = matches!(
-            shape,
-            crate::model::shape::ShapeObject::Polygon(_)
-                | crate::model::shape::ShapeObject::Curve(_)
-        );
-        let saved_orig_w = if is_polygon_or_curve {
-            shape.drawing().map(|d| d.shape_attr.original_width)
-        } else {
-            None
-        };
-        let saved_orig_h = if is_polygon_or_curve {
-            shape.drawing().map(|d| d.shape_attr.original_height)
-        } else {
-            None
-        };
-
         if let Some(d) = shape.drawing_mut() {
-            if let Some(w) = new_w {
+            // [#6806] 본문 경로와 동형 — 값이 바뀔 때만 `current_*` 만 따라간다.
+            // `original_*`(생성 시 크기)는 렌더 스케일 분모라 리사이즈가 다시 쓰지 않는다.
+            if let Some(w) = new_w.filter(|&w| w != width_before) {
                 d.shape_attr.current_width = w;
-                d.shape_attr.original_width = w;
             }
-            if let Some(h) = new_h {
+            if let Some(h) = new_h.filter(|&h| h != height_before) {
                 d.shape_attr.current_height = h;
-                d.shape_attr.original_height = h;
             }
             if let Some(v) = json_i32(props_json, "rotationAngle") {
                 d.shape_attr.rotation_angle = v as i16;
@@ -963,25 +955,22 @@ impl DocumentCore {
 
         let caption_changed = Self::apply_shape_caption_props(shape, props_json);
 
-        if let Some(d) = shape.drawing_mut() {
-            if let Some(w) = saved_orig_w {
-                d.shape_attr.original_width = w;
-            }
-            if let Some(h) = saved_orig_h {
-                d.shape_attr.original_height = h;
-            }
-        }
-
         if let crate::model::shape::ShapeObject::Group(ref mut group) = shape {
-            if let Some(nw) = new_w {
+            // [#6806] 본문 경로와 동형 — 값이 바뀔 때만.
+            if let Some(nw) = new_w.filter(|&w| w != width_before) {
                 group.shape_attr.current_width = nw;
             }
-            if let Some(nh) = new_h {
+            if let Some(nh) = new_h.filter(|&h| h != height_before) {
                 group.shape_attr.current_height = nh;
             }
             group.shape_attr.rotation_center.x = (group.common.width / 2) as i32;
             group.shape_attr.rotation_center.y = (group.common.height / 2) as i32;
-            group.shape_attr.raw_rendering = Vec::new();
+            // [#6740] 본문 경로(set_shape_properties_native)와 같은 판정 — 실제 변화 시에만.
+            if super::common::shape_transform_fingerprint(&group.common, &group.shape_attr)
+                != transform_before
+            {
+                group.shape_attr.raw_rendering = Vec::new();
+            }
         }
         caption_changed
     }
@@ -1070,6 +1059,21 @@ impl DocumentCore {
         para.controls.remove(control_idx);
         if control_idx < para.ctrl_data_records.len() {
             para.ctrl_data_records.remove(control_idx);
+        }
+        // 컨트롤 배열이 줄어도 뒤 누름틀의 범위는 같은 필드를 가리켜야 한다.
+        for range in &mut para.field_ranges {
+            if range.control_idx > control_idx {
+                range.control_idx -= 1;
+            }
+        }
+        if let Some(active) = self.active_field.as_mut() {
+            if active.section_idx == section_idx
+                && active.para_idx == parent_para_idx
+                && active.cell_path.is_none()
+                && active.control_idx > control_idx
+            {
+                active.control_idx -= 1;
+            }
         }
         if para.char_count >= 8 {
             para.char_count -= 8;
@@ -1511,49 +1515,16 @@ impl DocumentCore {
             };
 
             // 컨트롤 추가
+            // [#3214] controls 기준 인덱스를 ctrl_data_records 에 그대로 쓰기 전에 정렬한다.
+            paragraph.align_ctrl_data_records();
             paragraph
                 .controls
                 .insert(insert_idx, Control::Shape(Box::new(shape_obj)));
             paragraph.ctrl_data_records.insert(insert_idx, None);
 
-            // char_offsets: 컨트롤은 텍스트축 배열에 원소로 들어가지 않고 "8 code unit 갭"으로
-            // 표현된다. insert_idx 는 controls 축 인덱스이므로, 이를 char_offsets(텍스트축,
-            // 길이 = text.chars().count())에 원소로 끼워넣으면 배열이 1 늘어나 불변이 깨진다
-            // (control_text_positions 등이 char_offsets[i]↔text char i 대응을 가정). 각주/수식
-            // 삽입 경로처럼 텍스트 인덱스 기준으로 삽입 지점 이후만 +8 시프트한다.
-            if !paragraph.char_offsets.is_empty() {
-                let text_len = paragraph.text.chars().count();
-                let safe_offset = char_offset.min(text_len);
-                let insert_pos: u32 = if safe_offset < paragraph.char_offsets.len() {
-                    paragraph.char_offsets[safe_offset]
-                } else {
-                    let last_idx = paragraph.char_offsets.len() - 1;
-                    let last_w = paragraph
-                        .text
-                        .chars()
-                        .nth(last_idx)
-                        .map(|c| if (c as u32) > 0xFFFF { 2 } else { 1 })
-                        .unwrap_or(1);
-                    paragraph.char_offsets[last_idx] + last_w
-                };
-                for co in paragraph.char_offsets[safe_offset..].iter_mut() {
-                    *co += 8;
-                }
-                for cs in &mut paragraph.char_shapes {
-                    if cs.start_pos > insert_pos || (cs.start_pos == insert_pos && cs.start_pos > 0)
-                    {
-                        cs.start_pos += 8;
-                    }
-                }
-                for rt in &mut paragraph.range_tags {
-                    if rt.start >= insert_pos {
-                        rt.start += 8;
-                    }
-                    if rt.end >= insert_pos {
-                        rt.end += 8;
-                    }
-                }
-            }
+            // 컨트롤은 char_offsets 에 원소로 들어가지 않고 8 code unit 갭으로 표현된다.
+            // 각주·수식·그림 경로와 같은 공용 시프트로 갭을 내고 뒤 누름틀 번호도 민다.
+            paragraph.shift_for_inline_control_insert(insert_idx, char_offset);
 
             // char_count 갱신 (확장 컨트롤 = 8 code units)
             paragraph.char_count += 8;
@@ -1564,6 +1535,7 @@ impl DocumentCore {
             paragraph.has_para_text = true;
             insert_ctrl_idx = insert_idx;
         }
+        self.shift_active_field_for_control_insert(section_idx, para_idx, insert_ctrl_idx);
 
         // 리플로우 + 페이지네이션
         self.recompose_section(section_idx);
@@ -1675,6 +1647,20 @@ impl DocumentCore {
             }
         };
 
+        // [#5769 후속] 자기기술 변경 레코드 — SetZOrderCommand 가 이대로 소비해 undo/redo
+        // 의 절대 대입 쌍으로 쓴다. 교환인 경우 이웃의 이전 값은 new_z 와 같다(둘의 z 를
+        // 맞바꾼 것). 기존 소비자는 zOrder 키만 읽으므로 추가 필드는 안전하다.
+        let mut moves_json = format!(
+            "{{\"ppi\":{},\"ci\":{},\"before\":{},\"after\":{}}}",
+            para_idx, control_idx, current_z, new_z
+        );
+        if let Some((n_pi, n_ci, n_z)) = neighbor_change {
+            moves_json.push_str(&format!(
+                ",{{\"ppi\":{},\"ci\":{},\"before\":{},\"after\":{}}}",
+                n_pi, n_ci, new_z, n_z
+            ));
+        }
+
         // z_order 변경: 대상 + 이웃
         {
             let section = &mut self.document.sections[section_idx];
@@ -1693,8 +1679,79 @@ impl DocumentCore {
         self.paginate_if_needed();
 
         Ok(crate::document_core::helpers::json_ok_with(&format!(
-            "\"zOrder\":{}",
-            new_z
+            "\"zOrder\":{},\"moves\":[{}]",
+            new_z, moves_json
+        )))
+    }
+
+    /// [#5769 후속] z 순서 절대 대입 — `SetZOrderCommand` 의 undo/redo 가 쓴다.
+    ///
+    /// pairs_json: `[{"ppi":N,"ci":N,"z":N},...]`. 상대 연산(front/forward/…)과 달리 값
+    /// 자체를 복원하므로 [`Self::change_shape_z_order_native`] 이 남긴 `moves` 를 뒤집어
+    /// 넣으면 정확한 역연산이다 — Shape z 대입에는 대입 외 부작용이 없다(#5769 선결 규약).
+    /// 적용 후 passthrough 무효화·파생 상태 재구성 후처리는 상대 연산과 동일하다. 하나라도
+    /// 검증에 어긋나면 아무것도 적용하지 않고 거절한다 — 부분 적용은 undo 도중의 문서 오염이다.
+    pub fn apply_shape_z_order_pairs_native(
+        &mut self,
+        section_idx: usize,
+        pairs_json: &str,
+    ) -> Result<String, HwpError> {
+        let pairs: Vec<serde_json::Value> = serde_json::from_str(pairs_json)
+            .map_err(|e| HwpError::RenderError(format!("pairs JSON 파싱 실패: {}", e)))?;
+        if pairs.is_empty() {
+            return Ok(crate::document_core::helpers::json_ok_with("\"applied\":0"));
+        }
+
+        // 1차 — 전수 검증. 지목이 Shape 가 아니면 기록 이후 문서가 바뀐 것이므로 실패다.
+        {
+            let section = self.document.sections.get(section_idx).ok_or_else(|| {
+                HwpError::RenderError(format!("구역 인덱스 {} 범위 초과", section_idx))
+            })?;
+            for pair in &pairs {
+                let err = |what: &str| HwpError::RenderError(format!("pairs 항목 {} 누락", what));
+                let pi = pair["ppi"].as_u64().ok_or_else(|| err("ppi"))? as usize;
+                let ci = pair["ci"].as_u64().ok_or_else(|| err("ci"))? as usize;
+                if pair["z"].as_i64().is_none() {
+                    return Err(err("z"));
+                }
+                let para = section.paragraphs.get(pi).ok_or_else(|| {
+                    HwpError::RenderError(format!("문단 인덱스 {} 범위 초과", pi))
+                })?;
+                match para.controls.get(ci) {
+                    Some(Control::Shape(_)) => {}
+                    _ => {
+                        return Err(HwpError::RenderError(format!(
+                            "지목 (ppi={}, ci={}) 은 Shape 가 아니다 — 기록 이후 문서가 바뀌었다",
+                            pi, ci
+                        )))
+                    }
+                }
+            }
+        }
+
+        // 2차 — 적용.
+        let applied = {
+            let section = &mut self.document.sections[section_idx];
+            let mut applied = 0usize;
+            for pair in &pairs {
+                let pi = pair["ppi"].as_u64().expect("1차에서 검증됨") as usize;
+                let ci = pair["ci"].as_u64().expect("1차에서 검증됨") as usize;
+                let z = pair["z"].as_i64().expect("1차에서 검증됨") as i32;
+                if let Some(Control::Shape(shape)) = section.paragraphs[pi].controls.get_mut(ci) {
+                    shape.common_mut().z_order = z;
+                    applied += 1;
+                }
+            }
+            applied
+        };
+
+        self.document.sections[section_idx].raw_stream = None;
+        self.recompose_section(section_idx);
+        self.paginate_if_needed();
+
+        Ok(crate::document_core::helpers::json_ok_with(&format!(
+            "\"applied\":{}",
+            applied
         )))
     }
     /// 도형 내부 좌표만 스케일 (common/shape_attr은 변경하지 않음)
@@ -2326,6 +2383,8 @@ impl DocumentCore {
             }
 
             // 문단에 삽입
+            // [#3214] controls 기준 인덱스를 ctrl_data_records 에 그대로 쓰기 전에 정렬한다.
+            para.align_ctrl_data_records();
             para.controls
                 .insert(insert_idx, Control::Shape(Box::new(child)));
             para.ctrl_data_records.insert(insert_idx, None);
@@ -2493,6 +2552,21 @@ impl DocumentCore {
             }
         }
     }
+    /// HWP 직렬화가 읽는 문단 control stream의 구역 정의를 section 메타와 맞춘다.
+    fn sync_section_def_controls_from_section(&mut self, section_idx: usize) {
+        let Some(section) = self.document.sections.get_mut(section_idx) else {
+            return;
+        };
+        let section_def = section.section_def.clone();
+        for paragraph in &mut section.paragraphs {
+            for control in &mut paragraph.controls {
+                if let Control::SectionDef(control_section_def) = control {
+                    **control_section_def = section_def.clone();
+                }
+            }
+        }
+    }
+
     /// 현재 구역의 미주 모양을 조회한다.
     pub fn get_endnote_shape_native(&self, section_idx: usize) -> Result<String, HwpError> {
         let section = self.document.sections.get(section_idx).ok_or_else(|| {
@@ -2560,88 +2634,95 @@ impl DocumentCore {
         section_idx: usize,
         props_json: &str,
     ) -> Result<String, HwpError> {
-        let section = self.document.sections.get_mut(section_idx).ok_or_else(|| {
-            HwpError::RenderError(format!("구역 인덱스 {} 범위 초과", section_idx))
-        })?;
-        let shape = &mut section.section_def.endnote_shape;
+        {
+            let section = self.document.sections.get_mut(section_idx).ok_or_else(|| {
+                HwpError::RenderError(format!("구역 인덱스 {} 범위 초과", section_idx))
+            })?;
+            let shape = &mut section.section_def.endnote_shape;
 
-        if let Some(v) = crate::document_core::helpers::json_str(props_json, "numberFormat") {
-            shape.number_format =
-                Self::footnote_shape_number_format_from_str(&v, shape.number_format);
+            if let Some(v) = crate::document_core::helpers::json_str(props_json, "numberFormat") {
+                shape.number_format =
+                    Self::footnote_shape_number_format_from_str(&v, shape.number_format);
+            }
+            if let Some(v) = crate::document_core::helpers::json_str(props_json, "userChar") {
+                shape.user_char = Self::first_char_or_nul(&v);
+            }
+            if let Some(v) = crate::document_core::helpers::json_str(props_json, "prefixChar") {
+                shape.prefix_char = Self::first_char_or_nul(&v);
+            }
+            if let Some(v) = crate::document_core::helpers::json_str(props_json, "suffixChar") {
+                shape.suffix_char = Self::first_char_or_nul(&v);
+            }
+            if let Some(v) = crate::document_core::helpers::json_u16(props_json, "startNumber") {
+                shape.start_number = v.max(1);
+            }
+            if let Some(v) = Self::hwpunit16_from_json(props_json, "separatorLength") {
+                shape.separator_length = i32::from(v.max(0));
+            }
+            if let Some(v) = Self::hwpunit16_from_json(props_json, "separatorMarginTop") {
+                let above = v.max(0);
+                // HWP5 저장본은 구분선 위 값을 fallback 슬롯에 보관하는 경우가 있어 함께 갱신한다.
+                shape.separator_margin_top = above;
+                shape.separator_margin_bottom = above;
+            }
+            if let Some(v) = Self::hwpunit16_from_json(props_json, "separatorMarginBottom") {
+                shape.note_spacing = v.max(0);
+            }
+            if let Some(v) = Self::hwpunit16_from_json(props_json, "noteSpacing") {
+                shape.raw_unknown = v.max(0) as u16;
+            }
+            if let Some(v) = crate::document_core::helpers::json_u8(props_json, "separatorLineType")
+            {
+                shape.separator_line_type = v;
+            }
+            if let Some(v) =
+                crate::document_core::helpers::json_u8(props_json, "separatorLineWidth")
+            {
+                shape.separator_line_width = v;
+            }
+            if let Some(v) = crate::document_core::helpers::json_color(props_json, "separatorColor")
+            {
+                shape.separator_color = v;
+            }
+            if let Some(v) = crate::document_core::helpers::json_str(props_json, "numbering") {
+                shape.numbering = Self::footnote_numbering_from_str(&v, shape.numbering);
+            }
+            if let Some(v) = crate::document_core::helpers::json_str(props_json, "placement") {
+                shape.placement = Self::footnote_placement_from_str(&v, shape.placement);
+            }
+            if let Some(v) =
+                crate::document_core::helpers::json_bool(props_json, "numberCodeSuperscript")
+            {
+                shape.number_code_superscript = v;
+            }
+            if let Some(v) =
+                crate::document_core::helpers::json_bool(props_json, "printInlineAfterText")
+            {
+                shape.print_inline_after_text = v;
+            }
+            if let Some(false) =
+                crate::document_core::helpers::json_bool(props_json, "separatorEnabled")
+            {
+                shape.separator_length = 0;
+                shape.separator_line_type = 0;
+                shape.separator_line_width = 0;
+            }
+            shape.attr = Self::encode_footnote_shape_attr(shape);
+            let start_number = shape.start_number.max(1);
+            let number_format_code = Self::footnote_shape_number_format_code(shape.number_format);
+            let prefix_char = shape.prefix_char;
+            let suffix_char = shape.suffix_char;
+            let mut next_number = start_number;
+            Self::renumber_paragraph_endnotes_with_shape(
+                &mut section.paragraphs,
+                &mut next_number,
+                number_format_code,
+                prefix_char,
+                suffix_char,
+            );
+            section.raw_stream = None;
         }
-        if let Some(v) = crate::document_core::helpers::json_str(props_json, "userChar") {
-            shape.user_char = Self::first_char_or_nul(&v);
-        }
-        if let Some(v) = crate::document_core::helpers::json_str(props_json, "prefixChar") {
-            shape.prefix_char = Self::first_char_or_nul(&v);
-        }
-        if let Some(v) = crate::document_core::helpers::json_str(props_json, "suffixChar") {
-            shape.suffix_char = Self::first_char_or_nul(&v);
-        }
-        if let Some(v) = crate::document_core::helpers::json_u16(props_json, "startNumber") {
-            shape.start_number = v.max(1);
-        }
-        if let Some(v) = Self::hwpunit16_from_json(props_json, "separatorLength") {
-            shape.separator_length = i32::from(v.max(0));
-        }
-        if let Some(v) = Self::hwpunit16_from_json(props_json, "separatorMarginTop") {
-            let above = v.max(0);
-            // HWP5 저장본은 구분선 위 값을 fallback 슬롯에 보관하는 경우가 있어 함께 갱신한다.
-            shape.separator_margin_top = above;
-            shape.separator_margin_bottom = above;
-        }
-        if let Some(v) = Self::hwpunit16_from_json(props_json, "separatorMarginBottom") {
-            shape.note_spacing = v.max(0);
-        }
-        if let Some(v) = Self::hwpunit16_from_json(props_json, "noteSpacing") {
-            shape.raw_unknown = v.max(0) as u16;
-        }
-        if let Some(v) = crate::document_core::helpers::json_u8(props_json, "separatorLineType") {
-            shape.separator_line_type = v;
-        }
-        if let Some(v) = crate::document_core::helpers::json_u8(props_json, "separatorLineWidth") {
-            shape.separator_line_width = v;
-        }
-        if let Some(v) = crate::document_core::helpers::json_color(props_json, "separatorColor") {
-            shape.separator_color = v;
-        }
-        if let Some(v) = crate::document_core::helpers::json_str(props_json, "numbering") {
-            shape.numbering = Self::footnote_numbering_from_str(&v, shape.numbering);
-        }
-        if let Some(v) = crate::document_core::helpers::json_str(props_json, "placement") {
-            shape.placement = Self::footnote_placement_from_str(&v, shape.placement);
-        }
-        if let Some(v) =
-            crate::document_core::helpers::json_bool(props_json, "numberCodeSuperscript")
-        {
-            shape.number_code_superscript = v;
-        }
-        if let Some(v) =
-            crate::document_core::helpers::json_bool(props_json, "printInlineAfterText")
-        {
-            shape.print_inline_after_text = v;
-        }
-        if let Some(false) =
-            crate::document_core::helpers::json_bool(props_json, "separatorEnabled")
-        {
-            shape.separator_length = 0;
-            shape.separator_line_type = 0;
-            shape.separator_line_width = 0;
-        }
-        shape.attr = Self::encode_footnote_shape_attr(shape);
-        let start_number = shape.start_number.max(1);
-        let number_format_code = Self::footnote_shape_number_format_code(shape.number_format);
-        let prefix_char = shape.prefix_char;
-        let suffix_char = shape.suffix_char;
-        let mut next_number = start_number;
-        Self::renumber_paragraph_endnotes_with_shape(
-            &mut section.paragraphs,
-            &mut next_number,
-            number_format_code,
-            prefix_char,
-            suffix_char,
-        );
-        section.raw_stream = None;
+        self.sync_section_def_controls_from_section(section_idx);
 
         self.recompose_section(section_idx);
         self.paginate_if_needed();
@@ -2676,6 +2757,7 @@ mod resize_clamp_tests {
             },
             paragraphs: vec![Paragraph::default()],
             raw_stream: None,
+            raw_provenance: None,
         });
         let mut core = DocumentCore::new_empty();
         // set_document이 composed/styles/pagination 벡터를 일관되게 초기화한다.

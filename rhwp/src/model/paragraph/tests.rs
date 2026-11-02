@@ -288,6 +288,78 @@ fn test_delete_text_char_shapes_shift() {
 }
 
 #[test]
+fn test_delete_text_preserves_right_char_shape_at_collapsed_boundary() {
+    let mut para = Paragraph {
+        text: "ABCDEFGH".to_string(),
+        char_count: 8,
+        char_offsets: (0..8).collect(),
+        char_shapes: vec![
+            CharShapeRef {
+                start_pos: 0,
+                char_shape_id: 10,
+            },
+            CharShapeRef {
+                start_pos: 2,
+                char_shape_id: 99,
+            },
+            CharShapeRef {
+                start_pos: 5,
+                char_shape_id: 20,
+            },
+        ],
+        ..Default::default()
+    };
+
+    // 가운데의 별도 서식 런("CDE")을 지우면 오른쪽 원문("FGH")의 서식이
+    // 삭제 경계로 이동해 보존되어야 한다.
+    assert_eq!(para.delete_text_at(2, 3), 3);
+    assert_eq!(para.text, "ABFGH");
+    assert_eq!(para.char_shape_id_at(1), Some(10));
+    assert_eq!(para.char_shape_id_at(2), Some(20));
+    assert_eq!(para.char_shape_id_at(4), Some(20));
+    let refs: Vec<_> = para
+        .char_shapes
+        .iter()
+        .map(|shape| (shape.start_pos, shape.char_shape_id))
+        .collect();
+    assert_eq!(refs, vec![(0, 10), (2, 20)]);
+}
+
+#[test]
+fn test_delete_text_to_end_keeps_leftmost_collapsed_char_shape() {
+    let mut para = Paragraph {
+        text: "ABCDEFGH".to_string(),
+        char_count: 8,
+        char_offsets: (0..8).collect(),
+        char_shapes: vec![
+            CharShapeRef {
+                start_pos: 0,
+                char_shape_id: 10,
+            },
+            CharShapeRef {
+                start_pos: 2,
+                char_shape_id: 99,
+            },
+            CharShapeRef {
+                start_pos: 5,
+                char_shape_id: 20,
+            },
+        ],
+        ..Default::default()
+    };
+
+    // 오른쪽 원문이 없는 끝 삭제는 기존처럼 첫 경계를 남긴다.
+    assert_eq!(para.delete_text_at(2, 6), 6);
+    assert_eq!(para.text, "AB");
+    let refs: Vec<_> = para
+        .char_shapes
+        .iter()
+        .map(|shape| (shape.start_pos, shape.char_shape_id))
+        .collect();
+    assert_eq!(refs, vec![(0, 10), (2, 99)]);
+}
+
+#[test]
 fn test_delete_text_line_segs_shift() {
     let mut para = Paragraph {
         text: "HelXXlo\nWorld".to_string(),
@@ -362,6 +434,27 @@ fn test_split_at_middle() {
     assert_eq!(new_para.char_offsets, vec![0, 1, 2]);
     assert_eq!(new_para.char_shapes[0].start_pos, 0);
     assert_eq!(new_para.char_shapes[0].char_shape_id, 1);
+
+    split_publishes_fresh_rows_without_old_suffix_or_source_positions();
+}
+
+fn split_publishes_fresh_rows_without_old_suffix_or_source_positions() {
+    let mut para = Paragraph {
+        text: "abcd".to_string(),
+        char_count: 5,
+        char_offsets: vec![0, 1, 2, 3],
+        line_segs: vec![LineSeg::default(), LineSeg::default()],
+        layout_only_fill_lines: 1,
+        source_line_seg_vertical_pos: Some(vec![10, 20]),
+        ..Default::default()
+    };
+
+    let new_para = para.split_at(2);
+    assert_eq!(para.line_segs.len(), 1);
+    assert_eq!(para.serializable_line_segs().len(), 1);
+    assert_eq!(para.layout_only_fill_lines, 0);
+    assert!(para.source_line_seg_vertical_pos.is_none());
+    assert_eq!(new_para.serializable_line_segs().len(), 1);
 }
 
 #[test]
@@ -512,6 +605,32 @@ fn test_merge_from_basic() {
     assert_eq!(merge_pos, 2); // 원래 "안녕"의 길이
     assert_eq!(para1.text, "안녕하세요");
     assert_eq!(para1.char_offsets, vec![0, 1, 2, 3, 4]);
+
+    merge_publishes_fresh_rows_without_old_suffix_or_source_positions();
+}
+
+fn merge_publishes_fresh_rows_without_old_suffix_or_source_positions() {
+    let mut first = Paragraph {
+        text: "ab".to_string(),
+        char_count: 3,
+        char_offsets: vec![0, 1],
+        line_segs: vec![LineSeg::default(), LineSeg::default()],
+        layout_only_fill_lines: 1,
+        source_line_seg_vertical_pos: Some(vec![10, 20]),
+        ..Default::default()
+    };
+    let second = Paragraph {
+        text: "cd".to_string(),
+        char_count: 3,
+        char_offsets: vec![0, 1],
+        ..Default::default()
+    };
+
+    first.merge_from(&second);
+    assert_eq!(first.line_segs.len(), 1);
+    assert_eq!(first.serializable_line_segs().len(), 1);
+    assert_eq!(first.layout_only_fill_lines, 0);
+    assert!(first.source_line_seg_vertical_pos.is_none());
 }
 
 #[test]
@@ -1276,6 +1395,24 @@ fn test_control_text_positions_gap_between_chars() {
 }
 
 #[test]
+fn test_control_utf16_positions_reconstructs_a_shared_control_gap() {
+    // Two controls share the visible-text boundary before B. The raw stream
+    // has their distinct 8-unit control slots at 1 and 9 before B at 17.
+    let para = Paragraph {
+        text: "AB".to_string(),
+        char_offsets: vec![0, 17],
+        controls: vec![
+            Control::Table(Box::<Table>::default()),
+            Control::Table(Box::<Table>::default()),
+        ],
+        ..Default::default()
+    };
+
+    assert_eq!(para.control_text_positions(), vec![1, 1]);
+    assert_eq!(para.control_utf16_positions(), vec![1, 9]);
+}
+
+#[test]
 fn test_control_text_positions_gap_before() {
     // text = "A", char_offsets = [8] → 'A' 앞에 8 unit 갭 = inline ctrl 1개
     let para = Paragraph {
@@ -1398,4 +1535,66 @@ fn test_utf16_pos_to_char_idx_surrogate_pair_midpoint() {
     assert_eq!(para.utf16_pos_to_char_idx(1), 1);
     assert_eq!(para.utf16_pos_to_char_idx(2), 1);
     assert_eq!(para.utf16_pos_to_char_idx(3), 2); // beyond end
+}
+
+#[test]
+fn shift_for_inline_control_insert_moves_line_starts_too() {
+    // [#4347] 줄 시작(`text_start`)도 char_offsets 와 같은 UTF-16 좌표계다. 함께 밀지 않으면
+    // 저장된 줄 나눔만 8 만큼 어긋난 채 남고, 그 문단을 다시 조판하는 순간 값이 튄다 —
+    // 원인이 삽입이 아닌 곳(그림 배치 토글)에서 찾아진다.
+    let mut para = Paragraph {
+        text: "0123456789".to_string(),
+        char_offsets: (0..10).collect(),
+        char_count: 10,
+        line_segs: vec![
+            LineSeg {
+                text_start: 0,
+                ..Default::default()
+            },
+            LineSeg {
+                text_start: 4,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    para.shift_for_inline_control_insert(0, 0);
+
+    // 첫 줄은 문단 시작에 고정한다 — 넣은 컨트롤이 그 줄에 든다.
+    assert_eq!(para.line_segs[0].text_start, 0);
+    // 뒤 줄은 char_offsets 와 같은 만큼 밀린다.
+    assert_eq!(para.line_segs[1].text_start, 12);
+    assert_eq!(para.char_offsets[4], 12);
+}
+
+#[test]
+fn shift_for_inline_control_insert_leaves_earlier_lines_alone() {
+    // 삽입 지점 **앞** 줄은 그대로다. 뒤 줄만 밀린다.
+    let mut para = Paragraph {
+        text: "0123456789".to_string(),
+        char_offsets: (0..10).collect(),
+        char_count: 10,
+        line_segs: vec![
+            LineSeg {
+                text_start: 0,
+                ..Default::default()
+            },
+            LineSeg {
+                text_start: 4,
+                ..Default::default()
+            },
+            LineSeg {
+                text_start: 8,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    para.shift_for_inline_control_insert(0, 6);
+
+    assert_eq!(para.line_segs[0].text_start, 0);
+    assert_eq!(para.line_segs[1].text_start, 4);
+    assert_eq!(para.line_segs[2].text_start, 16);
 }

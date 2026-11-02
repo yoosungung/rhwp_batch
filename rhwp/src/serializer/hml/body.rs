@@ -1,12 +1,12 @@
 use crate::model::control::{Control, Equation};
 use crate::model::document::{Document, Section};
-use crate::model::page::PageDef;
+use crate::model::page::{ColumnDef, ColumnDirection, ColumnType, PageDef};
 use crate::model::paragraph::{ColumnBreakType, Paragraph};
 use crate::model::shape::{
     CommonObjAttr, HorzAlign, HorzRelTo, RectangleShape, ShapeObject, TextWrap, VertAlign,
     VertRelTo,
 };
-use crate::model::table::{Cell, Table};
+use crate::model::table::{Cell, Table, VerticalAlign};
 use crate::parser::HmlImportMetadata;
 
 use super::error::{unsupported_ir, HmlExportError};
@@ -249,6 +249,7 @@ fn write_control_run(
         Control::Equation(equation) => write_equation(writer, equation),
         Control::Table(table) => write_table(writer, table, path),
         Control::Shape(shape) => write_shape(writer, shape, path),
+        Control::ColumnDef(column_def) => write_column_def(writer, column_def),
         _ => Err(unsupported_ir(
             path,
             "HML reader가 매핑하지 않는 컨트롤입니다",
@@ -274,6 +275,43 @@ fn write_equation(writer: &mut XmlWriter, equation: &Equation) -> Result<(), Hml
     writer.close("SCRIPT");
     writer.close("EQUATION");
     Ok(())
+}
+
+/// [#4386] `Control::ColumnDef` → `COLDEF`. reader.rs의 `capture_col_def`가 읽는
+/// `Count`/`Layout`/`SameGap`/`SameSize`/`Type` 다섯 속성만 왕복한다(HML 실물에서 관찰된
+/// 전부). `widths`/`gaps`/`separator_*`/`raw_attr`는 `validate_column_def`(preflight)가
+/// 기본값이 아니면 미리 export를 막으므로 여기서는 항상 무시해도 안전하다.
+fn write_column_def(writer: &mut XmlWriter, column_def: &ColumnDef) -> Result<(), HmlExportError> {
+    writer.empty(
+        "COLDEF",
+        &[
+            ("Count", column_def.column_count.to_string()),
+            (
+                "Layout",
+                column_direction_name(column_def.direction).to_string(),
+            ),
+            ("SameGap", column_def.spacing.to_string()),
+            ("SameSize", column_def.same_width.to_string()),
+            ("Type", column_type_name(column_def.column_type).to_string()),
+        ],
+    );
+    Ok(())
+}
+
+fn column_type_name(column_type: ColumnType) -> &'static str {
+    match column_type {
+        ColumnType::Normal => "Newspaper",
+        ColumnType::Distribute => "Distribute",
+        ColumnType::Parallel => "Parallel",
+    }
+}
+
+fn column_direction_name(direction: ColumnDirection) -> &'static str {
+    match direction {
+        ColumnDirection::LeftToRight => "Left",
+        ColumnDirection::RightToLeft => "Right",
+        ColumnDirection::Mirror => "Mirror",
+    }
 }
 
 fn write_shape(
@@ -466,7 +504,15 @@ fn write_cell(writer: &mut XmlWriter, cell: &Cell, path: &str) -> Result<(), Hml
             cell.padding.bottom,
         ),
     );
-    writer.open("PARALIST", &[]);
+    // [#3189] 종전엔 속성 없이 방출해 셀 세로 정렬이 저장 때마다 사라졌다.
+    // 한컴 실물 HML 도 CELL/PARALIST 에 VertAlign 을 적어 넣는다.
+    writer.open(
+        "PARALIST",
+        &[(
+            "VertAlign",
+            cell_vert_align_name(cell.vertical_align).to_string(),
+        )],
+    );
     for (index, paragraph) in cell.paragraphs.iter().enumerate() {
         write_paragraph(writer, paragraph, None, &format!("{path}/P[{index}]"))?;
     }
@@ -533,6 +579,16 @@ fn vert_align_name(value: VertAlign) -> &'static str {
         VertAlign::Inside => "Inside",
         VertAlign::Outside => "Outside",
         VertAlign::Top => "Top",
+    }
+}
+
+/// [#3189] 셀 세로 정렬 이름. 개체 위치용 `vert_align_name`(VertAlign) 과 달리
+/// 표 셀은 Top/Center/Bottom 세 값뿐이다.
+fn cell_vert_align_name(value: VerticalAlign) -> &'static str {
+    match value {
+        VerticalAlign::Top => "Top",
+        VerticalAlign::Center => "Center",
+        VerticalAlign::Bottom => "Bottom",
     }
 }
 

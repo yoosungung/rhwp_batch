@@ -1,8 +1,8 @@
 //! 내부 클립보드 + HTML 내보내기 관련 native 메서드
 
 use super::super::helpers::{
-    border_line_type_to_u8_val, clipboard_color_to_css, clipboard_escape_html, color_ref_to_css,
-    detect_clipboard_image_mime, get_textbox_from_shape, get_textbox_from_shape_mut,
+    clipboard_color_to_css, clipboard_escape_html, detect_clipboard_image_mime,
+    get_textbox_from_shape, logical_paragraph_length, logical_to_text_offset,
     utf16_pos_to_char_idx,
 };
 use super::super::queries::field_query::rebuild_char_offsets;
@@ -15,6 +15,75 @@ use crate::model::paragraph::{FieldRange, LineSeg, Paragraph};
 /// [Task #1161] 떠 있는 개체 반복 붙여넣기 cascade 1 회당 위치 오프셋(HWPUNIT).
 /// 약 2mm (1mm = 7200/25.4 ≈ 283.46 HWPUNIT). 한컴 정합은 작업지시자 시각 대조로 미세조정.
 const PASTE_CASCADE_STEP_HU: u32 = 567;
+
+/// [#4413] 셀 안 컨트롤을 HTML로 변환하는 재귀(표 안의 표 안의 표…)의 깊이 상한.
+/// `table_extract::MAX_NEST_DEPTH`/`explain::MAX_NEST_DEPTH`/`hidden_text::MAX_NEST_DEPTH`와
+/// 같은 값·형태 — 병적으로 깊은 중첩 문서에서 export 재귀가 스택을 태우지 않게 막는다.
+const MAX_NEST_DEPTH: usize = 8;
+
+/// [#4275] HTML 내보내기에 쓸 셀 BorderFill — `table.zones` 가 덮어쓴 유효 값.
+/// 셀 고유 `border_fill_id` 만 보면 cellzone 회색 헤더 등이 빠진다.
+fn html_cell_border_fill_id(
+    table: &crate::model::table::Table,
+    cell: &crate::model::table::Cell,
+) -> u16 {
+    table
+        .zones
+        .iter()
+        .rev()
+        .find(|zone| {
+            zone.border_fill_id > 0
+                && zone.start_row <= cell.row
+                && cell.row <= zone.end_row
+                && zone.start_col <= cell.col
+                && cell.col <= zone.end_col
+        })
+        .map(|zone| zone.border_fill_id)
+        .unwrap_or(cell.border_fill_id)
+}
+
+/// 셀 HTML 내보내기에서 지원하지 않는 컨트롤을 경고 주석에 남기기 위한 표시 이름.
+/// `Control::Table`/`Control::Picture`는 `control_to_html`이 직접 처리하므로 이 경로를
+/// 타지 않지만, 매치 순서가 바뀌어도 무해한 이름을 반환하도록 모든 변형을 다룬다.
+fn control_kind_label(control: &Control) -> &'static str {
+    match control {
+        Control::SectionDef(_) => "SectionDef",
+        Control::ColumnDef(_) => "ColumnDef",
+        Control::Table(_) => "Table",
+        Control::Shape(_) => "Shape",
+        Control::Picture(_) => "Picture",
+        Control::Header(_) => "Header",
+        Control::Footer(_) => "Footer",
+        Control::Footnote(_) => "Footnote",
+        Control::Endnote(_) => "Endnote",
+        Control::AutoNumber(_) => "AutoNumber",
+        Control::NewNumber(_) => "NewNumber",
+        Control::PageNumberPos(_) => "PageNumberPos",
+        Control::Bookmark(_) => "Bookmark",
+        Control::IndexMark(_) => "IndexMark",
+        Control::PageNumCtrl(_) => "PageNumCtrl",
+        Control::Hyperlink(_) => "Hyperlink",
+        Control::Ruby(_) => "Ruby",
+        Control::CharOverlap(_) => "CharOverlap",
+        Control::PageHide(_) => "PageHide",
+        Control::HiddenComment(_) => "HiddenComment",
+        Control::Equation(_) => "Equation",
+        Control::Field(_) => "Field",
+        Control::Form(_) => "Form",
+        Control::Unknown(_) => "Unknown",
+    }
+}
+
+/// [#2550] 압축 해제 상한 초과 항목(deflate bomb 포함)에 대한 공통 오류.
+///
+/// 범위 초과(`범위 초과`)와 같은 `RenderError` 계열이라 호출부 처리 경로가 같다.
+fn bin_data_over_limit_error(bin_data_id: u16) -> HwpError {
+    HwpError::RenderError(format!(
+        "바이너리 데이터 {} 압축 해제 상한 {}MB 초과",
+        bin_data_id,
+        crate::model::bin_data::MAX_BIN_DATA_BYTES / (1024 * 1024)
+    ))
+}
 
 fn clipboard_paragraphs_contain_field(paragraphs: &[Paragraph]) -> bool {
     paragraphs.iter().any(|para| !para.field_ranges.is_empty())
@@ -37,7 +106,8 @@ fn clipboard_control_char_code(ctrl: &Control) -> u16 {
         Control::Footnote(_) | Control::Endnote(_) => 0x0011,
         Control::AutoNumber(_) | Control::NewNumber(_) => 0x0012,
         Control::PageNumberPos(_) | Control::PageHide(_) => 0x0015,
-        Control::Bookmark(_) => 0x0016,
+        Control::Bookmark(_) | Control::IndexMark(_) => 0x0016,
+        Control::PageNumCtrl(_) => 0x0015,
         Control::CharOverlap(_) => 0x0017,
     }
 }
@@ -59,7 +129,16 @@ fn recompute_clipboard_control_mask(para: &Paragraph) -> u32 {
     mask
 }
 
-fn strip_structural_controls_for_text_clipboard(para: &mut Paragraph) {
+pub(super) fn strip_structural_controls_for_text_clipboard(para: &mut Paragraph) {
+    // [#4149] clip 사본이지만 다중 문단 붙여넣기에서 중간 문단이 통째로 문서에
+    // 스플라이스되어 렌더 입력이 될 수 있다 — 컨트롤 제거로 compose 입력이
+    // 바뀌므로 단일줄 과밀 memo 를 무효화한다.
+    para.invalidate_layout_inputs();
+    let leading_defs = para
+        .controls
+        .iter()
+        .take_while(|c| matches!(c, Control::SectionDef(_) | Control::ColumnDef(_)))
+        .count();
     let old_controls = std::mem::take(&mut para.controls);
     let old_records = std::mem::take(&mut para.ctrl_data_records);
     let mut index_map = vec![None; old_controls.len()];
@@ -86,13 +165,20 @@ fn strip_structural_controls_for_text_clipboard(para: &mut Paragraph) {
         .collect();
     para.controls = new_controls;
     para.ctrl_data_records = new_records;
+    // 구역 첫 문단을 0 부터 복사하면 secd/cold 의 선행 자리(16)가 char_offsets 에 남는다.
+    para.release_leading_extended_control_slots(leading_defs);
     para.control_mask = recompute_clipboard_control_mask(para);
     if !para.field_ranges.is_empty() {
         rebuild_char_offsets(para);
     }
 }
 
-fn text_to_split_logical_offset(para: &Paragraph, text_offset: usize) -> usize {
+/// `after_control` 이면 `text_offset` 자리에 놓인 개체 뒤를 가리킨다.
+fn text_to_split_logical_offset(
+    para: &Paragraph,
+    text_offset: usize,
+    after_control: bool,
+) -> usize {
     let control_positions = para.control_text_positions();
     if control_positions.is_empty() {
         return text_offset;
@@ -107,26 +193,43 @@ fn text_to_split_logical_offset(para: &Paragraph, text_offset: usize) -> usize {
         .enumerate()
         .filter(|(_, ctrl)| Paragraph::is_split_movable_control(ctrl))
         .filter_map(|(ci, _)| control_positions.get(ci))
-        .filter(|&&pos| pos < text_offset)
+        .filter(|&&pos| pos < text_offset || (after_control && pos == text_offset))
         .count();
     text_offset + before_count
 }
 
-fn clip_paragraph_text_range_for_clipboard(
+pub(super) fn clip_paragraph_text_range_for_clipboard(
     source: &Paragraph,
     start_char_offset: usize,
     end_char_offset: usize,
+) -> Paragraph {
+    // 글자 위치 경계는 시작 자리의 개체를 담고, 끝이 문단 끝이면 뒤에 붙은 개체도 담는다.
+    let end_after_control = end_char_offset >= source.text.chars().count();
+    clip_paragraph_caret_range_for_clipboard(
+        source,
+        (start_char_offset, false),
+        (end_char_offset, end_after_control),
+    )
+}
+
+/// [#7444] 캐럿 경계 `(글자 위치, 그 자리 개체 뒤인가)` 로 문단을 자른다.
+/// 시작이 개체 뒤면 그 개체를 빼고, 끝이 개체 뒤면 그 개체를 담는다.
+fn clip_paragraph_caret_range_for_clipboard(
+    source: &Paragraph,
+    (start_char_offset, start_after_control): (usize, bool),
+    (end_char_offset, end_after_control): (usize, bool),
 ) -> Paragraph {
     let text_len = source.text.chars().count();
     let start = start_char_offset.min(text_len);
     let end = end_char_offset.min(text_len).max(start);
 
     let mut clipped = source.clone();
-    if end < text_len {
-        let end_logical = text_to_split_logical_offset(&clipped, end);
+    let end_logical = text_to_split_logical_offset(&clipped, end, end_after_control);
+    // 문단 끝 개체까지 담는 끝이면 자를 것이 없다.
+    if end_logical < text_to_split_logical_offset(&clipped, text_len, true) {
         let _ = clipped.split_at(end_logical);
     }
-    if start == 0 {
+    if start == 0 && !start_after_control {
         return clipped;
     }
 
@@ -135,7 +238,7 @@ fn clip_paragraph_text_range_for_clipboard(
     let old_records = clipped.ctrl_data_records.clone();
     let old_ranges = clipped.field_ranges.clone();
 
-    let start_logical = text_to_split_logical_offset(&clipped, start);
+    let start_logical = text_to_split_logical_offset(&clipped, start, start_after_control);
     let mut suffix = clipped.split_at(start_logical);
     let mut keep_control = vec![false; old_controls.len()];
 
@@ -156,7 +259,8 @@ fn clip_paragraph_text_range_for_clipboard(
             continue;
         }
         let pos = control_positions.get(idx).copied().unwrap_or(text_len);
-        if pos >= start && pos <= end {
+        let after_start = pos > start || (pos == start && !start_after_control);
+        if after_start && pos <= end {
             keep_control[idx] = true;
         }
     }
@@ -197,81 +301,6 @@ fn clip_paragraph_text_range_for_clipboard(
     suffix
 }
 
-fn collect_max_clipboard_field_id(para: &Paragraph, max_id: &mut u32) {
-    for ctrl in &para.controls {
-        match ctrl {
-            Control::Field(field) => {
-                *max_id = (*max_id).max(field.field_id);
-            }
-            Control::Table(table) => {
-                for cell in &table.cells {
-                    for cell_para in &cell.paragraphs {
-                        collect_max_clipboard_field_id(cell_para, max_id);
-                    }
-                }
-                if let Some(caption) = &table.caption {
-                    for cap_para in &caption.paragraphs {
-                        collect_max_clipboard_field_id(cap_para, max_id);
-                    }
-                }
-            }
-            Control::Shape(shape) => {
-                if let Some(text_box) = get_textbox_from_shape(shape) {
-                    for tb_para in &text_box.paragraphs {
-                        collect_max_clipboard_field_id(tb_para, max_id);
-                    }
-                }
-            }
-            Control::Picture(pic) => {
-                if let Some(caption) = &pic.caption {
-                    for cap_para in &caption.paragraphs {
-                        collect_max_clipboard_field_id(cap_para, max_id);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn assign_new_clipboard_field_ids(para: &mut Paragraph, next_id: &mut u32) {
-    for ctrl in &mut para.controls {
-        match ctrl {
-            Control::Field(field) => {
-                field.field_id = (*next_id).max(1);
-                *next_id = next_id.saturating_add(1).max(1);
-            }
-            Control::Table(table) => {
-                for cell in &mut table.cells {
-                    for cell_para in &mut cell.paragraphs {
-                        assign_new_clipboard_field_ids(cell_para, next_id);
-                    }
-                }
-                if let Some(caption) = &mut table.caption {
-                    for cap_para in &mut caption.paragraphs {
-                        assign_new_clipboard_field_ids(cap_para, next_id);
-                    }
-                }
-            }
-            Control::Shape(shape) => {
-                if let Some(text_box) = get_textbox_from_shape_mut(shape) {
-                    for tb_para in &mut text_box.paragraphs {
-                        assign_new_clipboard_field_ids(tb_para, next_id);
-                    }
-                }
-            }
-            Control::Picture(pic) => {
-                if let Some(caption) = &mut pic.caption {
-                    for cap_para in &mut caption.paragraphs {
-                        assign_new_clipboard_field_ids(cap_para, next_id);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 impl DocumentCore {
     pub fn has_internal_clipboard_native(&self) -> bool {
         self.clipboard.is_some()
@@ -290,19 +319,6 @@ impl DocumentCore {
         self.clipboard = None;
     }
 
-    fn renumber_pasted_field_ids(&self, clip_paras: &mut [Paragraph]) {
-        let mut max_id = 0u32;
-        for section in &self.document.sections {
-            for para in &section.paragraphs {
-                collect_max_clipboard_field_id(para, &mut max_id);
-            }
-        }
-        let mut next_id = max_id.saturating_add(1).max(1);
-        for para in clip_paras {
-            assign_new_clipboard_field_ids(para, &mut next_id);
-        }
-    }
-
     /// 선택 영역을 내부 클립보드에 복사한다.
     ///
     /// 같은 구역 내 start ~ end 범위의 문단을 클립보드에 저장.
@@ -314,6 +330,61 @@ impl DocumentCore {
         start_char_offset: usize,
         end_para_idx: usize,
         end_char_offset: usize,
+    ) -> Result<String, HwpError> {
+        // 글자 위치 경계는 끝이 문단 끝이면 뒤에 붙은 개체도 담는다.
+        let end_after_control = self
+            .document
+            .sections
+            .get(section_idx)
+            .and_then(|section| section.paragraphs.get(end_para_idx))
+            .is_some_and(|para| end_char_offset >= para.text.chars().count());
+        self.copy_selection_range(
+            section_idx,
+            start_para_idx,
+            (start_char_offset, false),
+            end_para_idx,
+            (end_char_offset, end_after_control),
+        )
+    }
+
+    /// [#7444] 선택 영역을 논리 오프셋(글자와 글자처럼 취급 개체·각주·미주를 한 칸씩
+    /// 센다)으로 받아 내부 클립보드에 복사한다. 개체 바로 뒤에서 시작한 선택은 그 개체를
+    /// 담지 않고, 개체 바로 뒤에서 끝난 선택은 담는다.
+    ///
+    /// 반환값: JSON `{"ok":true,"text":"<plain_text>"}`
+    pub fn copy_selection_logical_native(
+        &mut self,
+        section_idx: usize,
+        start_para_idx: usize,
+        start_logical: usize,
+        end_para_idx: usize,
+        end_logical: usize,
+    ) -> Result<String, HwpError> {
+        let para = |para_idx: usize| {
+            self.document
+                .sections
+                .get(section_idx)
+                .and_then(|section| section.paragraphs.get(para_idx))
+        };
+        let start = para(start_para_idx).map_or((start_logical, false), |p| {
+            logical_to_text_offset(p, start_logical)
+        });
+        let mut end = para(end_para_idx).map_or((end_logical, false), |p| {
+            logical_to_text_offset(p, end_logical)
+        });
+        // 문단 논리 끝에서 끝나면 copySelection 처럼 문단 끝에 붙은 개체(글자처럼 취급하지
+        // 않는 도형·그림·표 등)도 담는다. 이 개체들은 논리 오프셋에 칸이 없다.
+        end.1 |= para(end_para_idx).is_some_and(|p| end_logical >= logical_paragraph_length(p));
+        self.copy_selection_range(section_idx, start_para_idx, start, end_para_idx, end)
+    }
+
+    fn copy_selection_range(
+        &mut self,
+        section_idx: usize,
+        start_para_idx: usize,
+        start: (usize, bool),
+        end_para_idx: usize,
+        end: (usize, bool),
     ) -> Result<String, HwpError> {
         // 인덱스 범위 검증
         if section_idx >= self.document.sections.len() {
@@ -341,19 +412,19 @@ impl DocumentCore {
 
         if start_para_idx == end_para_idx {
             // 단일 문단 내 선택
-            clip_paragraphs.push(clip_paragraph_text_range_for_clipboard(
+            clip_paragraphs.push(clip_paragraph_caret_range_for_clipboard(
                 &section.paragraphs[start_para_idx],
-                start_char_offset,
-                end_char_offset,
+                start,
+                end,
             ));
         } else {
             // 다중 문단 선택
             // 첫 번째 문단: start_offset부터 끝까지
             let first_text_len = section.paragraphs[start_para_idx].text.chars().count();
-            clip_paragraphs.push(clip_paragraph_text_range_for_clipboard(
+            clip_paragraphs.push(clip_paragraph_caret_range_for_clipboard(
                 &section.paragraphs[start_para_idx],
-                start_char_offset,
-                first_text_len,
+                start,
+                (first_text_len, true),
             ));
 
             // 중간 문단: 전체 복사
@@ -362,10 +433,10 @@ impl DocumentCore {
             }
 
             // 마지막 문단: 처음부터 end_offset까지
-            clip_paragraphs.push(clip_paragraph_text_range_for_clipboard(
+            clip_paragraphs.push(clip_paragraph_caret_range_for_clipboard(
                 &section.paragraphs[end_para_idx],
-                0,
-                end_char_offset,
+                (0, false),
+                end,
             ));
         }
 
@@ -386,6 +457,7 @@ impl DocumentCore {
         self.clipboard = Some(ClipboardData {
             paragraphs: clip_paragraphs,
             plain_text: plain_text.clone(),
+            copied_table_text_reflowed: false,
         });
 
         Ok(super::super::helpers::json_ok_with(&format!(
@@ -476,6 +548,66 @@ impl DocumentCore {
         self.clipboard = Some(ClipboardData {
             paragraphs: clip_paragraphs,
             plain_text: plain_text.clone(),
+            copied_table_text_reflowed: false,
+        });
+
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"text\":\"{}\"",
+            escaped
+        )))
+    }
+
+    /// 전체 cellPath가 가리키는 중첩 셀의 선택 영역을 내부 클립보드에 복사한다(#4272).
+    pub fn copy_selection_in_cell_by_path_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+        start_cell_para_idx: usize,
+        start_char_offset: usize,
+        end_cell_para_idx: usize,
+        end_char_offset: usize,
+    ) -> Result<String, HwpError> {
+        if path.is_empty() {
+            return Err(HwpError::RenderError("경로가 비어있습니다".to_string()));
+        }
+        if start_cell_para_idx > end_cell_para_idx {
+            return Err(HwpError::RenderError(
+                "시작 위치가 끝 위치보다 뒤에 있음".to_string(),
+            ));
+        }
+
+        let mut clip_paragraphs = Vec::new();
+        for cell_para_idx in start_cell_para_idx..=end_cell_para_idx {
+            let mut para_path = path.to_vec();
+            para_path.last_mut().unwrap().2 = cell_para_idx;
+            let para = self.resolve_paragraph_by_path(section_idx, parent_para_idx, &para_path)?;
+            let start = if cell_para_idx == start_cell_para_idx {
+                start_char_offset
+            } else {
+                0
+            };
+            let end = if cell_para_idx == end_cell_para_idx {
+                end_char_offset
+            } else {
+                para.text.chars().count()
+            };
+            clip_paragraphs.push(clip_paragraph_text_range_for_clipboard(para, start, end));
+        }
+
+        for para in &mut clip_paragraphs {
+            strip_structural_controls_for_text_clipboard(para);
+        }
+        let plain_text = clip_paragraphs
+            .iter()
+            .map(|para| para.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let escaped = super::super::helpers::json_escape(&plain_text);
+        self.clipboard = Some(ClipboardData {
+            paragraphs: clip_paragraphs,
+            plain_text,
+            copied_table_text_reflowed: false,
         });
 
         Ok(super::super::helpers::json_ok_with(&format!(
@@ -492,6 +624,8 @@ impl DocumentCore {
         cell_path: &[(usize, usize, usize)],
         control_idx: usize,
     ) -> Result<String, HwpError> {
+        let copied_table_text_reflowed = cell_path.is_empty()
+            && self.table_text_reflowed_path_exists(section_idx, para_idx, control_idx);
         // [Task #1161] cell_path 가 비면 본문, 아니면 셀/글상자 안 문단.
         let para = self.resolve_control_para(section_idx, para_idx, cell_path)?;
         let control = para
@@ -575,6 +709,7 @@ impl DocumentCore {
         self.clipboard = Some(ClipboardData {
             paragraphs: vec![clip_para],
             plain_text: plain_text.clone(),
+            copied_table_text_reflowed,
         });
         // [Task #1161] 새 컨트롤 복사 → cascade 리셋(다음 첫 붙여넣기부터 누적 시작).
         self.paste_cascade_count = 0;
@@ -612,8 +747,8 @@ impl DocumentCore {
             )));
         }
 
+        super::clone_identity::reidentify_clipboard(&self.document, &mut clip_paras)?;
         self.document.sections[section_idx].raw_stream = None;
-        self.renumber_pasted_field_ids(&mut clip_paras);
 
         let clip_count = clip_paras.len();
 
@@ -804,14 +939,13 @@ impl DocumentCore {
             _ => return Ok("{\"ok\":false,\"error\":\"clipboard empty\"}".to_string()),
         };
         let contains_field = clipboard_paragraphs_contain_field(&clip_paras);
-        self.renumber_pasted_field_ids(&mut clip_paras);
+        super::clone_identity::reidentify_clipboard(&self.document, &mut clip_paras)?;
 
         let (last_para_idx, merge_point) = {
             let section =
                 self.document.sections.get_mut(section_idx).ok_or_else(|| {
                     HwpError::RenderError(format!("구역 {} 범위 초과", section_idx))
                 })?;
-            section.raw_stream = None;
             let para = section.paragraphs.get_mut(parent_para_idx).ok_or_else(|| {
                 HwpError::RenderError(format!("문단 {} 범위 초과", parent_para_idx))
             })?;
@@ -851,15 +985,8 @@ impl DocumentCore {
         for i in cell_para_idx..=last_para_idx {
             self.reflow_cell_paragraph(section_idx, parent_para_idx, control_idx, cell_idx, i);
         }
-        match self.document.sections[section_idx].paragraphs[parent_para_idx]
-            .controls
-            .get_mut(control_idx)
-        {
-            Some(Control::Table(t)) => {
-                t.dirty = true;
-            }
-            _ => {}
-        }
+        self.mark_cell_control_dirty(section_idx, parent_para_idx, control_idx);
+        self.document.sections[section_idx].raw_stream = None;
         self.mark_section_dirty(section_idx);
         self.paginate_if_needed();
 
@@ -886,10 +1013,10 @@ impl DocumentCore {
             _ => return Ok("{\"ok\":false,\"error\":\"clipboard empty\"}".to_string()),
         };
         let contains_field = clipboard_paragraphs_contain_field(&clip_paras);
-        self.renumber_pasted_field_ids(&mut clip_paras);
         if path.is_empty() {
             return Err(HwpError::RenderError("경로가 비어있습니다".to_string()));
         }
+        super::clone_identity::reidentify_clipboard(&self.document, &mut clip_paras)?;
 
         let cell_para_idx = path[path.len() - 1].2;
         let (last_para_idx, merge_point) = {
@@ -1018,6 +1145,10 @@ impl DocumentCore {
         para_idx: usize,
         char_offset: usize,
     ) -> Result<String, HwpError> {
+        let inherit_table_text_reflow = self
+            .clipboard
+            .as_ref()
+            .is_some_and(|clipboard| clipboard.copied_table_text_reflowed);
         // 클립보드에서 컨트롤 문단 확인
         let mut clip_para = match &self.clipboard {
             Some(c) => match c.paragraphs.first() {
@@ -1026,6 +1157,24 @@ impl DocumentCore {
             },
             None => return Ok("{\"ok\":false,\"error\":\"clipboard empty\"}".to_string()),
         };
+
+        // Validate before touching either the document or cascade state.
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 {} 범위 초과",
+                section_idx
+            )));
+        }
+        if para_idx >= self.document.sections[section_idx].paragraphs.len() {
+            return Err(HwpError::RenderError(format!(
+                "문단 {} 범위 초과",
+                para_idx
+            )));
+        }
+        super::clone_identity::reidentify_clipboard(
+            &self.document,
+            std::slice::from_mut(&mut clip_para),
+        )?;
 
         // [Task #1161] 떠 있는 개체(treat_as_char=false) 반복 붙여넣기 시 한컴처럼
         // cascade 오프셋을 누적해 동일 위치 겹침을 방지한다. inline(글자처럼 취급)은
@@ -1043,20 +1192,6 @@ impl DocumentCore {
                 common.horizontal_offset = common.horizontal_offset.saturating_add(off);
                 self.paste_cascade_count = cascade;
             }
-        }
-
-        // 인덱스 검증
-        if section_idx >= self.document.sections.len() {
-            return Err(HwpError::RenderError(format!(
-                "구역 {} 범위 초과",
-                section_idx
-            )));
-        }
-        if para_idx >= self.document.sections[section_idx].paragraphs.len() {
-            return Err(HwpError::RenderError(format!(
-                "문단 {} 범위 초과",
-                para_idx
-            )));
         }
 
         self.document.sections[section_idx].raw_stream = None;
@@ -1104,6 +1239,10 @@ impl DocumentCore {
                     .insert(para_idx + 1, clip_para);
                 insert_para_idx = para_idx + 1;
             }
+        }
+
+        if inherit_table_text_reflow {
+            self.mark_table_text_reflowed_after_edit(section_idx, insert_para_idx, 0)?;
         }
 
         // 삽입된 문단의 line_segs 보정: 컨트롤 치수 반영
@@ -1290,9 +1429,49 @@ impl DocumentCore {
             } else {
                 None
             };
-            html.push_str(&self.paragraph_to_html(cpara, start, end));
+            // [#4413] 이 셀은 본문 직속(depth 0) 표의 셀이므로 그 안 문단에
+            // 붙은 컨트롤(중첩 표·그림 등)은 depth 1부터 검사한다.
+            html.push_str(&self.cell_paragraph_to_html(cpara, start, end, 1));
         }
 
+        html.push_str("<!--EndFragment-->\n</body></html>");
+        Ok(html)
+    }
+
+    /// 전체 cellPath가 가리키는 중첩 셀의 선택 영역을 HTML로 변환한다(#4272).
+    pub fn export_selection_in_cell_html_by_path_native(
+        &self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+        start_cell_para_idx: usize,
+        start_char_offset: usize,
+        end_cell_para_idx: usize,
+        end_char_offset: usize,
+    ) -> Result<String, HwpError> {
+        if path.is_empty() {
+            return Err(HwpError::RenderError("경로가 비어있습니다".to_string()));
+        }
+        if start_cell_para_idx > end_cell_para_idx {
+            return Err(HwpError::RenderError(
+                "시작 위치가 끝 위치보다 뒤에 있음".to_string(),
+            ));
+        }
+
+        let mut html = String::from("<html><body>\n<!--StartFragment-->\n");
+        // [#4413] path 의 각 항목이 표 중첩 한 단계이므로, 그 안 문단의
+        // 컨트롤은 path.len() 깊이(= 이 셀 자체가 이미 path.len()번 중첩된
+        // 지점)에서부터 검사한다. cell_path 가 1개면 depth 1부터 시작하는
+        // `export_selection_in_cell_html_native`와 같은 규칙이다.
+        let control_depth = path.len();
+        for cell_para_idx in start_cell_para_idx..=end_cell_para_idx {
+            let mut para_path = path.to_vec();
+            para_path.last_mut().unwrap().2 = cell_para_idx;
+            let para = self.resolve_paragraph_by_path(section_idx, parent_para_idx, &para_path)?;
+            let start = (cell_para_idx == start_cell_para_idx).then_some(start_char_offset);
+            let end = (cell_para_idx == end_cell_para_idx).then_some(end_char_offset);
+            html.push_str(&self.cell_paragraph_to_html(para, start, end, control_depth));
+        }
         html.push_str("<!--EndFragment-->\n</body></html>");
         Ok(html)
     }
@@ -1313,7 +1492,9 @@ impl DocumentCore {
             .ok_or_else(|| HwpError::RenderError(format!("컨트롤 {} 범위 초과", control_idx)))?;
 
         let mut html = String::from("<html><body>\n<!--StartFragment-->\n");
-        html.push_str(&self.control_to_html(control));
+        // 직접 선택해 내보내는 컨트롤은 문서 안 실제 중첩 위치와 무관하게 새
+        // export 루트로 취급한다 — depth 0부터 MAX_NEST_DEPTH 예산을 새로 받는다.
+        html.push_str(&self.control_to_html(control, 0));
         html.push_str("<!--EndFragment-->\n</body></html>");
         Ok(html)
     }
@@ -1522,18 +1703,45 @@ impl DocumentCore {
     }
 
     /// Control 객체를 HTML로 변환한다.
-    pub(crate) fn control_to_html(&self, control: &Control) -> String {
+    ///
+    /// `depth`는 이 컨트롤을 담은 셀의 표 중첩 깊이(0 = 최상위 표 바로 안)다.
+    /// `Control::Table`이 `depth >= MAX_NEST_DEPTH`이면 재귀를 멈추고 생략
+    /// 사실을 주석으로 남긴다 — `table_extract::MAX_NEST_DEPTH`와 같은 값·형태.
+    /// `Control::Table`/`Control::Picture` 외 변형은 아직 셀 안에서 내보내기를
+    /// 지원하지 않는다 [#4413]. 지원 범위 확장은 #4414 소관이라 여기서는 조용히
+    /// 버리지 않고 어떤 컨트롤이 생략됐는지 HTML 주석 경고로 남긴다.
+    pub(crate) fn control_to_html(&self, control: &Control, depth: usize) -> String {
         match control {
-            Control::Table(table) => self.table_to_html(table),
+            Control::Table(table) => {
+                if depth >= MAX_NEST_DEPTH {
+                    return format!(
+                        "<!-- rhwp: 표 중첩 깊이 상한({})을 넘어 생략됨 -->\n",
+                        MAX_NEST_DEPTH
+                    );
+                }
+                self.table_to_html_at_depth(table, depth)
+            }
             Control::Picture(pic) => self.picture_to_html(pic),
-            _ => String::new(),
+            other => format!(
+                "<!-- rhwp: 셀 안 {} 컨트롤은 클립보드 HTML 내보내기 미지원 - 경고: 내용 생략됨 -->\n",
+                control_kind_label(other)
+            ),
         }
     }
 
-    /// Table 컨트롤을 HTML <table>로 변환한다.
+    /// 최상위 Table 컨트롤을 HTML <table>로 변환한다.
+    ///
+    /// 재귀 깊이는 내부 구현에서만 관리해, 기존 최상위 변환 진입점의 계약을
+    /// 유지한다.
     pub(crate) fn table_to_html(&self, table: &crate::model::table::Table) -> String {
-        use crate::renderer::style_resolver::ResolvedBorderStyle;
+        self.table_to_html_at_depth(table, 0)
+    }
 
+    /// Table 컨트롤을 현재 중첩 깊이의 HTML <table>로 변환한다.
+    /// `depth`는 이 표 자체의 중첩 깊이(0 = 최상위) — 셀 안 문단의 컨트롤을
+    /// 처리할 때는 `depth + 1`을 넘겨, 그 컨트롤이 표이면 `control_to_html`이
+    /// 상한을 검사한 뒤 그 값으로 재귀한다.
+    fn table_to_html_at_depth(&self, table: &crate::model::table::Table, depth: usize) -> String {
         let mut html = String::from(
             "<table style=\"border-collapse:collapse;\" cellpadding=\"0\" cellspacing=\"0\">\n",
         );
@@ -1550,9 +1758,15 @@ impl DocumentCore {
                 // 병합된 셀은 첫 번째 셀만 출력 (rowspan/colspan 은 merge 된 셀 정보)
                 let mut td_style = String::new();
 
-                // 셀 배경/테두리 (BorderFill)
-                if cell.border_fill_id > 0 {
-                    if let Some(bs) = self.styles.border_styles.get(cell.border_fill_id as usize) {
+                // 셀 배경/테두리 (BorderFill) — border_fill_id는 1-based
+                // (styles.border_styles는 0-based). 다른 소비처(예:
+                // renderer/layout/table_layout.rs, document_core/queries/hidden_text.rs)와
+                // 동일하게 -1 보정한다. [#4412]
+                // [#4275] cellzone overlay 가 있으면 그 유효 id 를 쓴다.
+                let fill_id = html_cell_border_fill_id(table, cell);
+                if fill_id > 0 {
+                    let idx = (fill_id as usize).saturating_sub(1);
+                    if let Some(bs) = self.styles.border_styles.get(idx) {
                         self.apply_border_fill_css(&mut td_style, bs);
                     }
                 }
@@ -1573,9 +1787,11 @@ impl DocumentCore {
 
                 html.push_str(&format!("<td {}>\n", td_attrs));
 
-                // 셀 내부 문단들
+                // 셀 내부 문단들 — 텍스트뿐 아니라 문단에 붙은 컨트롤(중첩
+                // 표·그림 등)도 함께 내보낸다 [#4413]. 이 표 자체는 depth이므로
+                // 그 셀 문단의 컨트롤은 depth+1에서 검사한다.
                 for cpara in &cell.paragraphs {
-                    html.push_str(&self.paragraph_to_html(cpara, None, None));
+                    html.push_str(&self.cell_paragraph_to_html(cpara, None, None, depth + 1));
                 }
 
                 html.push_str("</td>\n");
@@ -1584,6 +1800,30 @@ impl DocumentCore {
         }
 
         html.push_str("</table>\n");
+        html
+    }
+
+    /// 셀 안 문단을 HTML로 변환한다 — 텍스트(`paragraph_to_html`)에 더해
+    /// `para.controls`(중첩 표·그림 등)도 순회해 이어붙인다.
+    ///
+    /// [#4413] 셀 내용 내보내기가 `para.controls`를 전혀 보지 않아 표 셀 안의
+    /// 중첩 표·이미지가 경고 없이 통째로 사라지던 결함 수정. `paragraph_to_html`
+    /// 자체는 본문(셀 밖) 선택 내보내기와도 공유하므로 그대로 두고, 셀 전용
+    /// 진입점에서만 컨트롤을 이어붙인다.
+    ///
+    /// `depth`는 이 문단을 담은 셀이 속한 표의 중첩 깊이다 — `control_to_html`에
+    /// 그대로 전달해 `MAX_NEST_DEPTH` 상한을 적용한다.
+    pub(crate) fn cell_paragraph_to_html(
+        &self,
+        para: &Paragraph,
+        start_offset: Option<usize>,
+        end_offset: Option<usize>,
+        depth: usize,
+    ) -> String {
+        let mut html = self.paragraph_to_html(para, start_offset, end_offset);
+        for ctrl in &para.controls {
+            html.push_str(&self.control_to_html(ctrl, depth));
+        }
         html
     }
 
@@ -1633,8 +1873,11 @@ impl DocumentCore {
             None
         };
 
-        if let Some(bdc) = image_data {
-            let bytes = bdc.data.load();
+        // [#2550] 상한 초과(deflate bomb 포함)는 이미지 누락과 같은 빈 조각으로 접는다.
+        if let Some(bytes) = image_data.and_then(|bdc| {
+            bdc.data
+                .load_limited(crate::model::bin_data::MAX_BIN_DATA_BYTES)
+        }) {
             let base64_data = base64::engine::general_purpose::STANDARD.encode(&bytes);
             let mime_type = detect_clipboard_image_mime(&bytes);
 
@@ -1691,7 +1934,9 @@ impl DocumentCore {
                 HwpError::RenderError(format!("바이너리 데이터 {} 범위 초과", bin_data_id))
             })?;
 
-        Ok(bdc.data.load())
+        bdc.data
+            .load_limited(crate::model::bin_data::MAX_BIN_DATA_BYTES)
+            .ok_or_else(|| bin_data_over_limit_error(bin_data_id))
     }
 
     /// 컨트롤의 이미지 MIME 타입을 반환한다.
@@ -1733,7 +1978,11 @@ impl DocumentCore {
                 HwpError::RenderError(format!("바이너리 데이터 {} 범위 초과", bin_data_id))
             })?;
 
-        Ok(detect_clipboard_image_mime(&bdc.data.load()).to_string())
+        let bytes = bdc
+            .data
+            .load_limited(crate::model::bin_data::MAX_BIN_DATA_BYTES)
+            .ok_or_else(|| bin_data_over_limit_error(bin_data_id))?;
+        Ok(detect_clipboard_image_mime(&bytes).to_string())
     }
 
     /// BinData ID(1-based)로 이미지 바이너리 데이터를 반환한다.
@@ -1750,7 +1999,9 @@ impl DocumentCore {
             .ok_or_else(|| {
                 HwpError::RenderError(format!("바이너리 데이터 {} 범위 초과", bin_data_id))
             })?;
-        Ok(bdc.data.load())
+        bdc.data
+            .load_limited(crate::model::bin_data::MAX_BIN_DATA_BYTES)
+            .ok_or_else(|| bin_data_over_limit_error(bin_data_id))
     }
 
     /// BinData ID(1-based)로 이미지 MIME 타입을 반환한다.
@@ -1767,7 +2018,11 @@ impl DocumentCore {
             .ok_or_else(|| {
                 HwpError::RenderError(format!("바이너리 데이터 {} 범위 초과", bin_data_id))
             })?;
-        Ok(detect_clipboard_image_mime(&bdc.data.load()).to_string())
+        let bytes = bdc
+            .data
+            .load_limited(crate::model::bin_data::MAX_BIN_DATA_BYTES)
+            .ok_or_else(|| bin_data_over_limit_error(bin_data_id))?;
+        Ok(detect_clipboard_image_mime(&bytes).to_string())
     }
 
     // === 클립보드 HTML 붙여넣기 ===
@@ -1975,6 +2230,7 @@ mod nested_cell_paste_reflow_tests {
                 ..Default::default()
             }],
             plain_text: text,
+            copied_table_text_reflowed: false,
         });
 
         core.paste_internal_in_cell_by_path_native(0, 0, &path, 0)
@@ -1985,6 +2241,436 @@ mod nested_cell_paste_reflow_tests {
             paras[0].line_segs.len() > 1,
             "폭 200 최내곽 셀에 40자를 붙여넣으면 여러 줄로 재래핑돼야 함 (실제 {}줄)",
             paras[0].line_segs.len()
+        );
+    }
+}
+
+/// [#4412] `table_to_html`(문서 간 복사·붙여넣기 HTML 경로)이 `cell.border_fill_id`를
+/// 1-based 보정 없이 `styles.border_styles`(0-based)에 그대로 인덱싱해, 실제 BorderFill보다
+/// 한 칸 뒤(id 기준 +1)의 BorderFill 색상이 붙던 결함의 회귀 테스트.
+#[cfg(test)]
+mod clipboard_border_fill_offset_tests {
+    use crate::document_core::DocumentCore;
+    use crate::model::style::{BorderFill, BorderLine, BorderLineType, Fill, FillType, SolidFill};
+    use crate::model::table::{Cell, Table};
+
+    /// 4방향 동일한 실선 테두리 + 단색 채우기를 갖는 BorderFill을 만든다.
+    fn border_fill(border_color: u32, fill_color: u32) -> BorderFill {
+        let line = BorderLine {
+            line_type: BorderLineType::Solid,
+            width: 2,
+            color: border_color,
+        };
+        BorderFill {
+            borders: [line, line, line, line],
+            fill: Fill {
+                fill_type: FillType::Solid,
+                solid: Some(SolidFill {
+                    background_color: fill_color,
+                    pattern_color: 0,
+                    pattern_type: 0,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// border_fills = [default0, default1, decoy(회색), REAL(녹/청), decoy2(주황/자홍)].
+    /// `cell.border_fill_id = 4`(1-based)는 index 3(REAL)을 가리켜야 하며, 색이 한 칸
+    /// 밀려 index 4(decoy2)를 가리키면 안 된다.
+    #[test]
+    fn table_to_html_uses_correct_border_fill_for_1_based_id() {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+
+        core.document.doc_info.border_fills = vec![
+            border_fill(0x000000, 0x000000), // index 0 → id 1 (default0)
+            border_fill(0x000000, 0x000000), // index 1 → id 2 (default1)
+            border_fill(0xC0C0C0, 0xC0C0C0), // index 2 → id 3 (decoy, 회색)
+            border_fill(0x00FF00, 0xFFFF00), // index 3 → id 4 (REAL, 테두리#00ff00/배경#00ffff)
+            border_fill(0x008CFF, 0xFF00FF), // index 4 → id 5 (decoy2, 테두리#ff8c00/배경#ff00ff)
+        ];
+        core.rebuild_resolved_styles();
+
+        let table = Table {
+            row_count: 1,
+            col_count: 1,
+            cells: vec![Cell {
+                row: 0,
+                col: 0,
+                col_span: 1,
+                row_span: 1,
+                width: 2000,
+                border_fill_id: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let html = core.table_to_html(&table);
+
+        assert!(
+            html.contains("border-left:2.0px solid #00ff00"),
+            "REAL(id=4, index 3)의 테두리색(#00ff00)이 출력되지 않음:\n{html}"
+        );
+        assert!(
+            html.contains("background-color:#00ffff"),
+            "REAL(id=4, index 3)의 배경색(#00ffff)이 출력되지 않음:\n{html}"
+        );
+        assert!(
+            !html.contains("#ff8c00") && !html.contains("#ff00ff"),
+            "decoy2(id=5, index 4)의 색상이 한 칸 밀려 출력됨:\n{html}"
+        );
+    }
+}
+
+/// #4413: `paragraph_to_html`이 `para.text`만 읽고 `para.controls`를 보지 않아
+/// 표 셀 안의 중첩 표·이미지가 문서 간 복사에서 통째로 사라지던 결함의 회귀 테스트.
+#[cfg(test)]
+mod cell_control_export_tests {
+    use super::MAX_NEST_DEPTH;
+    use crate::document_core::DocumentCore;
+    use crate::model::control::{Bookmark, Control};
+    use crate::model::document::{Document, Section};
+    use crate::model::image::{ImageAttr, Picture};
+    use crate::model::paragraph::Paragraph;
+    use crate::model::shape::CommonObjAttr;
+    use crate::model::table::{Cell, Table};
+
+    /// 본문 문단 하나에 표 컨트롤(1x1)을 붙이고, 그 유일한 셀의 문단으로
+    /// `outer_cell_para`를 넣는다. 반환값은 (core, parent_para_idx, control_idx, cell_idx).
+    fn core_with_body_table(outer_cell_para: Paragraph) -> (DocumentCore, usize, usize, usize) {
+        let outer_table = Table {
+            row_count: 1,
+            col_count: 1,
+            cells: vec![Cell {
+                row: 0,
+                col: 0,
+                col_span: 1,
+                row_span: 1,
+                width: 5000,
+                paragraphs: vec![outer_cell_para],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut body_para = Paragraph::default();
+        body_para
+            .controls
+            .push(Control::Table(Box::new(outer_table)));
+
+        let mut section = Section::default();
+        section.paragraphs.push(body_para);
+        let mut doc = Document::default();
+        doc.sections.push(section);
+
+        let mut core = DocumentCore::new_empty();
+        core.document = doc;
+
+        (core, 0, 0, 0)
+    }
+
+    fn make_inner_table_with_marker(marker: &str) -> Table {
+        let mut inner_para = Paragraph::default();
+        inner_para.text = marker.to_string();
+        inner_para.char_offsets = (0..inner_para.text.chars().count() as u32).collect();
+
+        Table {
+            row_count: 1,
+            col_count: 1,
+            cells: vec![Cell {
+                row: 0,
+                col: 0,
+                col_span: 1,
+                row_span: 1,
+                width: 2000,
+                paragraphs: vec![inner_para],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// [적대적 검증 대조군] 내부 클립보드(같은 문서)는 원래 셀의 컨트롤을
+    /// 보존한다 — 이슈 #4413이 명시한 대조군. `copy_selection_in_cell_native`는
+    /// `Paragraph::clone()`으로 셀 문단을 통째로 복사하고, `strip_structural_
+    /// controls_for_text_clipboard`가 SectionDef/ColumnDef만 제거하므로
+    /// `Control::Table`은 그대로 남는다.
+    #[test]
+    fn internal_clipboard_preserves_nested_table_in_cell_control_group() {
+        let mut outer_cell_para = Paragraph::default();
+        outer_cell_para
+            .controls
+            .push(Control::Table(Box::new(make_inner_table_with_marker(
+                "INNERMARK",
+            ))));
+
+        let (mut core, parent_para_idx, control_idx, cell_idx) =
+            core_with_body_table(outer_cell_para);
+
+        core.copy_selection_in_cell_native(0, parent_para_idx, control_idx, cell_idx, 0, 0, 0, 0)
+            .expect("내부 클립보드 복사가 성공해야 함");
+
+        let clip = core.clipboard.as_ref().expect("클립보드가 채워져야 함");
+        assert_eq!(clip.paragraphs.len(), 1);
+        assert!(
+            matches!(clip.paragraphs[0].controls.first(), Some(Control::Table(_))),
+            "내부 클립보드(같은 문서 안 복사)는 중첩 표 컨트롤을 보존해야 함(대조군). 실제 controls: {:?}",
+            clip.paragraphs[0].controls
+        );
+    }
+
+    /// #4413 red→green: 셀 문단에 붙은 `Control::Table`(중첩 표)이 셀 내용 HTML
+    /// 내보내기에서 사라지면 안 된다. 수정 전에는 `export_selection_in_cell_html_native`가
+    /// `paragraph_to_html`만 호출해(controls 미참조) 안쪽 표가 전혀 나타나지 않았다.
+    #[test]
+    fn nested_table_in_cell_is_exported_to_html() {
+        let mut outer_cell_para = Paragraph::default();
+        outer_cell_para
+            .controls
+            .push(Control::Table(Box::new(make_inner_table_with_marker(
+                "INNERMARK",
+            ))));
+
+        let (core, parent_para_idx, control_idx, cell_idx) = core_with_body_table(outer_cell_para);
+
+        let html = core
+            .export_selection_in_cell_html_native(
+                0,
+                parent_para_idx,
+                control_idx,
+                cell_idx,
+                0,
+                0,
+                0,
+                0,
+            )
+            .expect("셀 내용 HTML 내보내기가 성공해야 함");
+
+        assert_eq!(
+            html.matches("<table").count(),
+            1,
+            "셀 안 중첩 표가 <table 하나로 내보내져야 함. 실제 HTML: {html}"
+        );
+        assert!(
+            html.contains("INNERMARK"),
+            "안쪽 표 셀 텍스트가 내보낸 HTML에 있어야 함. 실제 HTML: {html}"
+        );
+    }
+
+    /// #4413 red→green, cellPath 버전(#4272): `export_selection_in_cell_html_by_path_native`도
+    /// 같은 결함을 공유했다 — cellPath 하나짜리 얕은 셀도 컨트롤을 보지 않았다.
+    #[test]
+    fn nested_table_in_cell_by_path_is_exported_to_html() {
+        let mut outer_cell_para = Paragraph::default();
+        outer_cell_para
+            .controls
+            .push(Control::Table(Box::new(make_inner_table_with_marker(
+                "INNERMARK",
+            ))));
+
+        let (core, parent_para_idx, control_idx, cell_idx) = core_with_body_table(outer_cell_para);
+        let path = vec![(control_idx, cell_idx, 0)];
+
+        let html = core
+            .export_selection_in_cell_html_by_path_native(0, parent_para_idx, &path, 0, 0, 0, 0)
+            .expect("cellPath 셀 내용 HTML 내보내기가 성공해야 함");
+
+        assert!(
+            html.contains("<table"),
+            "cellPath 경로로 내보내도 셀 안 중첩 표가 나와야 함. 실제 HTML: {html}"
+        );
+        assert!(
+            html.contains("INNERMARK"),
+            "cellPath 경로로 내보내도 안쪽 표 셀 텍스트가 있어야 함. 실제 HTML: {html}"
+        );
+    }
+
+    /// #4413 red→green: 셀 문단에 붙은 `Control::Picture`(셀 안 이미지)가 셀 내용
+    /// HTML 내보내기에서 사라지면 안 된다.
+    #[test]
+    fn picture_in_cell_is_exported_to_html() {
+        let mut outer_cell_para = Paragraph::default();
+        outer_cell_para
+            .controls
+            .push(Control::Picture(Box::new(Picture {
+                common: CommonObjAttr {
+                    treat_as_char: true,
+                    width: 1000,
+                    height: 1000,
+                    ..Default::default()
+                },
+                image_attr: ImageAttr {
+                    bin_data_id: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })));
+
+        let (mut core, parent_para_idx, control_idx, cell_idx) =
+            core_with_body_table(outer_cell_para);
+        core.document
+            .bin_data_content
+            .push(crate::model::bin_data::BinDataContent {
+                id: 1,
+                data: crate::model::bin_data::BinDataBytes::from_shared(vec![
+                    0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A,
+                ]),
+                extension: "png".to_string(),
+            });
+
+        let html = core
+            .export_selection_in_cell_html_native(
+                0,
+                parent_para_idx,
+                control_idx,
+                cell_idx,
+                0,
+                0,
+                0,
+                0,
+            )
+            .expect("셀 내용 HTML 내보내기가 성공해야 함");
+
+        assert!(
+            html.contains("<img"),
+            "셀 안 이미지가 <img>로 내보내져야 함. 실제 HTML: {html}"
+        );
+    }
+
+    /// [본문 대조군] 본문(셀 밖) 그림은 애초에 문제가 없었다 — 직접 컨트롤을
+    /// 선택해 내보내는 `export_control_html_native` 경로는 셀 순회와 무관하게
+    /// 항상 `control_to_html`을 탔다. 위치(셀 안 vs 본문 직접 선택)에 결함이
+    /// 국한됨을 확정하는 대조군.
+    #[test]
+    fn body_level_picture_export_via_control_html_was_already_fine() {
+        let pic = Picture {
+            common: CommonObjAttr {
+                treat_as_char: true,
+                width: 1000,
+                height: 1000,
+                ..Default::default()
+            },
+            image_attr: ImageAttr {
+                bin_data_id: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut body_para = Paragraph::default();
+        body_para.controls.push(Control::Picture(Box::new(pic)));
+
+        let mut section = Section::default();
+        section.paragraphs.push(body_para);
+        let mut doc = Document::default();
+        doc.sections.push(section);
+        doc.bin_data_content
+            .push(crate::model::bin_data::BinDataContent {
+                id: 1,
+                data: crate::model::bin_data::BinDataBytes::from_shared(vec![
+                    0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A,
+                ]),
+                extension: "png".to_string(),
+            });
+
+        let mut core = DocumentCore::new_empty();
+        core.document = doc;
+
+        let html = core
+            .export_control_html_native(0, 0, &[], 0)
+            .expect("본문 컨트롤 HTML 내보내기가 성공해야 함");
+
+        assert!(
+            html.contains("<img"),
+            "본문에서 직접 선택한 그림은 원래도 <img>로 내보내져야 함. 실제 HTML: {html}"
+        );
+    }
+
+    /// #4413 수정: `Control::Table`/`Control::Picture` 외의 셀 안 컨트롤(예: 책갈피)은
+    /// 아직 지원 대상이 아니다(#4414 소관) — 조용히 버리지 않고 HTML 주석 경고를
+    /// 남겨야 한다.
+    #[test]
+    fn unsupported_cell_control_leaves_warning_comment_not_silent_drop() {
+        let mut outer_cell_para = Paragraph::default();
+        outer_cell_para
+            .controls
+            .push(Control::Bookmark(Bookmark::default()));
+
+        let (core, parent_para_idx, control_idx, cell_idx) = core_with_body_table(outer_cell_para);
+
+        let html = core
+            .export_selection_in_cell_html_native(
+                0,
+                parent_para_idx,
+                control_idx,
+                cell_idx,
+                0,
+                0,
+                0,
+                0,
+            )
+            .expect("셀 내용 HTML 내보내기가 성공해야 함");
+
+        assert!(
+            html.contains("<!--") && html.contains("Bookmark"),
+            "지원하지 않는 셀 컨트롤은 조용히 버리지 말고 어떤 컨트롤이 생략됐는지 \
+             HTML 주석 경고를 남겨야 함. 실제 HTML: {html}"
+        );
+    }
+
+    /// #4413 수정: 표 중첩 HTML 변환 재귀에 `MAX_NEST_DEPTH` 상한이 실제로 걸린다.
+    /// `MAX_NEST_DEPTH + 4`단 깊이로 표를 중첩시키고 최상위에서 내보내면, 가장
+    /// 안쪽(마커 포함) 표는 상한을 넘어 렌더링되지 않고 생략 주석만 남아야 한다.
+    /// 상한이 없으면 병적으로 깊은 중첩 문서에서 export 재귀가 스택을 태울 수 있다.
+    #[test]
+    fn nested_table_recursion_is_capped_at_max_depth() {
+        const LEVELS: usize = MAX_NEST_DEPTH + 4;
+
+        let mut table = make_inner_table_with_marker("DEEPMARK");
+        for _ in 0..LEVELS {
+            let mut wrapper_para = Paragraph::default();
+            wrapper_para.controls.push(Control::Table(Box::new(table)));
+            table = Table {
+                row_count: 1,
+                col_count: 1,
+                cells: vec![Cell {
+                    row: 0,
+                    col: 0,
+                    col_span: 1,
+                    row_span: 1,
+                    width: 2000,
+                    paragraphs: vec![wrapper_para],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+        }
+
+        let mut body_para = Paragraph::default();
+        body_para.controls.push(Control::Table(Box::new(table)));
+
+        let mut section = Section::default();
+        section.paragraphs.push(body_para);
+        let mut doc = Document::default();
+        doc.sections.push(section);
+
+        let mut core = DocumentCore::new_empty();
+        core.document = doc;
+
+        let html = core
+            .export_control_html_native(0, 0, &[], 0)
+            .expect("최상위 표 컨트롤 HTML 내보내기가 성공해야 함");
+
+        assert!(
+            !html.contains("DEEPMARK"),
+            "깊이 상한을 넘는 가장 안쪽 표는 렌더링되면 안 됨. 실제 HTML: {html}"
+        );
+        assert!(
+            html.contains("깊이 상한"),
+            "깊이 상한에 걸리면 생략 사실을 주석으로 남겨야 함. 실제 HTML: {html}"
         );
     }
 }

@@ -7,4 +7,5 @@
 
 pub mod common_obj_attr_writer;
 pub mod diagnostics;
+pub(crate) mod hwpx_master_page_slots;
 pub mod hwpx_to_hwp;

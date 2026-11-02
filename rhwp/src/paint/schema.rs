@@ -15,9 +15,10 @@ pub struct LayerTreeSchema {
 
 pub const LAYER_TREE_SCHEMA: LayerTreeSchema = LayerTreeSchema {
     schema_version: 1,
-    schema_minor_version: 19,
+    // 23: canonical text-visual source binding, control labels, and producer-owned decoration extents.
+    schema_minor_version: 23,
     resource_table_version: 1,
-    resource_table_minor_version: 5,
+    resource_table_minor_version: 6,
     unit: "px",
     coordinate_system: "page-top-left-y-down",
 };
@@ -36,6 +37,8 @@ mod tests {
 
     #[test]
     fn layer_tree_schema_constants_match_schema() {
+        assert_eq!(LAYER_TREE_SCHEMA.schema_minor_version, 23);
+        assert_eq!(LAYER_TREE_SCHEMA.resource_table_minor_version, 6);
         assert_eq!(
             LAYER_TREE_SCHEMA,
             LayerTreeSchema {
