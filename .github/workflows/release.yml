@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing annotated tag to release (e.g. v0.9.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -13,6 +19,8 @@ env:
   CARGO_TERM_COLOR: always
   BIN_NAME: rhwp-batch
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/rhwp-batch
+  # Tag push keeps github.ref_name; dispatch re-releases an existing tag without moving it.
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   build-binaries:
@@ -25,11 +33,14 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: aarch64-apple-darwin
-            os: macos-14
+            # macos-14 retired 2026-11-02 (actions/runner-images#13518)
+            os: macos-15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -47,7 +58,7 @@ jobs:
 
       - name: Package archive
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${RELEASE_TAG}"
           TARGET="${{ matrix.target }}"
           ARCHIVE="${BIN_NAME}-${TAG}-${TARGET}.tar.gz"
           STAGE="package"
@@ -64,8 +75,8 @@ jobs:
         with:
           name: ${{ matrix.target }}
           path: |
-            ${{ env.BIN_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-            ${{ env.BIN_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+            ${{ env.BIN_NAME }}-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+            ${{ env.BIN_NAME }}-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
 
   publish-release:
@@ -90,6 +101,7 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             artifacts/${{ env.BIN_NAME }}-*.tar.gz
             artifacts/${{ env.BIN_NAME }}-*.tar.gz.sha256
@@ -103,6 +115,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Download Linux binary artifact
         uses: actions/download-artifact@v4
@@ -112,7 +126,7 @@ jobs:
 
       - name: Prepare binary for image
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${RELEASE_TAG}"
           TARGET="x86_64-unknown-linux-gnu"
           mkdir -p staging dist
           tar -xzf "artifacts/${BIN_NAME}-${TAG}-${TARGET}.tar.gz" -C staging
@@ -130,15 +144,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve image version tags
+        id: ver
+        run: |
+          TAG="${RELEASE_TAG}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern=v{{version}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=${{ steps.ver.outputs.tag }}
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=latest,enable=${{ !contains(env.RELEASE_TAG, '-') }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
