@@ -1,5 +1,7 @@
 # ROADMAP.md — rhwp-batch 구축 계획 (v1.0)
 
+Tracking edwardkim/rhwp **v0.9.0**.
+
 > **목표**: Linux 환경에서 동작하는 **CLI 도구**를 신설하여
 > 사용자의 데이터 처리 파이프라인(Airflow / K8s Job 등)에서
 > 다음을 수행한다.
