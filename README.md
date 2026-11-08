@@ -1,5 +1,7 @@
 # rhwp-batch
 
+Tracking edwardkim/rhwp **v0.9.0**.
+
 > Linux 환경에서 동작하는 CLI 도구. 데이터 처리 파이프라인(Airflow / K8s `Job` 등)에서
 > HWP/HWPX 문서를 다룬다.
 >
