@@ -1,0 +1,36 @@
+# Tenant What for mm topic-radar / comment-draft (schedule mm-topic-radar).
+# How: deploy/personas/mm skills — sites/keywords live here only.
+# Missing/empty → skip this tenant. Ticket: 01ab108e
+# Note: schedule SoR is marketing.yaml (not .md).
+
+# Public hosts only (no login scrape). KR-first for HWP/HWPX + RAG/template discourse.
+sites:
+  - velog.io
+  - news.hada.io
+  - www.okky.kr
+  - medium.com
+  - github.com
+  - stackoverflow.com
+  - news.ycombinator.com
+
+# Paired with each site (public web search).
+keywords:
+  - "HWP 파싱"
+  - "HWPX"
+  - "한글 문서 RAG"
+  - "HWP 템플릿"
+  - "한글 양식 문서"
+  - "hwp parse RAG"
+  - "hwpx template"
+
+# comment-draft constraints
+tone: helpful peer; technical; concise; no hype
+product_mention: soft # soft | none — at most one natural mention of rhwp-batch / rhwp
+must_avoid:
+  - "guaranteed"
+  - "best"
+  - "업계 1위"
+  - "무료로 다 됩니다"
+  - hard-sell CTA
+  - competitor bashing
+  - auto external post
