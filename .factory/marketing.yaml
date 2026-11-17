@@ -1,0 +1,33 @@
+# rhwp_batch / HWP·HWPX CLI — MM topic-radar What (ticket 01ab108e)
+# Schema: deploy/personas/mm/.../marketing.yaml.example
+# soft-mention only; no external auto-post
+# Schedule What for mm-topic-radar (agents.yaml) — not .md; marketing.yaml is SoR
+
+sites:
+  - linkedin.com
+  - velog.io
+  - tistory.com
+  - medium.com
+  - dev.to
+  - blog.naver.com
+  - brunch.co.kr
+  - news.ycombinator.com
+
+keywords:
+  - HWP 파싱
+  - HWPX
+  - 한글 문서 RAG
+  - HWP template
+  - 한글문서 JSON
+  - document generation HWP
+  - Korean Hangul Word Processor pipeline
+
+# locale hint for drafts (ko); not a hard schema field
+tone: technical peer; concise; Korean-friendly on KR blogs; professional B2B on LinkedIn; no hype
+product_mention: soft
+must_avoid:
+  - spam links
+  - fake testimonials
+  - guaranteed
+  - best in the world
+  - 자동 외부 게시
