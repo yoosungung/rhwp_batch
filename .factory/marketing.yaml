@@ -1,33 +1,34 @@
-# rhwp_batch / HWP·HWPX CLI — MM topic-radar What (ticket 01ab108e)
-# Schema: deploy/personas/mm/.../marketing.yaml.example
-# soft-mention only; no external auto-post
-# Schedule What for mm-topic-radar (agents.yaml) — not .md; marketing.yaml is SoR
+# Tenant What for mm topic-radar / comment-draft (schedule mm-topic-radar).
+# How: deploy/personas/mm skills — sites/keywords live here only.
+# Missing/empty → skip this tenant. Ticket: 01ab108e
+# Note: schedule SoR is marketing.yaml (not .md).
+# Sites: public hosts only — LinkedIn/네이버블로그 제외 (login·검색품질 리스크; topic-radar no-login).
 
 sites:
-  - linkedin.com
   - velog.io
-  - tistory.com
+  - news.hada.io
+  - www.okky.kr
   - medium.com
-  - dev.to
-  - blog.naver.com
-  - brunch.co.kr
+  - github.com
+  - stackoverflow.com
   - news.ycombinator.com
 
 keywords:
-  - HWP 파싱
-  - HWPX
-  - 한글 문서 RAG
-  - HWP template
-  - 한글문서 JSON
-  - document generation HWP
-  - Korean Hangul Word Processor pipeline
+  - "HWP 파싱"
+  - "HWPX"
+  - "한글 문서 RAG"
+  - "HWP 템플릿"
+  - "한글 양식 문서"
+  - "hwp parse RAG"
+  - "hwpx template"
 
-# locale hint for drafts (ko); not a hard schema field
-tone: technical peer; concise; Korean-friendly on KR blogs; professional B2B on LinkedIn; no hype
-product_mention: soft
+tone: helpful peer; technical; concise; no hype
+product_mention: soft # soft | none — at most one natural mention of rhwp-batch / rhwp
 must_avoid:
-  - spam links
-  - fake testimonials
-  - guaranteed
-  - best in the world
-  - 자동 외부 게시
+  - "guaranteed"
+  - "best"
+  - "업계 1위"
+  - "무료로 다 됩니다"
+  - hard-sell CTA
+  - competitor bashing
+  - auto external post
