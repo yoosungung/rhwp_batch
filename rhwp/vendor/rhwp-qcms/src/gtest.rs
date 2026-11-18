@@ -1,3 +1,10 @@
+//! 관계형: C bindings 테스트의 nullable transform은 역참조 전에 검사한다.
+//! 주석 갱신: 2026-11-10T02:54:44+09:00.
+//! ARM의 NEON 비교는 실제 모듈과 동일한 feature 조건에서만 컴파일한다.
+//! 기능 비활성 환경에서도 일반 C ABI·예산 실패·정상 LUT 검사는 실행한다.
+//! 직전 파일 변경: 2026-11-09T23:30:05+09:00, 913713dbfd0a911130e7d590629a656ffc1940b3.
+//! 시각 측정 비해당: 테스트 포인터의 실패 경계이며 색 변환·배치 기대값은 바꾸지 않는다.
+
 #[cfg(all(test, feature = "c_bindings"))]
 #[allow(clippy::all)]
 mod gtest {
@@ -6,13 +13,13 @@ mod gtest {
         transform_util::lut_inverse_interp16, Intent::Perceptual,
     };
     use libc::c_void;
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     use std::arch::is_aarch64_feature_detected;
-    #[cfg(target_arch = "arm")]
+    #[cfg(all(target_arch = "arm", feature = "neon"))]
     use std::arch::is_arm_feature_detected;
     use std::ptr::null_mut;
 
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    #[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "neon"))]
     use crate::transform_neon::{
         qcms_transform_data_bgra_out_lut_neon, qcms_transform_data_rgb_out_lut_neon,
         qcms_transform_data_rgba_out_lut_neon,
@@ -152,6 +159,67 @@ mod gtest {
     */
 
     #[test]
+    #[should_panic(expected = "test transform must be initialized")]
+    fn null_reference_transform_fails_before_calling_the_converter() {
+        let mut test = QcmsProfileTest::new();
+        unsafe { test.ProduceRef(Some(qcms_transform_data_rgb_out_lut)) };
+    }
+
+    #[test]
+    #[should_panic(expected = "test transform must be initialized")]
+    fn null_output_transform_fails_before_calling_the_converter() {
+        let mut test = QcmsProfileTest::new();
+        unsafe { test.ProduceOutput(Some(qcms_transform_data_rgb_out_lut)) };
+    }
+
+    #[test]
+    fn c_binding_lut_budget_failure_keeps_the_callers_output_untouched() {
+        use std::convert::TryFrom;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct RefuseWork(AtomicBool);
+        impl rhwp_codec_resource::ResourceBudget for RefuseWork {
+            fn allocation_limit(&self) -> usize {
+                0
+            }
+            fn reserve(&self, _: usize) -> bool {
+                self.reject();
+                false
+            }
+            fn work(&self, _: usize) -> bool {
+                self.reject();
+                false
+            }
+            fn reject(&self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let profile = Profile::new_sRGB();
+        let mut description = qcms_profile_data::default();
+        qcms_profile_get_data(&profile, &mut description);
+        let samples = usize::try_from(description.linear_from_trc_red_samples).unwrap();
+        assert!(samples > 0);
+        let mut output = vec![0.375_f32; samples];
+        let begin = output.as_mut_ptr();
+        let end = unsafe { begin.add(output.len()) };
+        let budget = Arc::new(RefuseWork(AtomicBool::new(false)));
+        {
+            let _scope = rhwp_codec_resource::Scope::enter(budget.clone());
+            qcms_profile_get_lut(&profile, qcms_color_channel::Red, begin, end);
+        }
+        assert!(budget.0.load(Ordering::Relaxed));
+        assert!(output.iter().all(|value| *value == 0.375));
+
+        // Normal calls still return the complete, monotonic sRGB transfer LUT.
+        qcms_profile_get_lut(&profile, qcms_color_channel::Red, begin, end);
+        assert_eq!(output[0], 0.0);
+        assert_eq!(output[output.len() - 1], 1.0);
+        assert!(output.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
     fn alignment() {
         assert_eq!(std::mem::align_of::<qcms_transform>(), 16);
     }
@@ -188,7 +256,9 @@ mod gtest {
 
         unsafe {
             qcms_transform_data(
-                &*transform,
+                transform
+                    .as_ref()
+                    .expect("test transform creation must succeed"),
                 data.as_ptr() as *const libc::c_void,
                 data.as_mut_ptr() as *mut libc::c_void,
                 data.len() / 3,
@@ -217,7 +287,9 @@ mod gtest {
         let mut out_data: [u8; 2 * 4] = [0; 8];
         unsafe {
             qcms_transform_data(
-                &*transform,
+                transform
+                    .as_ref()
+                    .expect("test transform creation must succeed"),
                 in_data.as_ptr() as *const libc::c_void,
                 out_data.as_mut_ptr() as *mut libc::c_void,
                 in_data.len() / 2,
@@ -312,7 +384,9 @@ mod gtest {
 
         unsafe {
             qcms_transform_data(
-                &*transform,
+                transform
+                    .as_ref()
+                    .expect("test transform creation must succeed"),
                 src.as_ptr() as *const libc::c_void,
                 dst.as_mut_ptr() as *mut libc::c_void,
                 SRC_SIZE,
@@ -585,7 +659,9 @@ mod gtest {
 
         unsafe fn ProduceRef(&mut self, trans_fn: transform_fn_t) {
             trans_fn.unwrap()(
-                &*self.transform,
+                self.transform
+                    .as_ref()
+                    .expect("test transform must be initialized"),
                 self.input.as_mut_ptr(),
                 self.reference.as_mut_ptr(),
                 self.pixels,
@@ -605,7 +681,9 @@ mod gtest {
         unsafe fn ProduceOutput(&mut self, trans_fn: transform_fn_t) {
             self.ClearOutputBuffer();
             trans_fn.unwrap()(
-                &*self.transform,
+                self.transform
+                    .as_ref()
+                    .expect("test transform must be initialized"),
                 self.input.as_mut_ptr(),
                 self.output.as_mut_ptr(),
                 self.pixels,
@@ -659,14 +737,14 @@ mod gtest {
                 }
             }
 
-            #[cfg(target_arch = "arm")]
+            #[cfg(all(target_arch = "arm", feature = "neon"))]
             {
                 if is_arm_feature_detected!("neon") {
                     assert!(self.ProduceVerifyOutput(Some(qcms_transform_data_rgb_out_lut_neon)))
                 }
             }
 
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", feature = "neon"))]
             {
                 if is_aarch64_feature_detected!("neon") {
                     assert!(self.ProduceVerifyOutput(Some(qcms_transform_data_rgb_out_lut_neon)))
@@ -688,14 +766,14 @@ mod gtest {
                 }
             }
 
-            #[cfg(target_arch = "arm")]
+            #[cfg(all(target_arch = "arm", feature = "neon"))]
             {
                 if is_arm_feature_detected!("neon") {
                     assert!(self.ProduceVerifyOutput(Some(qcms_transform_data_rgba_out_lut_neon)))
                 }
             }
 
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", feature = "neon"))]
             {
                 if is_aarch64_feature_detected!("neon") {
                     assert!(self.ProduceVerifyOutput(Some(qcms_transform_data_rgba_out_lut_neon)))
@@ -717,14 +795,14 @@ mod gtest {
                 }
             }
 
-            #[cfg(target_arch = "arm")]
+            #[cfg(all(target_arch = "arm", feature = "neon"))]
             {
                 if is_arm_feature_detected!("neon") {
                     assert!(self.ProduceVerifyOutput(Some(qcms_transform_data_bgra_out_lut_neon)))
                 }
             }
 
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", feature = "neon"))]
             {
                 if is_aarch64_feature_detected!("neon") {
                     assert!(self.ProduceVerifyOutput(Some(qcms_transform_data_bgra_out_lut_neon)))
@@ -756,7 +834,9 @@ mod gtest {
             pt.SetBuffers(RGB8);
             pt.SetTransformForType(RGB8);
             qcms_transform_data(
-                &*pt.transform,
+                pt.transform
+                    .as_ref()
+                    .expect("test transform creation must succeed"),
                 pt.input.as_mut_ptr() as *mut c_void,
                 pt.output.as_mut_ptr() as *mut c_void,
                 pt.pixels,
@@ -817,7 +897,9 @@ mod gtest {
         let mut dst = [0u8, 0, 0];
         unsafe {
             qcms_transform_data(
-                &*transform,
+                transform
+                    .as_ref()
+                    .expect("test transform creation must succeed"),
                 src.as_ptr() as *const libc::c_void,
                 dst.as_mut_ptr() as *mut libc::c_void,
                 1,
